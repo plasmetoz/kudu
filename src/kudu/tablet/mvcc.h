@@ -14,25 +14,29 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_MVCC_H
-#define KUDU_TABLET_MVCC_H
 
-#include <gtest/gtest_prod.h>
+#pragma once
+
+#include <atomic>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
 
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/server/clock.h"
+#include <gtest/gtest_prod.h>
+
+#include "kudu/common/timestamp.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 class CountDownLatch;
+class MonoTime;
+
 namespace tablet {
 class MvccManager;
-
-using std::string;
 
 // A snapshot of the current MVCC state, which can determine whether
 // a transaction ID should be considered visible.
@@ -90,7 +94,7 @@ class MvccSnapshot {
 
   // Return a string representation of the set of committed transactions
   // in this snapshot, suitable for debug printouts.
-  string ToString() const;
+  std::string ToString() const;
 
   // Return true if the snapshot is considered 'clean'. A clean snapshot is one
   // which is determined only by a timestamp -- the snapshot considers all
@@ -112,6 +116,7 @@ class MvccSnapshot {
   FRIEND_TEST(MvccTest, TestMayHaveCommittedTransactionsAtOrAfter);
   FRIEND_TEST(MvccTest, TestMayHaveUncommittedTransactionsBefore);
   FRIEND_TEST(MvccTest, TestWaitUntilAllCommitted_SnapAtTimestampWithInFlights);
+  FRIEND_TEST(MvccTest, TestCorrectInitWithNoTxns);
 
   bool IsCommittedFallback(const Timestamp& timestamp) const;
 
@@ -245,7 +250,9 @@ class MvccManager {
   // NOTE: this does _not_ guarantee that no transactions are APPLYING upon
   // return -- just that those that were APPLYING at call time are finished
   // upon return.
-  void WaitForApplyingTransactionsToCommit() const;
+  //
+  // Returns Status::Aborted() if MVCC closed while waiting.
+  Status WaitForApplyingTransactionsToCommit() const WARN_UNUSED_RESULT;
 
   bool AreAllTransactionsCommitted(Timestamp ts) const;
 
@@ -265,6 +272,16 @@ class MvccManager {
   // never Abort().
   void GetApplyingTransactionsTimestamps(std::vector<Timestamp>* timestamps) const;
 
+  // Closes the MVCC manager. New transactions will not start, in-flight
+  // transactions will exit early on a best-effort basis, and waiting threads
+  // will return Status::Aborted().
+  void Close();
+
+  // Returns whether MVCC is open and available to manage transactions.
+  bool is_open() const {
+    return open_.load();
+  }
+
   ~MvccManager();
 
  private:
@@ -274,6 +291,7 @@ class MvccManager {
   FRIEND_TEST(MvccTest, TestAutomaticCleanTimeMoveToSafeTimeOnCommit);
   FRIEND_TEST(MvccTest, TestWaitForApplyingTransactionsToCommit);
   FRIEND_TEST(MvccTest, TestWaitForCleanSnapshot_SnapAfterSafeTimeWithInFlights);
+  FRIEND_TEST(MvccTest, TestDontWaitAfterClose);
 
   enum TxnState {
     RESERVED,
@@ -294,6 +312,9 @@ class MvccManager {
     CountDownLatch* latch;
     WaitFor wait_for;
   };
+
+  // Returns an error if the MVCC manager is closed.
+  Status CheckOpen() const;
 
   // Returns true if all transactions before the given timestamp are committed.
   //
@@ -359,6 +380,8 @@ class MvccManager {
 
   mutable std::vector<WaitingState*> waiters_;
 
+  std::atomic<bool> open_;
+
   DISALLOW_COPY_AND_ASSIGN(MvccManager);
 };
 
@@ -408,5 +431,3 @@ class ScopedTransaction {
 
 } // namespace tablet
 } // namespace kudu
-
-#endif

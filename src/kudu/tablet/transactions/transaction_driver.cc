@@ -17,18 +17,40 @@
 
 #include "kudu/tablet/transactions/transaction_driver.h"
 
+#include <functional>
+#include <memory>
 #include <mutex>
+#include <ostream>
+#include <type_traits>
+#include <utility>
 
-#include "kudu/consensus/consensus.h"
+#include <glog/logging.h>
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/consensus/log.h"
 #include "kudu/consensus/time_manager.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/strcat.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/result_tracker.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_replica.h"
+#include "kudu/tablet/transaction_order_verifier.h"
 #include "kudu/tablet/transactions/transaction_tracker.h"
-#include "kudu/util/debug-util.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status_callback.h"
 #include "kudu/util/threadpool.h"
 #include "kudu/util/trace.h"
 
@@ -36,15 +58,15 @@ namespace kudu {
 namespace tablet {
 
 using consensus::CommitMsg;
-using consensus::Consensus;
-using consensus::ConsensusRound;
-using consensus::ReplicateMsg;
-using consensus::CommitMsg;
 using consensus::DriverType;
+using consensus::RaftConsensus;
+using consensus::ReplicateMsg;
 using log::Log;
+using pb_util::SecureShortDebugString;
 using rpc::RequestIdPB;
 using rpc::ResultTracker;
-using std::shared_ptr;
+using std::string;
+using strings::Substitute;
 
 static const char* kTimestampFieldName = "timestamp";
 
@@ -83,15 +105,15 @@ class FollowerTransactionCompletionCallback : public TransactionCompletionCallba
 ////////////////////////////////////////////////////////////
 
 TransactionDriver::TransactionDriver(TransactionTracker *txn_tracker,
-                                     Consensus* consensus,
+                                     RaftConsensus* consensus,
                                      Log* log,
-                                     ThreadPool* prepare_pool,
+                                     ThreadPoolToken* prepare_pool_token,
                                      ThreadPool* apply_pool,
                                      TransactionOrderVerifier* order_verifier)
     : txn_tracker_(txn_tracker),
       consensus_(consensus),
       log_(log),
-      prepare_pool_(prepare_pool),
+      prepare_pool_token_(prepare_pool_token),
       apply_pool_(apply_pool),
       order_verifier_(order_verifier),
       trace_(new Trace()),
@@ -105,6 +127,16 @@ TransactionDriver::TransactionDriver(TransactionTracker *txn_tracker,
 
 Status TransactionDriver::Init(gscoped_ptr<Transaction> transaction,
                                DriverType type) {
+  // If the tablet has been stopped, the replica is likely shutting down soon.
+  // Prevent further transacions from starting.
+  // Note: Some tests may not have a replica.
+  TabletReplica* replica = transaction->state()->tablet_replica();
+  {
+    std::shared_ptr<Tablet> tablet = replica ? replica->shared_tablet() : nullptr;
+    if (PREDICT_FALSE(tablet && tablet->HasBeenStopped())) {
+      return Status::IllegalState("Not initializing new transaction; the tablet is stopped");
+    }
+  }
   transaction_ = std::move(transaction);
 
   if (type == consensus::REPLICA) {
@@ -136,10 +168,12 @@ Status TransactionDriver::Init(gscoped_ptr<Transaction> transaction,
     gscoped_ptr<ReplicateMsg> replicate_msg;
     transaction_->NewReplicateMsg(&replicate_msg);
     if (consensus_) { // sometimes NULL in tests
-      // Unretained is required to avoid a refcount cycle.
+      // A raw pointer is required to avoid a refcount cycle.
       mutable_state()->set_consensus_round(
         consensus_->NewRound(std::move(replicate_msg),
-                             Bind(&TransactionDriver::ReplicationFinished, Unretained(this))));
+                             std::bind(&TransactionDriver::ReplicationFinished,
+                                       this,
+                                       std::placeholders::_1)));
     }
   }
 
@@ -193,7 +227,7 @@ Status TransactionDriver::ExecuteAsync() {
   }
 
   if (s.ok()) {
-    s = prepare_pool_->SubmitClosure(
+    s = prepare_pool_token_->SubmitClosure(
       Bind(&TransactionDriver::PrepareTask, Unretained(this)));
   }
 
@@ -272,7 +306,7 @@ Status TransactionDriver::Prepare() {
     } else {
       if (state()->are_results_tracked()
           && !state()->result_tracker()->IsCurrentDriver(state()->request_id())) {
-        transaction_status_ = Status::AlreadyPresent(strings::Substitute(
+        transaction_status_ = Status::AlreadyPresent(Substitute(
             "There's already an attempt of the same operation on the server for request id: $0",
             SecureShortDebugString(state()->request_id())));
         replication_state_ = REPLICATION_FAILED;
@@ -340,24 +374,26 @@ void TransactionDriver::HandleFailure(const Status& s) {
   }
 
   switch (repl_state_copy) {
+    case REPLICATING:
+    case REPLICATED:
+    {
+      // Replicated transactions are only allowed to fail if the tablet has
+      // been stopped.
+      if (!state()->tablet_replica()->tablet()->HasBeenStopped()) {
+        LOG_WITH_PREFIX(FATAL) << "Cannot cancel transactions that have already replicated"
+            << ": " << transaction_status_.ToString()
+            << " transaction:" << ToString();
+      }
+      FALLTHROUGH_INTENDED;
+    }
     case NOT_REPLICATING:
     case REPLICATION_FAILED:
     {
-      VLOG_WITH_PREFIX(1) << "Transaction " << ToString() << " failed prior to "
-          "replication success: " << s.ToString();
+      VLOG_WITH_PREFIX(1) << Substitute("Transaction $0 failed: $1", ToString(), s.ToString());
       transaction_->Finish(Transaction::ABORTED);
       mutable_state()->completion_callback()->set_error(transaction_status_);
       mutable_state()->completion_callback()->TransactionCompleted();
       txn_tracker_->Release(this);
-      return;
-    }
-
-    case REPLICATING:
-    case REPLICATED:
-    {
-      LOG_WITH_PREFIX(FATAL) << "Cannot cancel transactions that have already replicated"
-          << ": " << transaction_status_.ToString()
-          << " transaction:" << ToString();
     }
   }
 }
@@ -442,7 +478,7 @@ Status TransactionDriver::ApplyAsync() {
       order_verifier_->CheckApply(op_id_copy_.index(), prepare_physical_timestamp_);
       // Now that the transaction is committed in consensus advance the safe time.
       if (transaction_->state()->external_consistency_mode() != COMMIT_WAIT) {
-        transaction_->state()->tablet_peer()->tablet()->mvcc_manager()->
+        transaction_->state()->tablet_replica()->tablet()->mvcc_manager()->
             AdjustSafeTime(transaction_->state()->timestamp());
       }
     } else {
@@ -461,6 +497,11 @@ Status TransactionDriver::ApplyAsync() {
 void TransactionDriver::ApplyTask() {
   TRACE_EVENT_FLOW_END0("txn", "ApplyTask", this);
   ADOPT_TRACE(trace());
+  Tablet* tablet = state()->tablet_replica()->tablet();
+  if (tablet->HasBeenStopped()) {
+    HandleFailure(Status::IllegalState("Not Applying transaction; the tablet is stopped"));
+    return;
+  }
 
   {
     std::lock_guard<simple_spinlock> lock(lock_);
@@ -474,7 +515,13 @@ void TransactionDriver::ApplyTask() {
 
   {
     gscoped_ptr<CommitMsg> commit_msg;
-    CHECK_OK(transaction_->Apply(&commit_msg));
+    Status s = transaction_->Apply(&commit_msg);
+    if (PREDICT_FALSE(!s.ok())) {
+      LOG(WARNING) << Substitute("Did not Apply transaction $0: $1",
+          transaction_->ToString(), s.ToString());
+      HandleFailure(s);
+      return;
+    }
     commit_msg->mutable_commited_op_id()->CopyFrom(op_id_copy_);
     SetResponseTimestamp(transaction_->state(), transaction_->state()->timestamp());
 
@@ -515,7 +562,7 @@ void TransactionDriver::SetResponseTimestamp(TransactionState* transaction_state
 Status TransactionDriver::CommitWait() {
   MonoTime before = MonoTime::Now();
   DCHECK(mutable_state()->external_consistency_mode() == COMMIT_WAIT);
-  RETURN_NOT_OK(mutable_state()->tablet_peer()->clock()->WaitUntilAfter(
+  RETURN_NOT_OK(mutable_state()->tablet_replica()->clock()->WaitUntilAfter(
       mutable_state()->timestamp(), MonoTime::Max()));
   mutable_state()->mutable_metrics()->commit_wait_duration_usec =
       (MonoTime::Now() - before).ToMicroseconds();
@@ -582,12 +629,12 @@ std::string TransactionDriver::LogPrefix() const {
   string state_str = StateString(repl_state_copy, prep_state_copy);
   // We use the tablet and the peer (T, P) to identify ts and tablet and the timestamp (Ts) to
   // (help) identify the transaction. The state string (S) describes the state of the transaction.
-  return strings::Substitute("T $0 P $1 S $2 Ts $3: ",
-                             // consensus_ is NULL in some unit tests.
-                             PREDICT_TRUE(consensus_) ? consensus_->tablet_id() : "(unknown)",
-                             PREDICT_TRUE(consensus_) ? consensus_->peer_uuid() : "(unknown)",
-                             state_str,
-                             ts_string);
+  return Substitute("T $0 P $1 S $2 Ts $3: ",
+                    // consensus_ is NULL in some unit tests.
+                    PREDICT_TRUE(consensus_) ? consensus_->tablet_id() : "(unknown)",
+                    PREDICT_TRUE(consensus_) ? consensus_->peer_uuid() : "(unknown)",
+                    state_str,
+                    ts_string);
 }
 
 }  // namespace tablet

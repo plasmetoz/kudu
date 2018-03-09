@@ -19,16 +19,27 @@
 #ifndef KUDU_UTIL_TEST_UTIL_H
 #define KUDU_UTIL_TEST_UTIL_H
 
+#include <sys/types.h>
+
+#include <cstdint>
 #include <functional>
-#include <gtest/gtest.h>
 #include <string>
 
-#include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/util/env.h"
+#include <gflags/gflags.h>
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/test_macros.h"
+
+#define ASSERT_EVENTUALLY(expr) do { \
+  AssertEventually(expr); \
+  NO_PENDING_FATALS(); \
+} while (0)
 
 namespace kudu {
+
+class Env;
+class Status;
 
 extern const char* kInvalidPath;
 
@@ -92,13 +103,30 @@ std::string GetTestDataDirectory();
 //     ASSERT_GT(ReadValueOfMetric(), 10);
 //   });
 //
-// The function is run in a loop with exponential backoff, capped at once
-// a second.
+// The function is run in a loop with optional back-off.
+//
+// To check whether AssertEventually() eventually succeeded, call
+// NO_PENDING_FATALS() afterward, or use ASSERT_EVENTUALLY() which performs
+// this check automatically.
+enum class AssertBackoff {
+  // Use exponential back-off while looping, capped at one second.
+  EXPONENTIAL,
+
+  // Sleep for a millisecond while looping.
+  NONE,
+};
 void AssertEventually(const std::function<void(void)>& f,
-                      const MonoDelta& timeout = MonoDelta::FromSeconds(30));
+                      const MonoDelta& timeout = MonoDelta::FromSeconds(30),
+                      AssertBackoff backoff = AssertBackoff::EXPONENTIAL);
 
 // Count the number of open file descriptors in use by this process.
 int CountOpenFds(Env* env);
+
+// Waits for the subprocess to bind to any listening TCP port, and returns the port.
+Status WaitForTcpBind(pid_t pid, uint16_t* port, MonoDelta timeout) WARN_UNUSED_RESULT;
+
+// Waits for the subprocess to bind to any listening UDP port, and returns the port.
+Status WaitForUdpBind(pid_t pid, uint16_t* port, MonoDelta timeout) WARN_UNUSED_RESULT;
 
 } // namespace kudu
 #endif

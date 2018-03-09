@@ -14,53 +14,60 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_TABLET_H
-#define KUDU_TABLET_TABLET_H
 
-#include <condition_variable>
+#pragma once
+
+#include <cstddef>
+#include <cstdint>
 #include <iosfwd>
 #include <map>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/schema.h"
-#include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/threading/thread_collision_warner.h"
 #include "kudu/tablet/lock_manager.h"
 #include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/rowset.h"
-#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/tablet/tablet_metadata.h"
+#include "kudu/util/bloom_filter.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/rw_semaphore.h"
 #include "kudu/util/semaphore.h"
-#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
-#include "kudu/util/throttler.h"
 
 namespace kudu {
 
+class ConstContiguousRow;
+class MaintenanceManager;
+class MaintenanceOp;
+class MaintenanceOpStats;
 class MemTracker;
-class MetricEntity;
-class RowChangeList;
-class UnionIterator;
+class MonoDelta;
+class RowBlock;
+class ScanSpec;
+class Throttler;
+class Timestamp;
+struct IteratorStats;
 
 namespace log {
 class LogAnchorRegistry;
 }
-
-namespace server {
-class Clock;
-}
-
-class MaintenanceManager;
-class MaintenanceOp;
-class MaintenanceOpStats;
 
 namespace tablet {
 
@@ -68,7 +75,6 @@ class AlterSchemaTransactionState;
 class CompactionPolicy;
 class HistoryGcOpts;
 class MemRowSet;
-class MvccSnapshot;
 struct RowOp;
 class RowSetsInCompaction;
 class RowSetTree;
@@ -92,7 +98,7 @@ class Tablet {
   // If 'metric_registry' is non-NULL, then this tablet will create a 'tablet' entity
   // within the provided registry. Otherwise, no metrics are collected.
   Tablet(const scoped_refptr<TabletMetadata>& metadata,
-         const scoped_refptr<server::Clock>& clock,
+         const scoped_refptr<clock::Clock>& clock,
          const std::shared_ptr<MemTracker>& parent_mem_tracker,
          MetricRegistry* metric_registry,
          const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry);
@@ -105,9 +111,26 @@ class Tablet {
 
   // Mark that the tablet has finished bootstrapping.
   // This transitions from kBootstrapping to kOpen state.
-  void MarkFinishedBootstrapping();
+  // Returns an error if tablet has been stopped.
+  Status MarkFinishedBootstrapping();
 
+  // Shuts down the tablet, unregistering various components that may attempt
+  // to point back to it, and changing the lifecycle state to 'kShutdown'.
   void Shutdown();
+
+  // Stops the tablet from making any progress. Currently-Applying operations
+  // are terminated early on a best-effort basis, new transactions will return
+  // with Status::Aborted(), tablet maintenance ops will no longer be
+  // scheduled, and the lifecycle state is set to 'kStopped'.
+  //
+  // Currently, the tablet will only be Stopped as the tablet is shutting down.
+  // In the future, it can be Stopped when it hits a non-recoverable error
+  // (e.g. a disk error) to immediately prevent further writes.
+  void Stop();
+
+  // Returns whether the tablet has been stopped, i.e. is in either the
+  // 'kStopped' or 'kShutdown' state.
+  bool HasBeenStopped() const;
 
   // Decode the Write (insert/mutate) operations from within a user's
   // request.
@@ -154,13 +177,13 @@ class Tablet {
   void StartApplying(WriteTransactionState* tx_state);
 
   // Apply all of the row operations associated with this transaction.
-  void ApplyRowOperations(WriteTransactionState* tx_state);
+  Status ApplyRowOperations(WriteTransactionState* tx_state) WARN_UNUSED_RESULT;
 
   // Apply a single row operation, which must already be prepared.
-  // The result is set back into row_op->result
-  void ApplyRowOperation(WriteTransactionState* tx_state,
-                         RowOp* row_op,
-                         ProbeStats* stats);
+  // The result is set back into row_op->result.
+  Status ApplyRowOperation(WriteTransactionState* tx_state,
+                           RowOp* row_op,
+                           ProbeStats* stats) WARN_UNUSED_RESULT;
 
   // Create a new row iterator which yields the rows as of the current MVCC
   // state of this tablet.
@@ -197,7 +220,7 @@ class Tablet {
   // the operations in the log with the correct schema.
   //
   // REQUIRES: state_ == kBootstrapping
-  Status RewindSchemaForBootstrap(const Schema& schema,
+  Status RewindSchemaForBootstrap(const Schema& new_schema,
                                   int64_t schema_version);
 
   // Prints current RowSet layout, taking a snapshot of the current RowSet interval
@@ -235,8 +258,13 @@ class Tablet {
   // the current MRS.
   size_t MemRowSetLogReplaySize(const ReplaySizeMap& replay_size_map) const;
 
-  // Estimate the total on-disk size of this tablet, in bytes.
-  size_t EstimateOnDiskSize() const;
+  // Returns the total on-disk size of this tablet, in bytes.
+  // Includes the tablet superblock.
+  size_t OnDiskSize() const;
+
+  // Returns the on-disk size of this tablet's data, in bytes.
+  // Excludes all metadata (both tablet metadata and the metadata of this tablet's rowsets).
+  size_t OnDiskDataSize() const;
 
   // Get the total size of all the DMS
   size_t DeltaMemStoresSize() const;
@@ -250,7 +278,7 @@ class Tablet {
                                 int64_t* mem_size, int64_t* replay_size) const;
 
   // Flushes the DMS with the highest retention.
-  Status FlushDMSWithHighestRetention(const ReplaySizeMap& replay_size_map) const;
+  Status FlushBestDMS(const ReplaySizeMap &replay_size_map) const;
 
   // Flush only the biggest DMS
   Status FlushBiggestDMS();
@@ -310,7 +338,7 @@ class Tablet {
   // Verbosely dump this entire tablet to the logs. This is only
   // really useful when debugging unit tests failures where the tablet
   // has a very small number of rows.
-  Status DebugDump(vector<std::string> *lines = NULL);
+  Status DebugDump(std::vector<std::string> *lines = NULL);
 
   const Schema* schema() const {
     return &metadata_->schema();
@@ -328,6 +356,7 @@ class Tablet {
 
   const TabletMetadata *metadata() const { return metadata_.get(); }
   TabletMetadata *metadata() { return metadata_.get(); }
+  scoped_refptr<TabletMetadata> shared_metadata() const { return metadata_; }
 
   void SetCompactionHooksForTests(const std::shared_ptr<CompactionFaultHooks> &hooks);
   void SetFlushHooksForTests(const std::shared_ptr<FlushFaultHooks> &hooks);
@@ -341,10 +370,8 @@ class Tablet {
   // Runs a major delta major compaction on columns with specified IDs.
   // NOTE: RowSet must presently be a DiskRowSet. (Perhaps the API should be
   // a shared_ptr API for now?)
-  //
-  // TODO: Handle MVCC to support MemRowSet and handle deltas in DeltaMemStore
-  Status DoMajorDeltaCompaction(const std::vector<ColumnId>& column_ids,
-                                std::shared_ptr<RowSet> input_rowset);
+  Status DoMajorDeltaCompaction(const std::vector<ColumnId>& col_ids,
+                                const std::shared_ptr<RowSet>& input_rs);
 
   // Calculates the ancient history mark and returns true iff tablet history GC
   // is enabled, which requires the use of a HybridClock.
@@ -357,14 +384,23 @@ class Tablet {
   // Method used by tests to retrieve all rowsets of this table. This
   // will be removed once code for selecting the appropriate RowSet is
   // finished and delta files is finished is part of Tablet class.
-  void GetRowSetsForTests(vector<std::shared_ptr<RowSet> >* out);
+  void GetRowSetsForTests(std::vector<std::shared_ptr<RowSet> >* out);
 
   // Register the maintenance ops associated with this tablet
-  void RegisterMaintenanceOps(MaintenanceManager* maintenance_manager);
+  void RegisterMaintenanceOps(MaintenanceManager* maint_mgr);
 
-  // Unregister the maintenance ops associated with this tablet.
-  // This method is not thread safe.
+  // Unregister the maintenance ops associated with this tablet. This will wait
+  // for all ops to finish before returning.
+  //
+  // This method is not thread safe, but is currently only called during
+  // TabletReplica::Shutdown(), which is single-threaded by design.
   void UnregisterMaintenanceOps();
+
+  // Cancel the maintenance ops associated with this tablet. This will prevent
+  // further scheduling of the ops and will not wait for any ops to finish.
+  //
+  // This method is thread-safe.
+  void CancelMaintenanceOps();
 
   const std::string& tablet_id() const { return metadata_->tablet_id(); }
 
@@ -386,16 +422,80 @@ class Tablet {
   // Return true if this RPC is allowed.
   bool ShouldThrottleAllow(int64_t bytes);
 
-  scoped_refptr<server::Clock> clock() const { return clock_; }
+  scoped_refptr<clock::Clock> clock() const { return clock_; }
 
   std::string LogPrefix() const;
 
+  // Return the default bloom filter sizing parameters, configured by server flags.
+  static BloomFilterSizing DefaultBloomSizing();
+
  private:
   friend class Iterator;
-  friend class TabletPeerTest;
+  friend class TabletReplicaTest;
   FRIEND_TEST(TestTablet, TestGetReplaySizeForIndex);
 
+  // Lifecycle states that a Tablet can be in. Legal state transitions for a
+  // Tablet object:
+  //
+  //   kInitialized -> kBootstrapping -> kOpen -> kStopped -> kShutdown
+  //         |               |             |        ^^^
+  //         |               |             +--------+||
+  //         |               +-----------------------+|
+  //         +----------------------------------------+
+  enum State {
+    kInitialized,
+    kBootstrapping,
+    kOpen,
+    kStopped,
+    kShutdown
+  };
+
+  // Sets the lifecycle state of the tablet. See the definition of State for
+  // the valid transitions.
+  //
+  // Must be called while 'state_lock_' is held.
+  void set_state_unlocked(State s) {
+    DCHECK(state_lock_.is_locked());
+    switch (s) {
+      case kBootstrapping:
+        DCHECK_EQ(kInitialized, state_);
+        break;
+      case kOpen:
+        DCHECK_EQ(kBootstrapping, state_);
+        break;
+      case kStopped:
+        DCHECK(state_ == kInitialized ||
+               state_ == kBootstrapping ||
+               state_ == kOpen);
+        break;
+      case kShutdown:
+        DCHECK(state_ == kStopped ||
+               state_ == kShutdown);
+        break;
+      default:
+        LOG(DFATAL) << "Illegal state transition!";
+    }
+    state_ = s;
+  }
+
+  // Returns an error if the tablet is in the 'kStopped' or 'kShutdown' state.
+  // Must be called while 'state_lock_' is held.
+  Status CheckHasNotBeenStoppedUnlocked() const;
+
+  // Returns an error if the tablet is in the 'kStopped' or 'kShutdown' state.
+  Status CheckHasNotBeenStopped() const {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    return CheckHasNotBeenStoppedUnlocked();
+  }
+
   Status FlushUnlocked();
+
+  // Validate the contents of 'op' and return a bad Status if it is invalid.
+  Status ValidateOp(const RowOp& op) const;
+
+  // Validate 'op' as in 'ValidateOp()' above. If it is invalid, marks the op as failed
+  // and returns false. If valid, marks the op as validated and returns true.
+  bool ValidateOpOrMarkFailed(RowOp* op) const;
 
   // Validate the given insert/upsert operation. In particular, checks that the size
   // of any cells is not too large given the configured maximum on the server, and
@@ -429,9 +529,13 @@ class Tablet {
 
   // Return the list of RowSets that need to be consulted when processing the
   // given insertion or mutation.
-  static std::vector<RowSet*> FindRowSetsToCheck(RowOp* op,
+  static std::vector<RowSet*> FindRowSetsToCheck(const RowOp* op,
                                                  const TabletComponents* comps);
 
+  // For each of the operations in 'tx_state', check for the presence of their
+  // row keys in the RowSets in the current RowSetTree (as determined by the transaction's
+  // captured TabletComponents).
+  Status BulkCheckPresence(WriteTransactionState* tx_state) WARN_UNUSED_RESULT;
 
   // Capture a set of iterators which, together, reflect all of the data in the tablet.
   //
@@ -445,7 +549,7 @@ class Tablet {
                                     const MvccSnapshot &snap,
                                     const ScanSpec *spec,
                                     OrderMode order,
-                                    vector<std::shared_ptr<RowwiseIterator> > *iters) const;
+                                    std::vector<std::shared_ptr<RowwiseIterator> > *iters) const;
 
   Status PickRowSetsToCompact(RowSetsInCompaction *picked,
                               CompactFlags flags) const;
@@ -495,8 +599,6 @@ class Tablet {
   // TODO: Document me.
   Status FlushInternal(const RowSetsInCompaction& input,
                        const std::shared_ptr<MemRowSet>& old_ms);
-
-  BloomFilterSizing bloom_sizing() const;
 
   // Convert the specified read client schema (without IDs) to a server schema (with IDs)
   // This method is used by NewRowIterator().
@@ -552,7 +654,6 @@ class Tablet {
   // NOTE: callers should avoid taking this lock for a long time, even in shared mode.
   // This is because the lock has some concept of fairness -- if, while a long reader
   // is active, a writer comes along, then all future short readers will be blocked.
-  // TODO: now that this is single-threaded again, we should change it to rw_spinlock
   mutable rw_spinlock component_lock_;
 
   // The current components of the tablet. These should always be read
@@ -571,7 +672,7 @@ class Tablet {
   int64_t next_mrs_id_;
 
   // A pointer to the server's clock.
-  scoped_refptr<server::Clock> clock_;
+  scoped_refptr<clock::Clock> clock_;
 
   MvccManager mvcc_;
   LockManager lock_manager_;
@@ -588,13 +689,17 @@ class Tablet {
   // started earlier completes after the one started later.
   mutable Semaphore rowsets_flush_sem_;
 
-  enum State {
-    kInitialized,
-    kBootstrapping,
-    kOpen,
-    kShutdown
-  };
+  // Lock protecting access to 'state_' and 'maintenance_ops_'.
+  // If taken with any other locks, this must be taken last, i.e. no locks can
+  // be acquired while holding this this.
+  mutable simple_spinlock state_lock_;
+
   State state_;
+
+  // Fake lock used to ensure calls to RegisterMaintenanceOps and
+  // UnregisterMaintenanceOps don't overlap. This serves to ensure that only
+  // one thread is updating the maintenance op list at a time.
+  DFAKE_MUTEX(maintenance_registration_fake_lock_);
 
   // Fault hooks. In production code, these will always be NULL.
   std::shared_ptr<CompactionFaultHooks> compaction_hooks_;
@@ -679,4 +784,3 @@ struct TabletComponents : public RefCountedThreadSafe<TabletComponents> {
 } // namespace tablet
 } // namespace kudu
 
-#endif

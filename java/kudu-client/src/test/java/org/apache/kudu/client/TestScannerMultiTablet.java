@@ -30,7 +30,9 @@ import com.stumbleupon.async.Deferred;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import org.apache.kudu.client.Client.ScanTokenPB;
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
 
 public class TestScannerMultiTablet extends BaseKuduTest {
@@ -195,6 +197,21 @@ public class TestScannerMultiTablet extends BaseKuduTest {
   }
 
   @Test(timeout = 100000)
+  public void testScanTokenReplicaSelections() throws Exception {
+    ScanTokenPB.Builder pbBuilder = ScanTokenPB.newBuilder();
+    pbBuilder.setTableName(table.getName());
+    pbBuilder.setReplicaSelection(Common.ReplicaSelection.CLOSEST_REPLICA);
+    Client.ScanTokenPB scanTokenPB = pbBuilder.build();
+    final byte[] serializedToken = KuduScanToken.serialize(scanTokenPB);
+
+    // Deserialize the scan token into a scanner, and make sure it is using
+    // 'CLOSEST_REPLICA' selection policy.
+    KuduScanner scanner = KuduScanToken.deserializeIntoScanner(serializedToken, syncClient);
+    assertEquals(ReplicaSelection.CLOSEST_REPLICA, scanner.getReplicaSelection());
+    assertEquals(9, countRowsInScan(scanner));
+  }
+
+  @Test(timeout = 100000)
   public void testReadAtSnapshotNoTimestamp() throws Exception {
     // Perform scan in READ_AT_SNAPSHOT mode with no snapshot timestamp
     // specified. Verify that the scanner timestamp is set from the tablet
@@ -225,31 +242,71 @@ public class TestScannerMultiTablet extends BaseKuduTest {
 
   @Test(timeout = 100000)
   public void testScanPropagatesLatestTimestamp() throws Exception {
+    // Reset the clients in order to clear the propagated timestamp, which may
+    // have been set if other test cases ran before this one.
+    resetClients();
     AsyncKuduScanner scanner = client.newScannerBuilder(table).build();
+
     // Initially, the client does not have the timestamp set.
     assertEquals(AsyncKuduClient.NO_TIMESTAMP, client.getLastPropagatedTimestamp());
+    assertEquals(KuduClient.NO_TIMESTAMP, syncClient.getLastPropagatedTimestamp());
     KuduScanner syncScanner = new KuduScanner(scanner);
 
+    // Check that both clients return the same propagated timestamp.
     assertTrue(syncScanner.hasMoreRows());
     assertEquals(AsyncKuduClient.NO_TIMESTAMP, client.getLastPropagatedTimestamp());
+    assertEquals(KuduClient.NO_TIMESTAMP, syncClient.getLastPropagatedTimestamp());
 
     int rowCount = syncScanner.nextRows().getNumRows();
     // At this point, the call to the first tablet server should have been
     // done already, so the client should have received the propagated timestamp
     // in the scanner response.
-    long tsRef = client.getLastPropagatedTimestamp();
-    assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, tsRef);
+    long asyncTsRef = client.getLastPropagatedTimestamp();
+    long syncTsRef = syncClient.getLastPropagatedTimestamp();
+    assertEquals(asyncTsRef, syncTsRef);
+    assertNotEquals(AsyncKuduClient.NO_TIMESTAMP, asyncTsRef);
+    assertNotEquals(KuduClient.NO_TIMESTAMP, syncTsRef);
 
     assertTrue(syncScanner.hasMoreRows());
     while (syncScanner.hasMoreRows()) {
       rowCount += syncScanner.nextRows().getNumRows();
-      final long ts = client.getLastPropagatedTimestamp();
+      final long asyncTs = client.getLastPropagatedTimestamp();
+      final long syncTs = syncClient.getLastPropagatedTimestamp();
       // Next scan responses from tablet servers should move the propagated
       // timestamp further.
-      assertTrue(ts > tsRef);
-      tsRef = ts;
+      assertEquals(syncTs, asyncTs);
+      assertTrue(asyncTs > asyncTsRef);
+      asyncTsRef = asyncTs;
     }
     assertNotEquals(0, rowCount);
+  }
+
+  @Test(timeout = 100000)
+  public void testScanTokenPropagatesTimestamp() throws Exception {
+    resetClients();
+
+    // Initially, the client does not have the timestamp set.
+    assertEquals(AsyncKuduClient.NO_TIMESTAMP, client.getLastPropagatedTimestamp());
+    assertEquals(KuduClient.NO_TIMESTAMP, syncClient.getLastPropagatedTimestamp());
+    AsyncKuduScanner scanner = client.newScannerBuilder(table).build();
+    KuduScanner syncScanner = new KuduScanner(scanner);
+
+    // Let the client receive the propagated timestamp in the scanner response.
+    syncScanner.nextRows().getNumRows();
+    final long tsPrev = client.getLastPropagatedTimestamp();
+    final long tsPropagated = tsPrev + 1000000;
+
+    ScanTokenPB.Builder pbBuilder = ScanTokenPB.newBuilder();
+    pbBuilder.setTableName(table.getName());
+    pbBuilder.setPropagatedTimestamp(tsPropagated);
+    Client.ScanTokenPB scanTokenPB = pbBuilder.build();
+    final byte[] serializedToken = KuduScanToken.serialize(scanTokenPB);
+
+    // Deserialize scan tokens and make sure the client's last propagated
+    // timestamp is updated accordingly.
+    assertEquals(tsPrev, client.getLastPropagatedTimestamp());
+    KuduScanToken.deserializeIntoScanner(serializedToken, syncClient);
+    assertEquals(tsPropagated, client.getLastPropagatedTimestamp());
   }
 
   private AsyncKuduScanner getScanner(String lowerBoundKeyOne,

@@ -45,11 +45,13 @@ set(KRPC_SRCS
     blocking_ops.cc
     client_negotiation.cc
     connection.cc
+    connection_id.cc
     constants.cc
     inbound_call.cc
     messenger.cc
     negotiation.cc
     outbound_call.cc
+    periodic.cc
     proxy.cc
     reactor.cc
     remote_method.cc
@@ -74,6 +76,7 @@ set(KRPC_SRCS
 
 set(KRPC_LIBS
   cyrus_sasl
+  gssapi_krb5
   gutil
   kudu_util
   libev
@@ -116,13 +119,20 @@ target_link_libraries(rtest_krpc
   rtest_diff_package_proto)
 
 # Tests
-set(KUDU_TEST_LINK_LIBS rtest_krpc krpc rpc_header_proto security-test ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(exactly_once_rpc-test)
+set(KUDU_TEST_LINK_LIBS
+  krpc
+  mini_kdc
+  rpc_header_proto
+  rtest_krpc
+  security_test_util
+  ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(exactly_once_rpc-test PROCESSORS 10)
 ADD_KUDU_TEST(mt-rpc-test RUN_SERIAL true)
 ADD_KUDU_TEST(negotiation-test)
+ADD_KUDU_TEST(periodic-test)
 ADD_KUDU_TEST(reactor-test)
 ADD_KUDU_TEST(request_tracker-test)
 ADD_KUDU_TEST(rpc-bench RUN_SERIAL true)
 ADD_KUDU_TEST(rpc-test)
 ADD_KUDU_TEST(rpc_stub-test)
-ADD_KUDU_TEST(service_queue-test)
+ADD_KUDU_TEST(service_queue-test RUN_SERIAL true)

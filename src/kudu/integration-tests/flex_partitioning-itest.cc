@@ -19,23 +19,42 @@
 // of PK subsets, etc).
 
 #include <algorithm>
-#include <glog/stl_logging.h>
-#include <map>
+#include <cstdint>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/scan_predicate.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/value.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
-#include "kudu/integration-tests/cluster_itest_util.h"
-#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
+#include "kudu/master/master.pb.h"
+#include "kudu/master/master.proxy.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/tools/data_gen_util.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/gutil/strings/escaping.h"
 
 using kudu::client::KuduClient;
 using kudu::client::KuduClientBuilder;
@@ -52,10 +71,14 @@ using kudu::client::KuduTable;
 using kudu::client::KuduTableCreator;
 using kudu::client::KuduValue;
 using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
 using kudu::master::GetTableLocationsRequestPB;
 using kudu::master::GetTableLocationsResponsePB;
 using kudu::master::MasterErrorPB;
 using kudu::rpc::RpcController;
+using std::pair;
+using std::string;
 using std::unique_ptr;
 using std::unordered_map;
 using std::vector;
@@ -158,9 +181,9 @@ class FlexPartitioningITest : public KuduTest,
     opts.num_tablet_servers = 1;
     // This test produces lots of tablets. With container and log preallocation,
     // we end up using quite a bit of disk space. So, we disable them.
-    opts.extra_tserver_flags.push_back("--log_container_preallocate_bytes=0");
-    opts.extra_tserver_flags.push_back("--log_preallocate_segments=false");
-    cluster_.reset(new ExternalMiniCluster(opts));
+    opts.extra_tserver_flags.emplace_back("--log_container_preallocate_bytes=0");
+    opts.extra_tserver_flags.emplace_back("--log_preallocate_segments=false");
+    cluster_.reset(new ExternalMiniCluster(std::move(opts)));
     ASSERT_OK(cluster_->Start());
 
     ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
@@ -306,7 +329,7 @@ Status FlexPartitioningITest::InsertRows(const RangePartitionOptions& range_part
     range_partition.bounds.empty() ? kDefaultBounds : range_partition.bounds;
 
   shared_ptr<KuduSession> session(client_->NewSession());
-  session->SetTimeoutMillis(10000);
+  session->SetTimeoutMillis(60000);
   RETURN_NOT_OK(session->SetFlushMode(KuduSession::AUTO_FLUSH_BACKGROUND));
 
   int count = 0;
@@ -327,21 +350,21 @@ Status FlexPartitioningITest::InsertRows(const RangePartitionOptions& range_part
 
 void FlexPartitioningITest::CheckScanWithColumnPredicate(Slice col_name, int lower, int upper) {
   KuduScanner scanner(table_.get());
-  CHECK_OK(scanner.SetTimeoutMillis(60000));
-  CHECK_OK(scanner.AddConjunctPredicate(table_->NewComparisonPredicate(
+  ASSERT_OK(scanner.SetTimeoutMillis(60000));
+  ASSERT_OK(scanner.AddConjunctPredicate(table_->NewComparisonPredicate(
       col_name, KuduPredicate::GREATER_EQUAL, KuduValue::FromInt(lower))));
-  CHECK_OK(scanner.AddConjunctPredicate(table_->NewComparisonPredicate(
+  ASSERT_OK(scanner.AddConjunctPredicate(table_->NewComparisonPredicate(
       col_name, KuduPredicate::LESS_EQUAL, KuduValue::FromInt(upper))));
 
   vector<string> rows;
-  ScanToStrings(&scanner, &rows);
+  ASSERT_OK(ScanToStrings(&scanner, &rows));
   std::sort(rows.begin(), rows.end());
 
   // Manually evaluate the predicate against the data we think we inserted.
   vector<string> expected_rows;
   for (auto& row : inserted_rows_) {
     int32_t val;
-    CHECK_OK(row->GetInt32(col_name, &val));
+    ASSERT_OK(row->GetInt32(col_name, &val));
     if (val >= lower && val <= upper) {
       expected_rows.push_back("(" + row->ToString() + ")");
     }
@@ -357,23 +380,23 @@ void FlexPartitioningITest::CheckScanWithColumnPredicate(Slice col_name, int low
 void FlexPartitioningITest::CheckScanTokensWithColumnPredicate(
     Slice col_name, int lower, int upper, const vector<string>& expected_rows) {
   KuduScanTokenBuilder builder(table_.get());
-  CHECK_OK(builder.SetTimeoutMillis(60000));
+  ASSERT_OK(builder.SetTimeoutMillis(60000));
 
-  CHECK_OK(builder.AddConjunctPredicate(table_->NewComparisonPredicate(
+  ASSERT_OK(builder.AddConjunctPredicate(table_->NewComparisonPredicate(
       col_name, KuduPredicate::GREATER_EQUAL, KuduValue::FromInt(lower))));
-  CHECK_OK(builder.AddConjunctPredicate(table_->NewComparisonPredicate(
+  ASSERT_OK(builder.AddConjunctPredicate(table_->NewComparisonPredicate(
       col_name, KuduPredicate::LESS_EQUAL, KuduValue::FromInt(upper))));
 
   vector<KuduScanToken*> tokens;
   ElementDeleter DeleteTable(&tokens);
-  CHECK_OK(builder.Build(&tokens));
+  ASSERT_OK(builder.Build(&tokens));
 
   vector<string> rows;
   for (auto token : tokens) {
     KuduScanner* scanner_ptr;
-    CHECK_OK(token->IntoKuduScanner(&scanner_ptr));
+    ASSERT_OK(token->IntoKuduScanner(&scanner_ptr));
     unique_ptr<KuduScanner> scanner(scanner_ptr);
-    ScanToStrings(scanner.get(), &rows);
+    ASSERT_OK(ScanToStrings(scanner.get(), &rows));
   }
   std::sort(rows.begin(), rows.end());
 
@@ -387,7 +410,7 @@ void FlexPartitioningITest::CheckPKRangeScan(int lower, int upper) {
   ASSERT_OK(scanner.AddLowerBound(*inserted_rows_[lower]));
   ASSERT_OK(scanner.AddExclusiveUpperBound(*inserted_rows_[upper]));
   vector<string> rows;
-  ScanToStrings(&scanner, &rows);
+  ASSERT_OK(ScanToStrings(&scanner, &rows));
   std::sort(rows.begin(), rows.end());
 
   vector<string> expected_rows;
@@ -403,9 +426,10 @@ void FlexPartitioningITest::CheckPKRangeScan(int lower, int upper) {
 void FlexPartitioningITest::CheckPartitionKeyRangeScan() {
   GetTableLocationsResponsePB table_locations;
   ASSERT_OK(GetTableLocations(cluster_->master_proxy(),
-                    table_->name(),
-                    MonoDelta::FromSeconds(32),
-                    &table_locations));
+                              table_->name(),
+                              MonoDelta::FromSeconds(32),
+                              master::VOTER_REPLICA,
+                              &table_locations));
 
   vector<string> rows;
 
@@ -419,7 +443,7 @@ void FlexPartitioningITest::CheckPartitionKeyRangeScan() {
     scanner.SetTimeoutMillis(60000);
     ASSERT_OK(scanner.AddLowerBoundPartitionKeyRaw(partition_key_start));
     ASSERT_OK(scanner.AddExclusiveUpperBoundPartitionKeyRaw(partition_key_end));
-    ScanToStrings(&scanner, &rows);
+    ASSERT_OK(ScanToStrings(&scanner, &rows));
   }
   std::sort(rows.begin(), rows.end());
 
@@ -436,10 +460,10 @@ void FlexPartitioningITest::CheckPartitionKeyRangeScan() {
 void FlexPartitioningITest::CheckPartitionKeyRangeScanWithPKRange(int lower, int upper) {
   GetTableLocationsResponsePB table_locations;
   ASSERT_OK(GetTableLocations(cluster_->master_proxy(),
-                    table_->name(),
-                    MonoDelta::FromSeconds(32),
-                    &table_locations));
-
+                              table_->name(),
+                              MonoDelta::FromSeconds(32),
+                              master::VOTER_REPLICA,
+                              &table_locations));
   vector<string> rows;
 
   for (const master::TabletLocationsPB& tablet_locations :
@@ -454,7 +478,7 @@ void FlexPartitioningITest::CheckPartitionKeyRangeScanWithPKRange(int lower, int
     ASSERT_OK(scanner.AddExclusiveUpperBoundPartitionKeyRaw(partition_key_end));
     ASSERT_OK(scanner.AddLowerBound(*inserted_rows_[lower]));
     ASSERT_OK(scanner.AddExclusiveUpperBound(*inserted_rows_[upper]));
-    ScanToStrings(&scanner, &rows);
+    ASSERT_OK(ScanToStrings(&scanner, &rows));
   }
   std::sort(rows.begin(), rows.end());
 

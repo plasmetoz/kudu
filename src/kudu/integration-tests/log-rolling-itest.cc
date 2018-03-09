@@ -18,14 +18,17 @@
 // Tests that log rolling and excess logfile cleanup logic works correctly.
 
 #include <algorithm>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/util/env.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
@@ -35,6 +38,11 @@ using strings::Substitute;
 
 namespace kudu {
 
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
+
+class LogRollingITest : public KuduTest {};
+
 static int64_t CountInfoLogs(const string& log_dir) {
     vector<string> logfiles;
     string pattern = Substitute("$0/*.$1.*", log_dir, "INFO");
@@ -43,13 +51,13 @@ static int64_t CountInfoLogs(const string& log_dir) {
 }
 
 // Tests that logs roll on startup, and get cleaned up appropriately.
-TEST(LogRollingITest, TestLogCleanupOnStartup) {
+TEST_F(LogRollingITest, TestLogCleanupOnStartup) {
   ExternalMiniClusterOptions opts;
   opts.num_masters = 1;
   opts.num_tablet_servers = 0;
   opts.extra_master_flags = { "--max_log_files=3", };
   opts.logtostderr = false;
-  ExternalMiniCluster cluster(opts);
+  ExternalMiniCluster cluster(std::move(opts));
   ASSERT_OK(cluster.Start());
 
   // Explicitly wait for the catalog manager because we've got no tservers in
@@ -61,7 +69,7 @@ TEST(LogRollingITest, TestLogCleanupOnStartup) {
   ASSERT_OK(cluster.master()->WaitForCatalogManager());
 
   for (int i = 1; i <= 10; i++) {
-    AssertEventually([&] () {
+    ASSERT_EVENTUALLY([&] () {
         ASSERT_EQ(std::min(3, i), CountInfoLogs(cluster.master()->log_dir()));
     });
     cluster.master()->Shutdown();

@@ -16,11 +16,30 @@
 // under the License.
 #include "kudu/tserver/tablet_server-test-base.h"
 
+#include <cstdint>
+#include <ostream>
+#include <string>
+#include <vector>
 #include <thread>
 
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/jsonwriter.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/process_memory.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
 DEFINE_int32(runtime_secs, 10,
              "Maximum number of seconds to run. If the threads have not completed "
@@ -60,7 +79,7 @@ class TSStressTest : public TabletServerTestBase {
 
   virtual void SetUp() OVERRIDE {
     TabletServerTestBase::SetUp();
-    NO_FATALS(StartTabletServer());
+    NO_FATALS(StartTabletServer(/* num_data_dirs */ 1));
 
     histogram_ = METRIC_insert_latency.Instantiate(ts_test_metric_entity_);
   }
@@ -99,7 +118,7 @@ void TSStressTest::InserterThread(int thread_idx) {
   int start_row = thread_idx * max_rows;
   for (int i = start_row; i < start_row + max_rows && stop_latch_.count() > 0; i++) {
     MonoTime before = MonoTime::Now();
-    InsertTestRowsRemote(thread_idx, i, 1);
+    InsertTestRowsRemote(i, 1);
     MonoTime after = MonoTime::Now();
     MonoDelta delta = after - before;
     histogram_->Increment(delta.ToMicroseconds());
@@ -138,6 +157,19 @@ TEST_F(TSStressTest, TestMTInserts) {
   // Ensure the timeout thread is stopped before exiting.
   stop_latch_.CountDown();
   if (timeout_thread.joinable()) timeout_thread.join();
+
+#ifdef TCMALLOC_ENABLED
+  // In TCMalloc-enabled builds, verify that our memory tracking matches the
+  // actual memory consumed, within a short period of time (the memory tracking
+  // can lag by up to 50ms).
+  ASSERT_EVENTUALLY([&]() {
+      int64_t consumption = process_memory::CurrentConsumption();
+      LOG(INFO) << "consumption: " << consumption;
+      ASSERT_NEAR(process_memory::GetTCMallocCurrentAllocatedBytes(),
+                  consumption,
+                  consumption * 0.005);
+    });
+#endif
 }
 
 } // namespace tserver

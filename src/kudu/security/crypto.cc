@@ -17,15 +17,21 @@
 
 #include "kudu/security/crypto.h"
 
-#include <cstdio>
-#include <cstdlib>
+#include <memory>
+#include <ostream>
 #include <string>
 
 #include <glog/logging.h>
 #include <openssl/bio.h>
+#include <openssl/bn.h>
+#include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/opensslv.h>
+#include <openssl/ossl_typ.h>
 #include <openssl/pem.h>
 #include <openssl/rand.h>
+#include <openssl/rsa.h>
+#include <openssl/x509.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/openssl_util.h"
@@ -64,25 +70,25 @@ int DerWritePublicKey(BIO* bio, EVP_PKEY* key) {
 } // anonymous namespace
 
 template<> struct SslTypeTraits<BIGNUM> {
-  static constexpr auto free = &BN_free;
+  static constexpr auto kFreeFunc = &BN_free;
 };
 struct RsaPrivateKeyTraits : public SslTypeTraits<EVP_PKEY> {
-  static constexpr auto read_pem = &PEM_read_bio_PrivateKey;
-  static constexpr auto read_der = &d2i_PrivateKey_bio;
-  static constexpr auto write_pem = &PemWritePrivateKey;
-  static constexpr auto write_der = &i2d_PrivateKey_bio;
+  static constexpr auto kReadPemFunc = &PEM_read_bio_PrivateKey;
+  static constexpr auto kReadDerFunc = &d2i_PrivateKey_bio;
+  static constexpr auto kWritePemFunc = &PemWritePrivateKey;
+  static constexpr auto kWriteDerFunc = &i2d_PrivateKey_bio;
 };
 struct RsaPublicKeyTraits : public SslTypeTraits<EVP_PKEY> {
-  static constexpr auto read_pem = &PEM_read_bio_PUBKEY;
-  static constexpr auto read_der = &d2i_PUBKEY_bio;
-  static constexpr auto write_pem = &PemWritePublicKey;
-  static constexpr auto write_der = &DerWritePublicKey;
+  static constexpr auto kReadPemFunc = &PEM_read_bio_PUBKEY;
+  static constexpr auto kReadDerFunc = &d2i_PUBKEY_bio;
+  static constexpr auto kWritePemFunc = &PemWritePublicKey;
+  static constexpr auto kWriteDerFunc = &DerWritePublicKey;
 };
 template<> struct SslTypeTraits<RSA> {
-  static constexpr auto free = &RSA_free;
+  static constexpr auto kFreeFunc = &RSA_free;
 };
 template<> struct SslTypeTraits<EVP_MD_CTX> {
-  static constexpr auto free = &EVP_MD_CTX_destroy;
+  static constexpr auto kFreeFunc = &EVP_MD_CTX_destroy;
 };
 
 namespace {
@@ -122,6 +128,7 @@ Status PublicKey::FromBIO(BIO* bio, DataFormat format) {
 Status PublicKey::VerifySignature(DigestType digest,
                                   const std::string& data,
                                   const std::string& signature) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   const EVP_MD* md = GetMessageDigest(digest);
   auto md_ctx = ssl_make_unique(EVP_MD_CTX_create());
 
@@ -141,10 +148,12 @@ Status PublicKey::VerifySignature(DigestType digest,
   const int rc = EVP_DigestVerifyFinal(md_ctx.get(), sig_data, signature.size());
   if (rc < 0 || rc > 1) {
     return Status::RuntimeError(
-        Substitute("error verifying data signature: $0",
-                   GetOpenSSLErrors()));
+        Substitute("error verifying data signature: $0", GetOpenSSLErrors()));
   }
   if (rc == 0) {
+    // No sense stringifying the internal OpenSSL error, since a bad verification
+    // is self-explanatory.
+    ERR_clear_error();
     return Status::Corruption("data signature verification failed");
   }
 
@@ -152,6 +161,7 @@ Status PublicKey::VerifySignature(DigestType digest,
 }
 
 Status PublicKey::Equals(const PublicKey& other, bool* equals) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   int cmp = EVP_PKEY_cmp(data_.get(), other.data_.get());
   switch (cmp) {
     case -2:
@@ -178,15 +188,17 @@ Status PrivateKey::ToString(std::string* data, DataFormat format) const {
       data, format, data_.get());
 }
 
-Status PrivateKey::FromFile(const std::string& fpath, DataFormat format) {
+Status PrivateKey::FromFile(const std::string& fpath, DataFormat format,
+                            const PasswordCallback& password_cb) {
   return ::kudu::security::FromFile<RawDataType, RsaPrivateKeyTraits>(
-      fpath, format, &data_);
+      fpath, format, &data_, password_cb);
 }
 
 // The code is modeled after $OPENSSL_ROOT/apps/rsa.c code: there is
 // corresponding functionality to read public part from RSA private/public
 // keypair.
 Status PrivateKey::GetPublicKey(PublicKey* public_key) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(public_key);
   auto rsa = ssl_make_unique(EVP_PKEY_get1_RSA(CHECK_NOTNULL(data_.get())));
   if (PREDICT_FALSE(!rsa)) {
@@ -207,6 +219,7 @@ Status PrivateKey::GetPublicKey(PublicKey* public_key) const {
 Status PrivateKey::MakeSignature(DigestType digest,
                                  const std::string& data,
                                  std::string* signature) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(signature);
   const EVP_MD* md = GetMessageDigest(digest);
   auto md_ctx = ssl_make_unique(EVP_MD_CTX_create());
@@ -227,6 +240,7 @@ Status PrivateKey::MakeSignature(DigestType digest,
 }
 
 Status GeneratePrivateKey(int num_bits, PrivateKey* ret) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(ret);
   InitializeOpenSSL();
   auto key = ssl_make_unique(EVP_PKEY_new());
@@ -246,6 +260,7 @@ Status GeneratePrivateKey(int num_bits, PrivateKey* ret) {
 }
 
 Status GenerateNonce(string* s) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK_NOTNULL(s);
   unsigned char buf[kNonceSize];
   OPENSSL_RET_NOT_OK(RAND_bytes(buf, sizeof(buf)), "failed to generate nonce");

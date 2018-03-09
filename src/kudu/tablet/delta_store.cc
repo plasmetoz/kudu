@@ -18,16 +18,27 @@
 #include "kudu/tablet/delta_store.h"
 
 #include <algorithm>
+#include <cstdlib>
 
+#include <glog/logging.h>
+
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/deltafile.h"
+#include "kudu/util/memory/arena.h"
 
 namespace kudu {
 namespace tablet {
 
 using std::shared_ptr;
 using std::string;
+using std::vector;
 using strings::Substitute;
 
 string DeltaKeyAndUpdate::Stringify(DeltaType type, const Schema& schema, bool pad_key) const {
@@ -52,7 +63,7 @@ Status DebugDumpDeltaIterator(DeltaType type,
 
   const size_t kRowsPerBlock = 100;
 
-  Arena arena(32 * 1024, 128 * 1024);
+  Arena arena(32 * 1024);
   for (size_t i = 0; iter->HasNext(); ) {
     size_t n;
     if (nrows > 0) {
@@ -92,7 +103,7 @@ Status WriteDeltaIteratorToFile(DeltaIterator* iter,
 
   const size_t kRowsPerBlock = 100;
   DeltaStats stats;
-  Arena arena(32 * 1024, 128 * 1024);
+  Arena arena(32 * 1024);
   for (size_t i = 0; iter->HasNext(); ) {
     size_t n;
     if (nrows > 0) {

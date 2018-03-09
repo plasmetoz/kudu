@@ -17,13 +17,24 @@
     <parent>
         <groupId>org.apache.kudu</groupId>
         <artifactId>kudu-parent</artifactId>
-        <version>1.4.0-SNAPSHOT</version>
+        <version>1.7.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>kudu-${spark.version.label}_${scala.binary.version}</artifactId>
     <name>Kudu Spark Bindings</name>
 
     <dependencies>
+        <dependency>
+            <groupId>org.apache.kudu</groupId>
+            <artifactId>kudu-client</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.apache.yetus</groupId>
+            <artifactId>audience-annotations</artifactId>
+            <version>${yetus.version}</version>
+        </dependency>
+
         <dependency>
             <groupId>org.apache.spark</groupId>
             <artifactId>spark-core_${scala.binary.version}</artifactId>
@@ -48,12 +59,13 @@
             <version>${spark.version}</version>
             <scope>provided</scope>
         </dependency>
-
         <dependency>
-            <groupId>org.apache.kudu</groupId>
-            <artifactId>kudu-client</artifactId>
-            <version>${project.version}</version>
+            <groupId>org.scala-lang</groupId>
+            <artifactId>scala-library</artifactId>
+            <version>${scala.version}</version>
+            <scope>provided</scope>
         </dependency>
+
         <dependency>
             <groupId>org.apache.kudu</groupId>
             <artifactId>kudu-client</artifactId>
@@ -62,35 +74,15 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>org.apache.kudu</groupId>
-            <artifactId>interface-annotations</artifactId>
-            <version>${project.version}</version>
-        </dependency>
-
-        <dependency>
-            <groupId>org.scala-lang</groupId>
-            <artifactId>scala-library</artifactId>
-            <version>${scala.version}</version>
-            <scope>provided</scope>
-        </dependency>
-        <dependency>
             <groupId>junit</groupId>
             <artifactId>junit</artifactId>
             <version>${junit.version}</version>
             <scope>test</scope>
         </dependency>
-
         <dependency>
             <groupId>org.scalatest</groupId>
             <artifactId>scalatest_${scala.binary.version}</artifactId>
-            <version>2.2.4</version>
-            <scope>test</scope>
-        </dependency>
-
-        <dependency>
-            <groupId>org.scalamock</groupId>
-            <artifactId>scalamock-scalatest-support_${scala.binary.version}</artifactId>
-            <version>3.1.4</version>
+            <version>${scalatest.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -105,10 +97,16 @@
             <plugin>
                 <groupId>net.alchim31.maven</groupId>
                 <artifactId>scala-maven-plugin</artifactId>
-                <version>3.2.0</version>
+                <version>${scala-maven-plugin.version}</version>
                 <configuration>
                     <charset>${project.build.sourceEncoding}</charset>
                     <scalaVersion>${scala.version}</scalaVersion>
+                    <args>
+                        <!-- Emit warning and location for usages of features that should be imported explicitly. -->
+                        <arg>-feature</arg>
+                        <!-- Emit various static analysis warnings. -->
+                        <arg>-Xlint</arg>
+                    </args>
                 </configuration>
                 <executions>
                     <execution>
@@ -141,62 +139,13 @@
                 <configuration>
                     <artifactSet>
                         <includes>
-                            <include>*:*</include>
+                            <include>org.apache.kudu:kudu-client</include>
+                            <include>org.slf4:slf4j-api</include>
+                            <include>com.stumbleupon:async</include>
                         </includes>
                     </artifactSet>
                 </configuration>
-                <executions>
-                    <execution>
-                        <phase>package</phase>
-                        <goals>
-                            <goal>shade</goal>
-                        </goals>
-                    </execution>
-                </executions>
-            </plugin>
-            <!-- http://stackoverflow.com/questions/270445 -->
-            <plugin>
-                <groupId>org.codehaus.mojo</groupId>
-                <artifactId>build-helper-maven-plugin</artifactId>
-                <version>1.12</version>
-                <executions>
-                    <execution>
-                        <phase>generate-sources</phase>
-                        <goals><goal>add-source</goal></goals>
-                        <configuration>
-                            <sources>
-                                <source>${compat.src}</source>
-                            </sources>
-                        </configuration>
-                    </execution>
-                </executions>
             </plugin>
         </plugins>
     </build>
-
-    <profiles>
-        <profile>
-            <id>spark_2.10</id>
-            <activation>
-                <activeByDefault>true</activeByDefault>
-            </activation>
-            <properties>
-                <spark.version>1.6.1</spark.version>
-                <spark.version.label>spark</spark.version.label>
-                <scala.version>2.10.4</scala.version>
-                <scala.binary.version>2.10</scala.binary.version>
-                <compat.src>src/main/spark1</compat.src>
-            </properties>
-        </profile>
-        <profile>
-            <id>spark2_2.11</id>
-            <properties>
-                <spark.version>2.0.1</spark.version>
-                <spark.version.label>spark2</spark.version.label>
-                <scala.version>2.11.6</scala.version>
-                <scala.binary.version>2.11</scala.binary.version>
-                <compat.src>src/main/spark2</compat.src>
-            </properties>
-        </profile>
-    </profiles>
 </project>

@@ -18,15 +18,15 @@
 package org.apache.kudu.spark.kudu
 
 import org.junit.runner.RunWith
-import org.scalatest.{BeforeAndAfter, FunSuite}
 import org.scalatest.junit.JUnitRunner
+import org.scalatest.{BeforeAndAfter, FunSuite}
 
 @RunWith(classOf[JUnitRunner])
 class KuduRDDTest extends FunSuite with TestContext with BeforeAndAfter {
 
   test("collect rows") {
     insertRows(100)
-    val rdd = kuduContext.kuduRDD(sc, tableName, List("key"))
+    val rdd = kuduContext.kuduRDD(ss.sparkContext, tableName, List("key"))
     assert(rdd.collect.length == 100)
   }
 }

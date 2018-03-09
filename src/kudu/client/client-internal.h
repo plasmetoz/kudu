@@ -19,43 +19,62 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <set>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
-#include <boost/function.hpp>
-#include <boost/optional.hpp>
-
 #include "kudu/client/client.h"
-#include "kudu/security/token.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/status_callback.h"
+
+namespace boost {
+template <typename Signature>
+class function;
+} // namespace boost
 
 namespace kudu {
 
 class DnsResolver;
-class HostPort;
+class PartitionSchema;
+class Sockaddr;
 
 namespace master {
 class AlterTableRequestPB;
+class AlterTableResponsePB;
 class ConnectToMasterResponsePB;
 class CreateTableRequestPB;
+class CreateTableResponsePB;
 class MasterServiceProxy;
+class TableIdentifierPB;
 } // namespace master
 
 namespace rpc {
 class Messenger;
 class RequestTracker;
-class RpcController;
 } // namespace rpc
 
 namespace client {
 
+class KuduSchema;
+
 namespace internal {
 class ConnectToClusterRpc;
+class MetaCache;
+class RemoteTablet;
+class RemoteTabletServer;
 } // namespace internal
 
 class KuduClient::Data {
@@ -80,17 +99,17 @@ class KuduClient::Data {
 
   Status CreateTable(KuduClient* client,
                      const master::CreateTableRequestPB& req,
-                     const KuduSchema& schema,
+                     master::CreateTableResponsePB* resp,
                      const MonoTime& deadline,
                      bool has_range_partition_bounds);
 
   Status IsCreateTableInProgress(KuduClient* client,
-                                 const std::string& table_name,
+                                 master::TableIdentifierPB table,
                                  const MonoTime& deadline,
-                                 bool *create_in_progress);
+                                 bool* create_in_progress);
 
   Status WaitForCreateTableToFinish(KuduClient* client,
-                                    const std::string& table_name,
+                                    master::TableIdentifierPB table,
                                     const MonoTime& deadline);
 
   Status DeleteTable(KuduClient* client,
@@ -99,16 +118,17 @@ class KuduClient::Data {
 
   Status AlterTable(KuduClient* client,
                     const master::AlterTableRequestPB& req,
+                    master::AlterTableResponsePB* resp,
                     const MonoTime& deadline,
                     bool has_add_drop_partition);
 
   Status IsAlterTableInProgress(KuduClient* client,
-                                const std::string& table_name,
+                                master::TableIdentifierPB table,
                                 const MonoTime& deadline,
-                                bool *alter_in_progress);
+                                bool* alter_in_progress);
 
   Status WaitForAlterTableToFinish(KuduClient* client,
-                                   const std::string& alter_name,
+                                   master::TableIdentifierPB table,
                                    const MonoTime& deadline);
 
   Status GetTableSchema(KuduClient* client,
@@ -140,8 +160,9 @@ class KuduClient::Data {
   //
   // See also: ConnectToClusterAsync.
   void ConnectedToClusterCb(const Status& status,
-                            const Sockaddr& leader_addr,
-                            const master::ConnectToMasterResponsePB& connect_response);
+                            const std::pair<Sockaddr, std::string>& leader_addr_and_name,
+                            const master::ConnectToMasterResponsePB& connect_response,
+                            rpc::CredentialsPolicy cred_policy);
 
   // Asynchronously sets 'master_proxy_' to the leader master by
   // cycling through servers listed in 'master_server_addrs_' until
@@ -153,13 +174,17 @@ class KuduClient::Data {
   // Works with both a distributed and non-distributed configuration.
   void ConnectToClusterAsync(KuduClient* client,
                              const MonoTime& deadline,
-                             const StatusCallback& cb);
+                             const StatusCallback& cb,
+                             rpc::CredentialsPolicy creds_policy);
 
   // Synchronous version of ConnectToClusterAsync method above.
   //
   // NOTE: since this uses a Synchronizer, this may not be invoked by
   // a method that's on a reactor thread.
-  Status ConnectToCluster(KuduClient* client, const MonoTime& deadline);
+  Status ConnectToCluster(
+      KuduClient* client,
+      const MonoTime& deadline,
+      rpc::CredentialsPolicy creds_policy = rpc::CredentialsPolicy::ANY_CREDENTIALS);
 
   std::shared_ptr<master::MasterServiceProxy> master_proxy() const;
 
@@ -230,11 +255,13 @@ class KuduClient::Data {
   // Ref-counted RPC instance: since 'ConnectToClusterAsync' call
   // is asynchronous, we need to hold a reference in this class
   // itself, as to avoid a "use-after-free" scenario.
-  scoped_refptr<internal::ConnectToClusterRpc> leader_master_rpc_;
-  std::vector<StatusCallback> leader_master_callbacks_;
+  scoped_refptr<internal::ConnectToClusterRpc> leader_master_rpc_any_creds_;
+  std::vector<StatusCallback> leader_master_callbacks_any_creds_;
+  scoped_refptr<internal::ConnectToClusterRpc> leader_master_rpc_primary_creds_;
+  std::vector<StatusCallback> leader_master_callbacks_primary_creds_;
 
-  // Protects 'leader_master_rpc_', 'leader_master_hostport_',
-  // and master_proxy_
+  // Protects 'leader_master_rpc_{any,primary}_creds_',
+  // 'leader_master_hostport_', and 'master_proxy_'.
   //
   // See: KuduClient::Data::ConnectToClusterAsync for a more
   // in-depth explanation of why this is needed and how it works.
@@ -255,6 +282,10 @@ Status RetryFunc(const MonoTime& deadline,
                  const std::string& retry_msg,
                  const std::string& timeout_msg,
                  const boost::function<Status(const MonoTime&, bool*)>& func);
+
+// Set logging verbose level through environment variable.
+void SetVerboseLevelFromEnvVar();
+extern const char* kVerboseEnvVar;
 
 } // namespace client
 } // namespace kudu

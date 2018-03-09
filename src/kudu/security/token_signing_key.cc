@@ -24,6 +24,7 @@
 #include <glog/logging.h>
 
 #include "kudu/security/crypto.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/util/status.h"
 
@@ -33,8 +34,8 @@ using std::string;
 namespace kudu {
 namespace security {
 
-TokenSigningPublicKey::TokenSigningPublicKey(const TokenSigningPublicKeyPB& pb)
-    : pb_(pb) {
+TokenSigningPublicKey::TokenSigningPublicKey(TokenSigningPublicKeyPB pb)
+    : pb_(std::move(pb)) {
 }
 
 TokenSigningPublicKey::~TokenSigningPublicKey() {

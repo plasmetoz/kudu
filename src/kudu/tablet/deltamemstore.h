@@ -17,37 +17,51 @@
 #ifndef KUDU_TABLET_DELTAMEMSTORE_H
 #define KUDU_TABLET_DELTAMEMSTORE_H
 
+#include <cstddef>
+#include <cstdint>
 #include <deque>
-#include <gtest/gtest_prod.h>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/common/columnblock.h"
-#include "kudu/common/rowblock.h"
-#include "kudu/common/schema.h"
+#include <gtest/gtest_prod.h>
+
+#include "kudu/common/rowid.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/tablet/concurrent_btree.h"
 #include "kudu/tablet/delta_key.h"
-#include "kudu/tablet/delta_tracker.h"
 #include "kudu/tablet/delta_stats.h"
+#include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/mvcc.h"
 #include "kudu/util/atomic.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
+class ColumnBlock;
 class MemTracker;
+class MemoryTrackingBufferAllocator;
 class RowChangeList;
+class ScanSpec;
+class Schema;
+class SelectionVector;
+class Timestamp;
+struct ColumnId;
+
+namespace consensus {
+class OpId;
+}
 
 namespace tablet {
 
 class DeltaFileWriter;
-class DeltaStats;
-class DMSIterator;
 class Mutation;
 
 struct DMSTreeTraits : public btree::BTreeTraits {
@@ -194,13 +208,13 @@ class DMSIterator : public DeltaIterator {
 
   Status ApplyDeletes(SelectionVector *sel_vec) OVERRIDE;
 
-  Status CollectMutations(vector<Mutation *> *dst, Arena *arena) OVERRIDE;
+  Status CollectMutations(std::vector<Mutation *> *dst, Arena *arena) OVERRIDE;
 
-  Status FilterColumnIdsAndCollectDeltas(const vector<ColumnId>& col_ids,
-                                         vector<DeltaKeyAndUpdate>* out,
+  Status FilterColumnIdsAndCollectDeltas(const std::vector<ColumnId>& col_ids,
+                                         std::vector<DeltaKeyAndUpdate>* out,
                                          Arena* arena) OVERRIDE;
 
-  string ToString() const OVERRIDE;
+  std::string ToString() const OVERRIDE;
 
   virtual bool HasNext() OVERRIDE;
 

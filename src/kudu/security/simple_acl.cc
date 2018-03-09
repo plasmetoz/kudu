@@ -17,8 +17,9 @@
 
 #include "kudu/security/simple_acl.h"
 
-#include <ctype.h>
-
+#include <cctype>
+#include <cstring>
+#include <utility>
 #include <vector>
 
 #include "kudu/gutil/map-util.h"
@@ -26,6 +27,7 @@
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/status.h"
 
+using std::set;
 using std::string;
 using std::vector;
 

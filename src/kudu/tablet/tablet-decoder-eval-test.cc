@@ -15,14 +15,41 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cinttypes>
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/strings/substitute.h"
-#include <kudu/util/flags.h>
-
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/iterator.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/row.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
-#include "kudu/tablet/tablet-test-base.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/local_tablet_writer.h"
+#include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/util/auto_release_pool.h"
+#include "kudu/util/compression/compression.pb.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
 DEFINE_int32(decoder_eval_test_nrepeats, 1, "Number of times to repeat per tablet");
 DEFINE_int32(decoder_eval_test_lower, 0, "Lower bound on the predicate [lower, upper)");
@@ -88,7 +115,7 @@ public:
     }
 
     for (int i = 0; i < FLAGS_decoder_eval_test_nrepeats; i++) {
-      TestTimedScanWithBounds(nrows, cardinality, strlen, lower, upper, &fetched);
+      TestTimedScanWithBounds(strlen, lower, upper, &fetched);
 
       // Calculate the expected count, potentially factoring in nulls.
       size_t expected_sel_count = ExpectedCount(nrows, cardinality, lower_not_null, upper);
@@ -129,9 +156,9 @@ public:
     ASSERT_OK(tablet()->Flush());
   }
 
-  void TestTimedScanWithBounds(size_t nrows, size_t cardinality, size_t strlen, size_t lower_val,
+  void TestTimedScanWithBounds(size_t strlen, size_t lower_val,
                                size_t upper_val, int* fetched) {
-    Arena arena(128, 1028);
+    Arena arena(128);
     AutoReleasePool pool;
     ScanSpec spec;
 
@@ -199,7 +226,7 @@ public:
                               Substitute("$0", upper).length(),
                               Substitute("$0", cardinality).length()});
     FillTestTablet(nrows, 10, strlen, -1);
-    Arena arena(128, 1028);
+    Arena arena(128);
     AutoReleasePool pool;
     ScanSpec spec;
 
@@ -230,7 +257,7 @@ public:
     ASSERT_OK(iter->Init(&spec));
     ASSERT_TRUE(spec.predicates().empty()) << "Should have accepted all predicates";
 
-    Arena ret_arena(1028, 1028);
+    Arena ret_arena(1024);
     size_t expected_count = ExpectedCount(nrows, cardinality, lower, upper);
     Schema schema = iter->schema();
     RowBlock block(schema, 100, &ret_arena);

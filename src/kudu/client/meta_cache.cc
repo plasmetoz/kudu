@@ -17,55 +17,75 @@
 
 #include "kudu/client/meta_cache.h"
 
-#include <boost/bind.hpp>
-#include <glog/logging.h>
+#include <algorithm>
+#include <cstddef>
 #include <mutex>
+#include <ostream>
+#include <set>
+#include <string>
+#include <vector>
+#include <utility>
 
-#include "kudu/client/client.h"
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <glog/logging.h>
+#include <google/protobuf/repeated_field.h> // IWYU pragma: keep
+
 #include "kudu/client/client-internal.h"
-#include "kudu/common/schema.h"
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/callback.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
-#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 
 using std::map;
 using std::set;
 using std::shared_ptr;
 using std::string;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 
+namespace rpc {
+class Messenger;
+}
+
 using consensus::RaftPeerPB;
+using master::ANY_REPLICA;
 using master::GetTableLocationsRequestPB;
 using master::GetTableLocationsResponsePB;
 using master::MasterServiceProxy;
 using master::TabletLocationsPB;
 using master::TabletLocationsPB_ReplicaPB;
 using master::TSInfoPB;
+using rpc::CredentialsPolicy;
 using rpc::Messenger;
 using rpc::Rpc;
+using rpc::ErrorStatusPB;
 using tserver::TabletServerServiceProxy;
 
 namespace client {
 
 namespace internal {
-
-namespace {
-const int MAX_RETURNED_TABLE_LOCATIONS = 10;
-} // anonymous namespace
-
-////////////////////////////////////////////////////////////
 
 RemoteTabletServer::RemoteTabletServer(const master::TSInfoPB& pb)
   : uuid_(pb.permanent_uuid()) {
@@ -97,7 +117,7 @@ void RemoteTabletServer::DnsResolutionFinished(const HostPort& hp,
 
   {
     std::lock_guard<simple_spinlock> l(lock_);
-    proxy_.reset(new TabletServerServiceProxy(client->data_->messenger_, (*addrs)[0]));
+    proxy_.reset(new TabletServerServiceProxy(client->data_->messenger_, (*addrs)[0], hp.host()));
   }
   user_callback.Run(s);
 }
@@ -133,7 +153,7 @@ void RemoteTabletServer::Update(const master::TSInfoPB& pb) {
 
   rpc_hostports_.clear();
   for (const HostPortPB& hostport_pb : pb.rpc_addresses()) {
-    rpc_hostports_.push_back(HostPort(hostport_pb.host(), hostport_pb.port()));
+    rpc_hostports_.emplace_back(hostport_pb.host(), hostport_pb.port());
   }
 }
 
@@ -483,9 +503,11 @@ void MetaCacheServerPicker::InitProxyCb(const ServerPickedCallback& callback,
 
 ////////////////////////////////////////////////////////////
 
-MetaCache::MetaCache(KuduClient* client)
-  : client_(client),
-    master_lookup_sem_(50) {
+MetaCache::MetaCache(KuduClient* client,
+                     ReplicaController::Visibility replica_visibility)
+    : client_(client),
+      master_lookup_sem_(50),
+      replica_visibility_(replica_visibility) {
 }
 
 MetaCache::~MetaCache() {
@@ -510,14 +532,16 @@ void MetaCache::UpdateTabletServer(const TSInfoPB& pb) {
 // Keeps a reference on the owning metacache while alive.
 class LookupRpc : public Rpc {
  public:
-  LookupRpc(const scoped_refptr<MetaCache>& meta_cache,
+  LookupRpc(scoped_refptr<MetaCache> meta_cache,
             StatusCallback user_cb,
             const KuduTable* table,
             string partition_key,
             scoped_refptr<RemoteTablet>* remote_tablet,
             const MonoTime& deadline,
             shared_ptr<Messenger> messenger,
-            bool is_exact_lookup);
+            int max_returned_locations,
+            bool is_exact_lookup,
+            ReplicaController::Visibility replica_visibility);
   virtual ~LookupRpc();
   virtual void SendRpc() OVERRIDE;
   virtual string ToString() const OVERRIDE;
@@ -537,7 +561,7 @@ class LookupRpc : public Rpc {
     return table_->client()->data_->master_proxy();
   }
 
-  void ResetMasterLeaderAndRetry();
+  void ResetMasterLeaderAndRetry(CredentialsPolicy creds_policy);
 
   void NewLeaderMasterDeterminedCb(const Status& status);
 
@@ -572,27 +596,39 @@ class LookupRpc : public Rpc {
   // Whether this lookup has acquired a master lookup permit.
   bool has_permit_;
 
+  // The max number of tablets to fetch per round trip from the master
+  const int max_returned_locations_;
+
   // If true, this lookup is for an exact tablet match with the requested
   // partition key. If false, the next tablet after the partition key should be
   // returned if the partition key falls in a non-covered partition range.
-  bool is_exact_lookup_;
+  const bool is_exact_lookup_;
+
+  // Controlling which replicas to look up. If set to Visibility::ALL,
+  // non-voter tablet replicas, if any, appear in the lookup result in addition
+  // to 'regular' voter replicas.
+  const ReplicaController::Visibility replica_visibility_;
 };
 
-LookupRpc::LookupRpc(const scoped_refptr<MetaCache>& meta_cache,
+LookupRpc::LookupRpc(scoped_refptr<MetaCache> meta_cache,
                      StatusCallback user_cb, const KuduTable* table,
                      string partition_key,
                      scoped_refptr<RemoteTablet>* remote_tablet,
                      const MonoTime& deadline,
                      shared_ptr<Messenger> messenger,
-                     bool is_exact_lookup)
+                     int max_returned_locations,
+                     bool is_exact_lookup,
+                     ReplicaController::Visibility replica_visibility)
     : Rpc(deadline, std::move(messenger)),
-      meta_cache_(meta_cache),
+      meta_cache_(std::move(meta_cache)),
       user_cb_(std::move(user_cb)),
       table_(table),
       partition_key_(std::move(partition_key)),
       remote_tablet_(remote_tablet),
       has_permit_(false),
-      is_exact_lookup_(is_exact_lookup) {
+      max_returned_locations_(max_returned_locations),
+      is_exact_lookup_(is_exact_lookup),
+      replica_visibility_(replica_visibility) {
   DCHECK(deadline.Initialized());
 }
 
@@ -642,7 +678,10 @@ void LookupRpc::SendRpc() {
   // Fill out the request.
   req_.mutable_table()->set_table_id(table_->id());
   req_.set_partition_key_start(partition_key_);
-  req_.set_max_returned_locations(MAX_RETURNED_TABLE_LOCATIONS);
+  req_.set_max_returned_locations(max_returned_locations_);
+  if (replica_visibility_ == ReplicaController::Visibility::ALL) {
+    req_.set_replica_type_filter(master::ANY_REPLICA);
+  }
 
   // The end partition key is left unset intentionally so that we'll prefetch
   // some additional tablets.
@@ -655,7 +694,7 @@ void LookupRpc::SendRpc() {
   }
   MonoTime rpc_deadline = now + meta_cache_->client_->default_rpc_timeout();
   mutable_retrier()->mutable_controller()->set_deadline(
-      MonoTime::Earliest(rpc_deadline, retrier().deadline()));
+      std::min(rpc_deadline, retrier().deadline()));
 
   master_proxy()->GetTableLocationsAsync(req_, &resp_,
                                          mutable_retrier()->mutable_controller(),
@@ -671,12 +710,12 @@ string LookupRpc::ToString() const {
                     num_attempts());
 }
 
-void LookupRpc::ResetMasterLeaderAndRetry() {
+void LookupRpc::ResetMasterLeaderAndRetry(CredentialsPolicy creds_policy) {
   table_->client()->data_->ConnectToClusterAsync(
       table_->client(),
       retrier().deadline(),
-      Bind(&LookupRpc::NewLeaderMasterDeterminedCb,
-           Unretained(this)));
+      Bind(&LookupRpc::NewLeaderMasterDeterminedCb, Unretained(this)),
+      creds_policy);
 }
 
 void LookupRpc::NewLeaderMasterDeterminedCb(const Status& status) {
@@ -710,7 +749,7 @@ void LookupRpc::SendRpcCb(const Status& status) {
         resp_.error().code() == master::MasterErrorPB::CATALOG_MANAGER_NOT_INITIALIZED) {
       if (meta_cache_->client_->IsMultiMaster()) {
         KLOG_EVERY_N_SECS(WARNING, 1) << "Leader Master has changed, re-trying...";
-        ResetMasterLeaderAndRetry();
+        ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
         ignore_result(delete_me.release());
         return;
       }
@@ -723,7 +762,7 @@ void LookupRpc::SendRpcCb(const Status& status) {
     if (MonoTime::Now() < retrier().deadline()) {
       if (meta_cache_->client_->IsMultiMaster()) {
         KLOG_EVERY_N_SECS(WARNING, 1) << "Leader Master timed out, re-trying...";
-        ResetMasterLeaderAndRetry();
+        ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
         ignore_result(delete_me.release());
         return;
       }
@@ -738,7 +777,20 @@ void LookupRpc::SendRpcCb(const Status& status) {
     if (meta_cache_->client_->IsMultiMaster()) {
       KLOG_EVERY_N_SECS(WARNING, 1) << "Encountered a network error from the Master: "
                                     << new_status.ToString() << ", retrying...";
-      ResetMasterLeaderAndRetry();
+      ResetMasterLeaderAndRetry(CredentialsPolicy::ANY_CREDENTIALS);
+      ignore_result(delete_me.release());
+      return;
+    }
+  }
+
+  if (new_status.IsNotAuthorized()) {
+    const rpc::RpcController& controller(retrier().controller());
+    const ErrorStatusPB* err = controller.error_response();
+    if (err && err->has_code() &&
+        err->code() == ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN) {
+      KLOG_EVERY_N_SECS(INFO, 1)
+          << "Re-connecting to cluster in attempt to get new authn token";
+      ResetMasterLeaderAndRetry(CredentialsPolicy::PRIMARY_CREDENTIALS);
       ignore_result(delete_me.release());
       return;
     }
@@ -753,7 +805,7 @@ void LookupRpc::SendRpcCb(const Status& status) {
 
   if (new_status.ok()) {
     MetaCacheEntry entry;
-    new_status = meta_cache_->ProcessLookupResponse(*this, &entry);
+    new_status = meta_cache_->ProcessLookupResponse(*this, &entry, max_returned_locations_);
     if (entry.is_non_covered_range()) {
       new_status = Status::NotFound("No tablet covering the requested range partition",
                                     entry.DebugString(table_));
@@ -768,9 +820,10 @@ void LookupRpc::SendRpcCb(const Status& status) {
 }
 
 Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
-                                        MetaCacheEntry* cache_entry) {
+                                        MetaCacheEntry* cache_entry,
+                                        int max_returned_locations) {
   VLOG(2) << "Processing master response for " << rpc.ToString()
-          << ". Response: " << SecureShortDebugString(rpc.resp());
+          << ". Response: " << pb_util::SecureShortDebugString(rpc.resp());
 
   MonoTime expiration_time = MonoTime::Now() +
       MonoDelta::FromMilliseconds(rpc.resp().ttl_millis());
@@ -792,7 +845,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
     tablets_by_key.clear();
     MetaCacheEntry entry(expiration_time, "", "");
     VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
-    InsertOrDie(&tablets_by_key, "", std::move(entry));
+    InsertOrDie(&tablets_by_key, "", entry);
   } else {
 
     // The comments below will reference the following diagram:
@@ -819,7 +872,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
       tablets_by_key.erase(tablets_by_key.begin(), tablets_by_key.lower_bound(first_lower_bound));
       MetaCacheEntry entry(expiration_time, "", first_lower_bound);
       VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
-      InsertOrDie(&tablets_by_key, "", std::move(entry));
+      InsertOrDie(&tablets_by_key, "", entry);
     }
 
     // last_upper_bound tracks the upper bound of the previously processed
@@ -839,7 +892,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
 
         MetaCacheEntry entry(expiration_time, last_upper_bound, tablet_lower_bound);
         VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
-        InsertOrDie(&tablets_by_key, last_upper_bound, std::move(entry));
+        InsertOrDie(&tablets_by_key, last_upper_bound, entry);
       }
       last_upper_bound = tablet_upper_bound;
 
@@ -860,7 +913,8 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
         DCHECK_EQ(tablet_lower_bound, remote->partition().partition_key_start());
         DCHECK_EQ(tablet_upper_bound, remote->partition().partition_key_end());
 
-        VLOG(3) << "Refreshing tablet " << tablet_id << ": " << SecureShortDebugString(tablet);
+        VLOG(3) << "Refreshing tablet " << tablet_id << ": "
+                << pb_util::SecureShortDebugString(tablet);
         remote->Refresh(ts_cache_, tablet.replicas());
 
         // Update the entry TTL.
@@ -885,10 +939,10 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
       VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
 
       InsertOrDie(&tablets_by_id_, tablet_id, remote);
-      InsertOrDie(&tablets_by_key, tablet_lower_bound, std::move(entry));
+      InsertOrDie(&tablets_by_key, tablet_lower_bound, entry);
     }
 
-    if (!last_upper_bound.empty() && tablet_locations.size() < MAX_RETURNED_TABLE_LOCATIONS) {
+    if (!last_upper_bound.empty() && tablet_locations.size() < max_returned_locations) {
       // There is a non-covered range between the last tablet and the end of the
       // partition key space, such as F.
 
@@ -898,7 +952,7 @@ Status MetaCache::ProcessLookupResponse(const LookupRpc& rpc,
 
       MetaCacheEntry entry(expiration_time, last_upper_bound, "");
       VLOG(3) << "Caching '" << rpc.table_name() << "' entry " << entry.DebugString(rpc.table());
-      InsertOrDie(&tablets_by_key, last_upper_bound, std::move(entry));
+      InsertOrDie(&tablets_by_key, last_upper_bound, entry);
     }
   }
 
@@ -941,6 +995,25 @@ bool MetaCache::LookupTabletByKeyFastPath(const KuduTable* table,
   return false;
 }
 
+void MetaCache::ClearNonCoveredRangeEntries(const std::string& table_id) {
+  VLOG(3) << "Clearing non-covered range entries of table " << table_id;
+  std::lock_guard<rw_spinlock> l(lock_);
+
+  TabletMap* tablets = FindOrNull(tablets_by_table_and_key_, table_id);
+  if (PREDICT_FALSE(!tablets)) {
+    // No cache available for this table.
+    return;
+  }
+
+  for (auto it = tablets->begin(); it != tablets->end();) {
+    if (it->second.is_non_covered_range()) {
+      it = tablets->erase(it);
+    } else {
+      it++;
+    }
+  }
+}
+
 void MetaCache::ClearCache() {
   VLOG(3) << "Clearing cache";
   std::lock_guard<rw_spinlock> l(lock_);
@@ -961,7 +1034,8 @@ void MetaCache::LookupTabletByKey(const KuduTable* table,
                                  remote_tablet,
                                  deadline,
                                  client_->data_->messenger_,
-                                 true);
+                                 kFetchTabletsPerPointLookup,
+                                 true, replica_visibility_);
   rpc->SendRpc();
 }
 
@@ -969,7 +1043,8 @@ void MetaCache::LookupTabletByKeyOrNext(const KuduTable* table,
                                         string partition_key,
                                         const MonoTime& deadline,
                                         scoped_refptr<RemoteTablet>* remote_tablet,
-                                        const StatusCallback& callback) {
+                                        const StatusCallback& callback,
+                                        int max_returned_locations) {
   LookupRpc* rpc = new LookupRpc(this,
                                  callback,
                                  table,
@@ -977,7 +1052,8 @@ void MetaCache::LookupTabletByKeyOrNext(const KuduTable* table,
                                  remote_tablet,
                                  deadline,
                                  client_->data_->messenger_,
-                                 false);
+                                 max_returned_locations,
+                                 false, replica_visibility_);
   rpc->SendRpc();
 }
 

@@ -43,6 +43,8 @@ extern const char kCaExpiredCert[];
 extern const char kCaExpiredPrivateKey[];
 // The public part of the abovementioned private key.
 extern const char kCaExpiredPublicKey[];
+// Certificate with multiple DNS hostnames in the SAN field.
+extern const char kCertDnsHostnamesInSan[];
 
 extern const char kDataTiny[];
 extern const char kSignatureTinySHA512[];
@@ -53,13 +55,25 @@ extern const char kSignatureShortSHA512[];
 extern const char kDataLong[];
 extern const char kSignatureLongSHA512[];
 
-// Creates a matching SSL certificate and private key file in 'dir', returning
-// their paths in '*cert_file' and '*key_file'. The password associated with
-// the private key is stored in '*key_password'.
-Status CreateTestSSLCerts(const std::string& dir,
-                          std::string* cert_file,
-                          std::string* key_file,
-                          std::string* key_password);
+// Creates a matching SSL certificate and unencrypted private key file in 'dir',
+// returning their paths in '*cert_file' and '*key_file'.
+Status CreateTestSSLCertWithPlainKey(const std::string& dir,
+                                     std::string* cert_file,
+                                     std::string* key_file);
+
+// Same as the CreateTestSSLCertWithPlainKey() except that the private key is
+// encrypted with a password that is returned in 'key_password'.
+Status CreateTestSSLCertWithEncryptedKey(const std::string& dir,
+                                         std::string* cert_file,
+                                         std::string* key_file,
+                                         std::string* key_password);
+
+// Same as the CreateTestSSLCertWithPlainKey() except that the 'cert_file' is
+// signed by a CA chain.
+Status CreateTestSSLCertSignedByChain(const std::string& dir,
+                                      std::string* cert_file,
+                                      std::string* key_file,
+                                      std::string* ca_cert_file);
 
 } // namespace security
 } // namespace kudu

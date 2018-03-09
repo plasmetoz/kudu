@@ -15,39 +15,61 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
 #include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <thread>
 #include <utility>
+#include <vector>
 
 #include <boost/bind.hpp>
-#include <boost/optional.hpp>
-#include <gflags/gflags.h>
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
 #include "kudu/client/row_result.h"
-#include "kudu/client/scan_batch.h"
 #include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/value.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/mini_cluster.h"
+#include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
-#include "kudu/master/master-test-util.h"
 #include "kudu/master/mini_master.h"
-#include "kudu/server/hybrid_clock.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
-#include "kudu/util/faststring.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
 DECLARE_bool(enable_maintenance_manager);
 DECLARE_int32(heartbeat_interval_ms);
@@ -75,14 +97,17 @@ using client::KuduTableCreator;
 using client::KuduUpdate;
 using client::KuduValue;
 using client::sp::shared_ptr;
+using cluster::InternalMiniCluster;
+using cluster::InternalMiniClusterOptions;
 using master::AlterTableRequestPB;
 using master::AlterTableResponsePB;
 using std::atomic;
 using std::map;
 using std::pair;
+using std::string;
 using std::unique_ptr;
 using std::vector;
-using tablet::TabletPeer;
+using tablet::TabletReplica;
 
 class AlterTableTest : public KuduTest {
  public:
@@ -106,9 +131,9 @@ class AlterTableTest : public KuduTest {
 
     KuduTest::SetUp();
 
-    MiniClusterOptions opts;
+    InternalMiniClusterOptions opts;
     opts.num_tablet_servers = num_replicas();
-    cluster_.reset(new MiniCluster(env_, opts));
+    cluster_.reset(new InternalMiniCluster(env_, opts));
     ASSERT_OK(cluster_->Start());
 
     CHECK_OK(KuduClientBuilder()
@@ -125,37 +150,37 @@ class AlterTableTest : public KuduTest {
              .Create());
 
     if (num_replicas() == 1) {
-      tablet_peer_ = LookupTabletPeer();
-      ASSERT_OK(tablet_peer_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+      tablet_replica_ = LookupTabletReplica();
+      ASSERT_OK(tablet_replica_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
     }
     LOG(INFO) << "Tablet successfully located";
   }
 
   void TearDown() override {
-    tablet_peer_.reset();
+    tablet_replica_.reset();
     cluster_->Shutdown();
   }
 
-  scoped_refptr<TabletPeer> LookupTabletPeer() {
-    vector<scoped_refptr<TabletPeer> > peers;
-    cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletPeers(&peers);
-    CHECK_EQ(1, peers.size());
-    return peers[0];
+  scoped_refptr<TabletReplica> LookupTabletReplica() {
+    vector<scoped_refptr<TabletReplica> > replicas;
+    cluster_->mini_tablet_server(0)->server()->tablet_manager()->GetTabletReplicas(&replicas);
+    CHECK_EQ(1, replicas.size());
+    return replicas[0];
   }
 
   void ShutdownTS() {
-    // Drop the tablet_peer_ reference since the tablet peer becomes invalid once
+    // Drop the tablet_replica_ reference since the tablet replica becomes invalid once
     // we shut down the server. Additionally, if we hold onto the reference,
     // we'll end up calling the destructor from the test code instead of the
     // normal location, which can cause crashes, etc.
-    tablet_peer_.reset();
+    tablet_replica_.reset();
     if (cluster_->mini_tablet_server(0)->server() != nullptr) {
       cluster_->mini_tablet_server(0)->Shutdown();
     }
   }
 
   void RestartTabletServer(int idx = 0) {
-    tablet_peer_.reset();
+    tablet_replica_.reset();
     if (cluster_->mini_tablet_server(idx)->server()) {
       cluster_->mini_tablet_server(idx)->Shutdown();
       ASSERT_OK(cluster_->mini_tablet_server(idx)->Restart());
@@ -165,7 +190,7 @@ class AlterTableTest : public KuduTest {
 
     ASSERT_OK(cluster_->mini_tablet_server(idx)->WaitStarted());
     if (idx == 0) {
-      tablet_peer_ = LookupTabletPeer();
+      tablet_replica_ = LookupTabletReplica();
     }
   }
 
@@ -250,12 +275,12 @@ class AlterTableTest : public KuduTest {
 
   static const char *kTableName;
 
-  gscoped_ptr<MiniCluster> cluster_;
+  gscoped_ptr<InternalMiniCluster> cluster_;
   shared_ptr<KuduClient> client_;
 
   KuduSchema schema_;
 
-  scoped_refptr<TabletPeer> tablet_peer_;
+  scoped_refptr<TabletReplica> tablet_replica_;
 
   atomic<bool> stop_threads_;
 
@@ -279,14 +304,14 @@ const char *AlterTableTest::kTableName = "fake-table";
 // on the TS handling the tablet of the altered table.
 // TODO: create and verify multiple tablets when the client will support that.
 TEST_F(AlterTableTest, TestTabletReports) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
   ASSERT_OK(AddNewI32Column(kTableName, "new-i32", 0));
-  ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
 }
 
 // Verify that adding an existing column will return an "already present" error
 TEST_F(AlterTableTest, TestAddExistingColumn) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 
   {
     Status s = AddNewI32Column(kTableName, "c1", 0);
@@ -294,7 +319,7 @@ TEST_F(AlterTableTest, TestAddExistingColumn) {
     ASSERT_STR_CONTAINS(s.ToString(), "The column already exists: c1");
   }
 
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 }
 
 // Verify that adding a NOT NULL column without defaults will return an error.
@@ -303,7 +328,7 @@ TEST_F(AlterTableTest, TestAddExistingColumn) {
 // Our APIs for the client are designed such that it's impossible to send such
 // a request.
 TEST_F(AlterTableTest, TestAddNotNullableColumnWithoutDefaults) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 
   {
     AlterTableRequestPB req;
@@ -324,14 +349,14 @@ TEST_F(AlterTableTest, TestAddNotNullableColumnWithoutDefaults) {
     ASSERT_STR_CONTAINS(s.ToString(), "column `c2`: NOT NULL columns must have a default");
   }
 
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 }
 
 // Adding a nullable column with no default value should be equivalent
 // to a NULL default.
 TEST_F(AlterTableTest, TestAddNullableColumnWithoutDefault) {
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   {
     gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
@@ -348,10 +373,157 @@ TEST_F(AlterTableTest, TestAddNullableColumnWithoutDefault) {
   EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 new=NULL)", rows[1]);
 }
 
+// Rename a primary key column
+TEST_F(AlterTableTest, TestRenamePrimaryKeyColumn) {
+  InsertRows(0, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  {
+    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("c0")->RenameTo("primaryKeyRenamed");
+    table_alterer->AlterColumn("c1")->RenameTo("secondColumn");
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(1, 1);
+
+  vector<string> rows;
+  ScanToStrings(&rows);
+  ASSERT_EQ(2, rows.size());
+  EXPECT_EQ("(int32 primaryKeyRenamed=0, int32 secondColumn=0)", rows[0]);
+  EXPECT_EQ("(int32 primaryKeyRenamed=16777216, int32 secondColumn=1)", rows[1]);
+
+  {
+    gscoped_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("primaryKeyRenamed")->RenameTo("pk");
+    table_alterer->AlterColumn("secondColumn")->RenameTo("sc");
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(2, 1);
+
+  rows.clear();
+  ScanToStrings(&rows);
+  ASSERT_EQ(3, rows.size());
+  EXPECT_EQ("(int32 pk=0, int32 sc=0)", rows[0]);
+  EXPECT_EQ("(int32 pk=16777216, int32 sc=1)", rows[1]);
+  EXPECT_EQ("(int32 pk=33554432, int32 sc=2)", rows[2]);
+}
+
+// Test altering a column to add a default value, change a default value, and
+// remove a default value.
+TEST_F(AlterTableTest, TestAddChangeRemoveColumnDefaultValue) {
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AddColumn("newInt32")->Type(KuduColumnSchema::INT32);
+    table_alterer->AddColumn("newString")->Type(KuduColumnSchema::STRING);
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(0, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("newInt32")->Default(KuduValue::FromInt(12345));
+    table_alterer->AlterColumn("newString")->Default(KuduValue::CopyString("taco"));
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(1, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  vector<string> rows;
+  ScanToStrings(&rows);
+  ASSERT_EQ(2, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 newInt32=NULL, string newString=NULL)", rows[0]);
+  EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 newInt32=12345, string newString=\"taco\")",
+            rows[1]);
+
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("newInt32")->Default(KuduValue::FromInt(54321));
+    table_alterer->AlterColumn("newString")->Default(KuduValue::CopyString("ocat"));
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(2, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  ScanToStrings(&rows);
+  ASSERT_EQ(3, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 newInt32=NULL, string newString=NULL)", rows[0]);
+  EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 newInt32=12345, string newString=\"taco\")",
+            rows[1]);
+  EXPECT_EQ("(int32 c0=33554432, int32 c1=2, int32 newInt32=54321, string newString=\"ocat\")",
+            rows[2]);
+
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("newInt32")->RemoveDefault();
+    table_alterer->AlterColumn("newString")->RemoveDefault();
+    // Add an extra rename step
+    table_alterer->AlterColumn("newString")->RenameTo("newNewString");
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  InsertRows(3, 1);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  ScanToStrings(&rows);
+  ASSERT_EQ(4, rows.size());
+  EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 newInt32=NULL, string newNewString=NULL)", rows[0]);
+  EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 newInt32=12345, string newNewString=\"taco\")",
+            rows[1]);
+  EXPECT_EQ("(int32 c0=33554432, int32 c1=2, int32 newInt32=54321, string newNewString=\"ocat\")",
+            rows[2]);
+  EXPECT_EQ("(int32 c0=50331648, int32 c1=3, int32 newInt32=NULL, string newNewString=NULL)",
+            rows[3]);
+
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->DropColumn("newInt32");
+    table_alterer->DropColumn("newNewString");
+    ASSERT_OK(table_alterer->Alter());
+  }
+}
+
+// Test for a bug seen when an alter table creates an empty RLE block and the
+// block is subsequently scanned.
+TEST_F(AlterTableTest, TestAlterEmptyRLEBlock) {
+  // Add an RLE-encoded column
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AddColumn("rle")->Type(KuduColumnSchema::INT32)
+        ->Encoding(client::KuduColumnStorageAttributes::RLE);
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  // Insert some rows
+  InsertRows(0, 3);
+
+  // Now alter the column
+  {
+    unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+    table_alterer->AlterColumn("rle")->RenameTo("new_rle");
+    ASSERT_OK(table_alterer->Alter());
+  }
+
+  // Now scan the table, which would trigger a CHECK failure
+  // on trying to seek to position 0 in an empty RLE block
+  {
+    vector<string> rows;
+    ScanToStrings(&rows);
+    EXPECT_EQ("(int32 c0=0, int32 c1=0, int32 new_rle=NULL)", rows[0]);
+    EXPECT_EQ("(int32 c0=16777216, int32 c1=1, int32 new_rle=NULL)", rows[1]);
+    EXPECT_EQ("(int32 c0=33554432, int32 c1=2, int32 new_rle=NULL)", rows[2]);
+  }
+}
+
 // Verify that, if a tablet server is down when an alter command is issued,
 // it will eventually receive the command when it restarts.
 TEST_F(AlterTableTest, TestAlterOnTSRestart) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 
   ShutdownTS();
 
@@ -373,12 +545,12 @@ TEST_F(AlterTableTest, TestAlterOnTSRestart) {
   // Restart the TS and wait for the new schema
   RestartTabletServer();
   ASSERT_OK(WaitAlterTableCompletion(kTableName, 50));
-  ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
 }
 
 // Verify that nothing is left behind on cluster shutdown with pending async tasks
 TEST_F(AlterTableTest, TestShutdownWithPendingTasks) {
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 
   ShutdownTS();
 
@@ -401,7 +573,7 @@ TEST_F(AlterTableTest, TestRestartTSDuringAlter) {
     return;
   }
 
-  ASSERT_EQ(0, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(0, tablet_replica_->tablet()->metadata()->schema_version());
 
   Status s = AddNewI32Column(kTableName, "new-i32", 10,
                              MonoDelta::FromMilliseconds(1));
@@ -415,7 +587,7 @@ TEST_F(AlterTableTest, TestRestartTSDuringAlter) {
 
   // Wait for the new schema
   ASSERT_OK(WaitAlterTableCompletion(kTableName, 50));
-  ASSERT_EQ(1, tablet_peer_->tablet()->metadata()->schema_version());
+  ASSERT_EQ(1, tablet_replica_->tablet()->metadata()->schema_version());
 }
 
 TEST_F(AlterTableTest, TestGetSchemaAfterAlterTable) {
@@ -527,19 +699,21 @@ void AlterTableTest::ScanToStrings(vector<string>* rows) {
 // key (InsertRows swaps endianness so that we random-write instead of sequential-write)
 void AlterTableTest::VerifyRows(int start_row, int num_rows, VerifyPattern pattern) {
   shared_ptr<KuduTable> table;
-  CHECK_OK(client_->OpenTable(kTableName, &table));
+  ASSERT_OK(client_->OpenTable(kTableName, &table));
   KuduScanner scanner(table.get());
-  CHECK_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
-  CHECK_OK(scanner.Open());
+  // TODO(KUDU-791): we should probably be able to use a snapshot read here,
+  // but alter-table isn't all the way tied into the consistency-related code.
+  ASSERT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
+  ASSERT_OK(scanner.Open());
 
   int verified = 0;
   vector<KuduRowResult> results;
   while (scanner.HasMoreRows()) {
-    CHECK_OK(scanner.NextBatch(&results));
+    ASSERT_OK(scanner.NextBatch(&results));
 
     for (const KuduRowResult& row : results) {
       int32_t key = 0;
-      CHECK_OK(row.GetInt32(0, &key));
+      ASSERT_OK(row.GetInt32(0, &key));
       int32_t row_idx = bswap_32(key);
       if (row_idx < start_row || row_idx >= start_row + num_rows) {
         // Outside the range we're verifying
@@ -552,21 +726,21 @@ void AlterTableTest::VerifyRows(int start_row, int num_rows, VerifyPattern patte
       }
 
       int32_t c1 = 0;
-      CHECK_OK(row.GetInt32(1, &c1));
+      ASSERT_OK(row.GetInt32(1, &c1));
 
       switch (pattern) {
         case C1_MATCHES_INDEX:
-          CHECK_EQ(row_idx, c1);
+          ASSERT_EQ(row_idx, c1);
           break;
         case C1_IS_DEADBEEF:
-          CHECK_EQ(0xdeadbeef, c1);
+          ASSERT_EQ(0xdeadbeef, c1);
           break;
         default:
           LOG(FATAL);
       }
     }
   }
-  CHECK_EQ(verified, num_rows);
+  ASSERT_EQ(verified, num_rows);
 }
 
 Status AlterTableTest::CreateTable(const string& table_name,
@@ -606,7 +780,7 @@ TEST_F(AlterTableTest, TestDropAndAddNewColumn) {
   InsertRows(0, kNumRows);
 
   LOG(INFO) << "Verifying initial pattern";
-  VerifyRows(0, kNumRows, C1_MATCHES_INDEX);
+  NO_FATALS(VerifyRows(0, kNumRows, C1_MATCHES_INDEX));
 
   LOG(INFO) << "Dropping and adding back c1";
   unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
@@ -616,7 +790,7 @@ TEST_F(AlterTableTest, TestDropAndAddNewColumn) {
   ASSERT_OK(AddNewI32Column(kTableName, "c1", 0xdeadbeef));
 
   LOG(INFO) << "Verifying that the new default shows up";
-  VerifyRows(0, kNumRows, C1_IS_DEADBEEF);
+  NO_FATALS(VerifyRows(0, kNumRows, C1_IS_DEADBEEF));
 }
 
 // Tests that a renamed table can still be altered. This is a regression test, we used to not carry
@@ -638,7 +812,7 @@ TEST_F(AlterTableTest, TestBootstrapAfterAlters) {
 
   ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   InsertRows(1, 1);
 
   UpdateRow(0, { {"c1", 10001} });
@@ -690,9 +864,9 @@ TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
 
   ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   InsertRows(1, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
 
   NO_FATALS(ScanToStrings(&rows));
@@ -713,7 +887,7 @@ TEST_F(AlterTableTest, TestCompactAfterUpdatingRemovedColumn) {
   ASSERT_EQ("(int32 c0=0, int32 c2=12345)", rows[0]);
 
   // Compact
-  ASSERT_OK(tablet_peer_->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
+  ASSERT_OK(tablet_replica_->tablet()->Compact(tablet::Tablet::FORCE_COMPACT_ALL));
 }
 
 // Test which major-compacts a column for which there are updates in
@@ -727,7 +901,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterUpdatingRemovedColumn) {
 
   ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(1, rows.size());
@@ -737,7 +911,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterUpdatingRemovedColumn) {
   UpdateRow(0, { {"c1", 54321} });
 
   // Make sure the delta is in a delta-file.
-  ASSERT_OK(tablet_peer_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
 
   // Drop c1.
   LOG(INFO) << "Dropping c1";
@@ -749,13 +923,13 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterUpdatingRemovedColumn) {
   ASSERT_EQ("(int32 c0=0, int32 c2=12345)", rows[0]);
 
   // Major Compact Deltas
-  ASSERT_OK(tablet_peer_->tablet()->CompactWorstDeltas(
+  ASSERT_OK(tablet_replica_->tablet()->CompactWorstDeltas(
                 tablet::RowSet::MAJOR_DELTA_COMPACTION));
 
   // Check via debug dump that the data was properly compacted, including deltas.
   // We expect to see neither deltas nor base data for the deleted column.
   rows.clear();
-  tablet_peer_->tablet()->DebugDump(&rows);
+  tablet_replica_->tablet()->DebugDump(&rows);
   ASSERT_EQ("Dumping tablet:\n"
             "---------------------------\n"
             "MRS memrowset:\n"
@@ -778,7 +952,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasIntoMissingBaseData) {
   vector<string> rows;
 
   InsertRows(0, 2);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   // Add the new column after the Flush, so it has no base data.
   ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
@@ -787,7 +961,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasIntoMissingBaseData) {
   UpdateRow(0, { {"c2", 54321} });
 
   // Make sure the delta is in a delta-file.
-  ASSERT_OK(tablet_peer_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
 
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(2, rows.size());
@@ -795,7 +969,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasIntoMissingBaseData) {
   ASSERT_EQ("(int32 c0=16777216, int32 c1=1, int32 c2=12345)", rows[1]);
 
   // Major Compact Deltas
-  ASSERT_OK(tablet_peer_->tablet()->CompactWorstDeltas(
+  ASSERT_OK(tablet_replica_->tablet()->CompactWorstDeltas(
                 tablet::RowSet::MAJOR_DELTA_COMPACTION));
 
   // Check via debug dump that the data was properly compacted, including deltas.
@@ -803,7 +977,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasIntoMissingBaseData) {
   // row, the default value materialized for the second, and a proper UNDO to undo
   // the update on the first row.
   rows.clear();
-  tablet_peer_->tablet()->DebugDump(&rows);
+  tablet_replica_->tablet()->DebugDump(&rows);
   ASSERT_EQ("Dumping tablet:\n"
             "---------------------------\n"
             "MRS memrowset:\n"
@@ -827,7 +1001,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterAddUpdateRemoveColumn) {
   vector<string> rows;
 
   InsertRows(0, 1);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   // Add the new column after the Flush(), so that no CFile for this
   // column is present in the base data.
@@ -837,7 +1011,7 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterAddUpdateRemoveColumn) {
   UpdateRow(0, { {"c2", 54321} });
 
   // Make sure the delta is in a delta-file.
-  ASSERT_OK(tablet_peer_->tablet()->FlushBiggestDMS());
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
 
   NO_FATALS(ScanToStrings(&rows));
   ASSERT_EQ(1, rows.size());
@@ -853,13 +1027,13 @@ TEST_F(AlterTableTest, TestMajorCompactDeltasAfterAddUpdateRemoveColumn) {
   ASSERT_EQ("(int32 c0=0, int32 c1=0)", rows[0]);
 
   // Major Compact Deltas
-  ASSERT_OK(tablet_peer_->tablet()->CompactWorstDeltas(
+  ASSERT_OK(tablet_replica_->tablet()->CompactWorstDeltas(
                 tablet::RowSet::MAJOR_DELTA_COMPACTION));
 
   // Check via debug dump that the data was properly compacted, including deltas.
   // We expect to see neither deltas nor base data for the deleted column.
   rows.clear();
-  tablet_peer_->tablet()->DebugDump(&rows);
+  tablet_replica_->tablet()->DebugDump(&rows);
   ASSERT_EQ("Dumping tablet:\n"
             "---------------------------\n"
             "MRS memrowset:\n"
@@ -882,7 +1056,7 @@ TEST_F(AlterTableTest, TestReadHistoryAfterAlter) {
   DeleteRow(0);
   InsertRows(0, 1);
   uint64_t ts1 = client_->GetLatestObservedTimestamp();
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   ASSERT_OK(AddNewI32Column(kTableName, "c2", 12345));
 
   shared_ptr<KuduTable> table;
@@ -894,7 +1068,7 @@ TEST_F(AlterTableTest, TestReadHistoryAfterAlter) {
   // Delete then is assigned that timestamp.
   ASSERT_OK(scanner.SetSnapshotRaw(ts1 - 1));
   vector<string> row_strings;
-  client::ScanToStrings(&scanner, &row_strings);
+  ASSERT_OK(client::ScanToStrings(&scanner, &row_strings));
   ASSERT_EQ(1, row_strings.size());
   ASSERT_EQ("(int32 c0=0, int32 c1=0, int32 c2=12345)", row_strings[0]);
 }
@@ -1876,7 +2050,7 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   InsertRows(0, kNumRows);
 
   LOG(INFO) << "Verifying initial pattern";
-  VerifyRows(0, kNumRows, C1_MATCHES_INDEX);
+  NO_FATALS(VerifyRows(0, kNumRows, C1_MATCHES_INDEX));
 
   LOG(INFO) << "Dropping and adding back c1";
   unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
@@ -1889,7 +2063,54 @@ TEST_F(ReplicatedAlterTableTest, TestReplicatedAlter) {
   ASSERT_FALSE(alter_in_progress);
 
   LOG(INFO) << "Verifying that the new default shows up";
-  VerifyRows(0, kNumRows, C1_IS_DEADBEEF);
+  // TODO(KUDU-791): we should be able to assert right away, but alter-table doesn't
+  // currently obey the expected consistency semantics.
+  ASSERT_EVENTUALLY([&]() {
+    NO_FATALS(VerifyRows(0, kNumRows, C1_IS_DEADBEEF));
+  });
+}
+
+TEST_F(AlterTableTest, TestRenameStillCreatingTable) {
+  const string kNewTableName = "foo";
+
+  // Start creating the table in a separate thread.
+  std::thread creator_thread([&](){
+    unique_ptr<KuduTableCreator> creator(client_->NewTableCreator());
+    CHECK_OK(creator->table_name(kNewTableName)
+             .schema(&schema_)
+             .set_range_partition_columns({ "c0" })
+             .num_replicas(1)
+             .Create());
+  });
+  SCOPED_CLEANUP({
+    creator_thread.join();
+  });
+
+  // While the table is being created, change its name. We may have to retry a
+  // few times as this races with table creation.
+  //
+  // If the logic that waits for table creation to finish finds the table by
+  // name, this rename would cause it to fail and the test would crash.
+  while (true) {
+    unique_ptr<KuduTableAlterer> alterer(client_->NewTableAlterer(kNewTableName));
+    Status s = alterer->RenameTo("foo2")->Alter();
+    if (s.ok()) {
+      break;
+    }
+    if (!s.IsNotFound()) {
+      SCOPED_TRACE(s.ToString());
+      FAIL();
+    }
+  }
+}
+
+// Regression test for KUDU-2132.
+TEST_F(AlterTableTest, TestKUDU2132) {
+  unique_ptr<KuduTableAlterer> table_alterer(client_->NewTableAlterer(kTableName));
+  table_alterer->AlterColumn("c0")->RenameTo("primaryKeyRenamed");
+  table_alterer->AlterColumn("c1")->RenameTo("c0");
+  table_alterer->DropColumn("c0");
+  ASSERT_OK(table_alterer->Alter());
 }
 
 } // namespace kudu

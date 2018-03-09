@@ -15,17 +15,19 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
-
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
-#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/util/compression/compression.pb.h"
 #include "kudu/util/compression/compression_codec.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -59,9 +61,9 @@ static void TestCompressionCodec(CompressionType compression) {
 
   // Compress slices and uncompress
   vector<Slice> v;
-  v.push_back(Slice(ibuffer, 1));
+  v.emplace_back(ibuffer, 1);
   for (int i = 1; i <= kInputSize; i += 7)
-    v.push_back(Slice(ibuffer + i, 7));
+    v.emplace_back(ibuffer + i, 7);
   ASSERT_OK(codec->Compress(Slice(ibuffer, kInputSize), cbuffer.get(), &compressed));
   ASSERT_OK(codec->Uncompress(Slice(cbuffer.get(), compressed), ubuffer, kInputSize));
   ASSERT_EQ(0, memcmp(ibuffer, ubuffer, kInputSize));

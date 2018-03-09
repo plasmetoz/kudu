@@ -15,20 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
+
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <gtest/gtest.h>
 #include <glog/logging.h>
 
+#include "kudu/common/column_materialization_context.h"
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/generic_iterators.h"
+#include "kudu/common/iterator.h"
+#include "kudu/common/iterator_stats.h"
+#include "kudu/common/row.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/rowid.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/integral_types.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/tablet/cfile_set.h"
-#include "kudu/tablet/diskrowset-test-base.h"
-#include "kudu/tablet/tablet-test-base.h"
+#include "kudu/tablet/diskrowset.h"
+#include "kudu/tablet/tablet-test-util.h"
+#include "kudu/util/auto_release_pool.h"
+#include "kudu/util/bloom_filter.h"
 #include "kudu/util/mem_tracker.h"
-#include "kudu/util/test_util.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 
 DECLARE_int32(cfile_default_block_size);
 
 using std::shared_ptr;
+using std::string;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -88,7 +118,7 @@ class TestCFileSet : public KuduRowSetTest {
     ASSERT_OK(iter->Init(&spec));
 
     // Check that the range was respected on all the results.
-    Arena arena(1024, 1024);
+    Arena arena(1024);
     RowBlock block(schema_, 100, &arena);
     while (iter->HasNext()) {
       ASSERT_OK_FAST(iter->NextBlock(&block));
@@ -138,7 +168,7 @@ TEST_F(TestCFileSet, TestPartiallyMaterialize) {
   gscoped_ptr<CFileSet::Iterator> iter(fileset->NewIterator(&schema_));
   ASSERT_OK(iter->Init(nullptr));
 
-  Arena arena(4096, 1024*1024);
+  Arena arena(4096);
   RowBlock block(schema_, 100, &arena);
   rowid_t row_idx = 0;
   while (iter->HasNext()) {
@@ -197,15 +227,15 @@ TEST_F(TestCFileSet, TestPartiallyMaterialize) {
   }
 
   // Since we pushed down the block size, we expect to have read 100+ blocks of column 0
-  ASSERT_GT(stats[0].data_blocks_read_from_disk, 100);
+  ASSERT_GT(stats[0].blocks_read, 100);
 
   // Since we didn't ever materialize column 2, we shouldn't have read any data blocks.
-  ASSERT_EQ(0, stats[2].data_blocks_read_from_disk);
+  ASSERT_EQ(0, stats[2].blocks_read);
 
   // Column 0 and 1 skipped a lot of blocks, so should not have read all of the cells
   // from either column.
-  ASSERT_LT(stats[0].cells_read_from_disk, kNumRows * 3 / 4);
-  ASSERT_LT(stats[1].cells_read_from_disk, kNumRows * 3 / 4);
+  ASSERT_LT(stats[0].cells_read, kNumRows * 3 / 4);
+  ASSERT_LT(stats[1].cells_read, kNumRows * 3 / 4);
 }
 
 TEST_F(TestCFileSet, TestIteratePartialSchema) {
@@ -252,7 +282,7 @@ TEST_F(TestCFileSet, TestRangeScan) {
   shared_ptr<CFileSet::Iterator> cfile_iter(fileset->NewIterator(&schema_));
   gscoped_ptr<RowwiseIterator> iter(new MaterializingIterator(cfile_iter));
   Schema key_schema = schema_.CreateKeyProjection();
-  Arena arena(1024, 256 * 1024);
+  Arena arena(1024);
   AutoReleasePool pool;
 
   // Create a scan with a range predicate on the key column.
@@ -286,9 +316,10 @@ TEST_F(TestCFileSet, TestRangeScan) {
   // Since it's a small range, it should be all in one data block in each column.
   vector<IteratorStats> stats;
   iter->GetIteratorStats(&stats);
-  EXPECT_EQ(stats[0].data_blocks_read_from_disk, 1);
-  EXPECT_EQ(stats[1].data_blocks_read_from_disk, 1);
-  EXPECT_EQ(stats[2].data_blocks_read_from_disk, 1);
+  ASSERT_EQ(3, stats.size());
+  EXPECT_EQ(1, stats[0].blocks_read);
+  EXPECT_EQ(1, stats[1].blocks_read);
+  EXPECT_EQ(1, stats[2].blocks_read);
 }
 
 // Several other black-box tests for range scans. These are similar to

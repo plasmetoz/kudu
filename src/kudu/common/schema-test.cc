@@ -17,22 +17,37 @@
 
 #include "kudu/common/schema.h"
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <string>
+#include <tuple>  // IWYU pragma: keep
 #include <unordered_map>
 #include <vector>
 
+#include <glog/logging.h> // IWYU pragma: keep
+#include <gtest/gtest.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/key_encoder.h"
 #include "kudu/common/row.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/hexdump.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"  // IWYU pragma: keep
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 namespace kudu {
 namespace tablet {
 
+using std::string;
 using std::unordered_map;
 using std::vector;
 using strings::Substitute;
@@ -86,6 +101,66 @@ TEST_F(TestSchema, TestSchema) {
   EXPECT_EQ("uint32 NULLABLE", schema.column(1).TypeToString());
 }
 
+// Test basic functionality of Schema definition with decimal columns
+TEST_F(TestSchema, TestSchemaWithDecimal) {
+  ColumnSchema col1("key", STRING);
+  ColumnSchema col2("decimal32val", DECIMAL32, false,
+                    NULL, NULL, ColumnStorageAttributes(),
+                    ColumnTypeAttributes(9, 4));
+  ColumnSchema col3("decimal64val", DECIMAL64, true,
+                    NULL, NULL, ColumnStorageAttributes(),
+                    ColumnTypeAttributes(18, 10));
+  ColumnSchema col4("decimal128val", DECIMAL128, true,
+                    NULL, NULL, ColumnStorageAttributes(),
+                    ColumnTypeAttributes(38, 2));
+
+  vector<ColumnSchema> cols = { col1, col2, col3, col4 };
+  Schema schema(cols, 1);
+
+  ASSERT_EQ(sizeof(Slice) + sizeof(int32_t) +
+                sizeof(int64_t) + sizeof(int128_t),
+            schema.byte_size());
+
+  EXPECT_EQ("Schema [\n"
+                "\tkey[string NOT NULL],\n"
+                "\tdecimal32val[decimal(9, 4) NOT NULL],\n"
+                "\tdecimal64val[decimal(18, 10) NULLABLE],\n"
+                "\tdecimal128val[decimal(38, 2) NULLABLE]\n"
+                "]",
+            schema.ToString());
+
+  EXPECT_EQ("decimal(9, 4) NOT NULL", schema.column(1).TypeToString());
+  EXPECT_EQ("decimal(18, 10) NULLABLE", schema.column(2).TypeToString());
+  EXPECT_EQ("decimal(38, 2) NULLABLE", schema.column(3).TypeToString());
+}
+
+// Test Schema::Equals respects decimal column attributes
+TEST_F(TestSchema, TestSchemaEqualsWithDecimal) {
+  ColumnSchema col1("key", STRING);
+  ColumnSchema col_18_10("decimal64val", DECIMAL64, true,
+                         NULL, NULL, ColumnStorageAttributes(),
+                         ColumnTypeAttributes(18, 10));
+  ColumnSchema col_18_9("decimal64val", DECIMAL64, true,
+                        NULL, NULL, ColumnStorageAttributes(),
+                        ColumnTypeAttributes(18, 9));
+  ColumnSchema col_17_10("decimal64val", DECIMAL64, true,
+                         NULL, NULL, ColumnStorageAttributes(),
+                         ColumnTypeAttributes(17, 10));
+  ColumnSchema col_17_9("decimal64val", DECIMAL64, true,
+                        NULL, NULL, ColumnStorageAttributes(),
+                        ColumnTypeAttributes(17, 9));
+
+  Schema schema_18_10({ col1, col_18_10 }, 1);
+  Schema schema_18_9({ col1, col_18_9 }, 1);
+  Schema schema_17_10({ col1, col_17_10 }, 1);
+  Schema schema_17_9({ col1, col_17_9 }, 1);
+
+  EXPECT_TRUE(schema_18_10.Equals(schema_18_10));
+  EXPECT_FALSE(schema_18_10.Equals(schema_18_9));
+  EXPECT_FALSE(schema_18_10.Equals(schema_17_10));
+  EXPECT_FALSE(schema_18_10.Equals(schema_17_9));
+}
+
 TEST_F(TestSchema, TestSwap) {
   Schema schema1({ ColumnSchema("col1", STRING),
                    ColumnSchema("col2", STRING),
@@ -99,6 +174,52 @@ TEST_F(TestSchema, TestSwap) {
   ASSERT_EQ(1, schema1.num_key_columns());
   ASSERT_EQ(3, schema2.num_columns());
   ASSERT_EQ(2, schema2.num_key_columns());
+}
+
+TEST_F(TestSchema, TestColumnSchemaEquals) {
+  Slice default_str("read-write default");
+  ColumnSchema col1("key", STRING);
+  ColumnSchema col2("key1", STRING);
+  ColumnSchema col3("key", STRING, true);
+  ColumnSchema col4("key", STRING, true, &default_str, &default_str);
+
+  ASSERT_TRUE(col1.Equals(col1));
+  ASSERT_FALSE(col1.Equals(col2, ColumnSchema::COMPARE_NAME));
+  ASSERT_TRUE(col1.Equals(col2, ColumnSchema::COMPARE_TYPE));
+  ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_NAME));
+  ASSERT_FALSE(col1.Equals(col3, ColumnSchema::COMPARE_TYPE));
+  ASSERT_TRUE(col1.Equals(col3, ColumnSchema::COMPARE_DEFAULTS));
+  ASSERT_FALSE(col3.Equals(col4, ColumnSchema::COMPARE_DEFAULTS));
+  ASSERT_TRUE(col4.Equals(col4, ColumnSchema::COMPARE_DEFAULTS));
+}
+
+TEST_F(TestSchema, TestSchemaEquals) {
+  Schema schema1({ ColumnSchema("col1", STRING),
+                   ColumnSchema("col2", STRING),
+                   ColumnSchema("col3", UINT32) },
+                 2);
+  Schema schema2({ ColumnSchema("newCol1", STRING),
+                   ColumnSchema("newCol2", STRING),
+                   ColumnSchema("newCol3", UINT32) },
+                 2);
+  Schema schema3({ ColumnSchema("col1", STRING),
+                   ColumnSchema("col2", UINT32),
+                   ColumnSchema("col3", UINT32, true) },
+                 2);
+  Schema schema4({ ColumnSchema("col1", STRING),
+                   ColumnSchema("col2", UINT32),
+                   ColumnSchema("col3", UINT32, false) },
+                 2);
+  ASSERT_FALSE(schema1.Equals(schema2));
+  ASSERT_TRUE(schema1.KeyEquals(schema1));
+  ASSERT_TRUE(schema1.KeyEquals(schema2, ColumnSchema::COMPARE_TYPE));
+  ASSERT_FALSE(schema1.KeyEquals(schema2, ColumnSchema::COMPARE_NAME));
+  ASSERT_TRUE(schema1.KeyTypeEquals(schema2));
+  ASSERT_FALSE(schema2.KeyTypeEquals(schema3));
+  ASSERT_FALSE(schema3.Equals(schema4));
+  ASSERT_TRUE(schema4.Equals(schema4));
+  ASSERT_TRUE(schema3.KeyEquals(schema4,
+              ColumnSchema::COMPARE_NAME | ColumnSchema::COMPARE_TYPE));
 }
 
 TEST_F(TestSchema, TestReset) {
@@ -245,7 +366,7 @@ TEST_F(TestSchema, TestRowOperations) {
                   ColumnSchema("col4", INT32) },
                 1);
 
-  Arena arena(1024, 256*1024);
+  Arena arena(1024);
 
   RowBuilder rb(schema);
   rb.AddString(string("row_a_1"));

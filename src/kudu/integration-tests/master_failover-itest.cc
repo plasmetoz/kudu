@@ -15,24 +15,34 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <cstdint>
 #include <memory>
+#include <ostream>
 #include <set>
 #include <string>
 #include <vector>
 
-#include "kudu/client/client.h"
-#include "kudu/client/client-internal.h"
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/strings/util.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 METRIC_DECLARE_entity(server);
@@ -46,6 +56,12 @@ namespace client {
 
 const int kNumTabletServerReplicas = 3;
 
+using cluster::ExternalDaemon;
+using cluster::ExternalMaster;
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
+using cluster::ScopedResumeExternalDaemon;
+using itest::GetInt64Metric;
 using sp::shared_ptr;
 using std::set;
 using std::string;
@@ -71,15 +87,15 @@ class MasterFailoverTest : public KuduTest {
     // long pauses) more rapid.
 
     // Set max missed heartbeats periods to 1.0 (down from 3.0).
-    opts_.extra_master_flags.push_back("--leader_failure_max_missed_heartbeat_periods=1.0");
+    opts_.extra_master_flags.emplace_back("--leader_failure_max_missed_heartbeat_periods=1.0");
 
     // Set the TS->master heartbeat timeout to 1 second (down from 15 seconds).
-    opts_.extra_tserver_flags.push_back("--heartbeat_rpc_timeout_ms=1000");
+    opts_.extra_tserver_flags.emplace_back("--heartbeat_rpc_timeout_ms=1000");
     // Allow one TS heartbeat failure before retrying with back-off (down from 3).
-    opts_.extra_tserver_flags.push_back("--heartbeat_max_failures_before_backoff=1");
+    opts_.extra_tserver_flags.emplace_back("--heartbeat_max_failures_before_backoff=1");
     // Wait for 500 ms after 'max_consecutive_failed_heartbeats'
     // before trying again (down from 1 second).
-    opts_.extra_tserver_flags.push_back("--heartbeat_interval_ms=500");
+    opts_.extra_tserver_flags.emplace_back("--heartbeat_interval_ms=500");
   }
 
   virtual void SetUp() OVERRIDE {
@@ -154,7 +170,7 @@ TEST_F(MasterFailoverTest, TestCreateTableSync) {
   LOG(INFO) << "Pausing leader master";
   int leader_idx;
   ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
-  cluster_->master(leader_idx)->Pause();
+  ASSERT_OK(cluster_->master(leader_idx)->Pause());
   ScopedResumeExternalDaemon resume_daemon(cluster_->master(leader_idx));
 
   // As Pause() is asynchronous, the following sequence of events is possible:
@@ -189,12 +205,16 @@ TEST_F(MasterFailoverTest, TestPauseAfterCreateTableIssued) {
   LOG(INFO) << "Pausing leader master";
   int leader_idx;
   ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
-  cluster_->master(leader_idx)->Pause();
+  ASSERT_OK(cluster_->master(leader_idx)->Pause());
   ScopedResumeExternalDaemon resume_daemon(cluster_->master(leader_idx));
 
-  MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(90);
-  ASSERT_OK(client_->data_->WaitForCreateTableToFinish(client_.get(),
-                                                       kTableName, deadline));
+  AssertEventually([&]() {
+    bool in_progress;
+    ASSERT_OK(client_->IsCreateTableInProgress(kTableName, &in_progress));
+    ASSERT_FALSE(in_progress);
+  }, MonoDelta::FromSeconds(90));
+  NO_PENDING_FATALS();
+
   shared_ptr<KuduTable> table;
   ASSERT_OK(client_->OpenTable(kTableName, &table));
   ASSERT_EQ(0, CountTableRows(table.get()));
@@ -215,7 +235,7 @@ TEST_F(MasterFailoverTest, TestDeleteTableSync) {
   LOG(INFO) << "Pausing leader master";
   int leader_idx;
   ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
-  cluster_->master(leader_idx)->Pause();
+  ASSERT_OK(cluster_->master(leader_idx)->Pause());
   ScopedResumeExternalDaemon resume_daemon(cluster_->master(leader_idx));
 
   // It's possible for DeleteTable() to delete the table and still return
@@ -249,7 +269,7 @@ TEST_F(MasterFailoverTest, TestRenameTableSync) {
   LOG(INFO) << "Pausing leader master";
   int leader_idx;
   ASSERT_OK(cluster_->GetLeaderMasterIndex(&leader_idx));
-  cluster_->master(leader_idx)->Pause();
+  ASSERT_OK(cluster_->master(leader_idx)->Pause());
   ScopedResumeExternalDaemon resume_daemon(cluster_->master(leader_idx));
 
   // It's possible for AlterTable() to rename the table and still return
@@ -300,20 +320,12 @@ TEST_F(MasterFailoverTest, TestKUDU1374) {
   // 5. Leader master sees that all tablets in the table now have the new
   //    schema and ends the AlterTable() operation.
   // 6. The next IsAlterTableInProgress() call returns false.
-  MonoTime now = MonoTime::Now();
-  MonoTime deadline = now + MonoDelta::FromSeconds(90);
-  while (now < deadline) {
+  AssertEventually([&]() {
     bool in_progress;
     ASSERT_OK(client_->IsAlterTableInProgress(kTableName, &in_progress));
-    if (!in_progress) {
-      break;
-    }
-
-    SleepFor(MonoDelta::FromMilliseconds(100));
-    now = MonoTime::Now();
-  }
-  ASSERT_TRUE(now < deadline)
-      << "Deadline elapsed before alter table completed";
+    ASSERT_FALSE(in_progress);
+  }, MonoDelta::FromSeconds(90));
+  NO_PENDING_FATALS();
 }
 
 TEST_F(MasterFailoverTest, TestMasterUUIDResolution) {
@@ -321,7 +333,8 @@ TEST_F(MasterFailoverTest, TestMasterUUIDResolution) {
   // their UUIDs.
   for (int i = 0; i < cluster_->num_masters(); i++) {
     int64_t num_get_node_instances;
-    ASSERT_OK(cluster_->master(i)->GetInt64Metric(
+    ASSERT_OK(GetInt64Metric(
+        cluster_->master(i)->bound_http_hostport(),
         &METRIC_ENTITY_server, "kudu.master",
         &METRIC_handler_latency_kudu_consensus_ConsensusService_GetNodeInstance,
         "total_count", &num_get_node_instances));
@@ -341,7 +354,8 @@ TEST_F(MasterFailoverTest, TestMasterUUIDResolution) {
   for (int i = 0; i < cluster_->num_masters(); i++) {
     ExternalMaster* master = cluster_->master(i);
     int64_t num_get_node_instances;
-    ASSERT_OK(master->GetInt64Metric(
+    ASSERT_OK(GetInt64Metric(
+        master->bound_http_hostport(),
         &METRIC_ENTITY_server, "kudu.master",
         &METRIC_handler_latency_kudu_consensus_ConsensusService_GetNodeInstance,
         "total_count", &num_get_node_instances));
@@ -363,8 +377,7 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
 
     // "Fail" a master and blow away its state completely.
     failed_master->Shutdown();
-    string data_root = failed_master->data_dir();
-    env_->DeleteRecursively(data_root);
+    ASSERT_OK(failed_master->DeleteFromDisk());
 
     // Pick another master at random to serve as a basis for recovery.
     //
@@ -382,7 +395,7 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
           "local_replica",
           "cmeta",
           "print_replica_uuids",
-          "--fs_wal_dir=" + other_master->data_dir(),
+          "--fs_wal_dir=" + other_master->wal_dir(),
           "--fs_data_dirs=" + other_master->data_dir(),
           master::SysCatalogTable::kSysCatalogTabletId
       };
@@ -408,8 +421,8 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
           kBinPath,
           "fs",
           "format",
-          "--fs_wal_dir=" + data_root,
-          "--fs_data_dirs=" + data_root,
+          "--fs_wal_dir=" + failed_master->wal_dir(),
+          "--fs_data_dirs=" + failed_master->data_dir(),
           "--uuid=" + uuid
       };
       ASSERT_OK(Subprocess::Call(args));
@@ -421,8 +434,8 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
           kBinPath,
           "local_replica",
           "copy_from_remote",
-          "--fs_wal_dir=" + data_root,
-          "--fs_data_dirs=" + data_root,
+          "--fs_wal_dir=" + failed_master->wal_dir(),
+          "--fs_data_dirs=" + failed_master->data_dir(),
           master::SysCatalogTable::kSysCatalogTabletId,
           other_master->bound_rpc_hostport().ToString()
       };
@@ -450,7 +463,7 @@ TEST_F(MasterFailoverTest, TestMasterPermanentFailure) {
     // Only in slow mode.
     if (AllowSlowTests()) {
       for (int j = 0; j < cluster_->num_masters(); j++) {
-        cluster_->master(j)->Pause();
+        ASSERT_OK(cluster_->master(j)->Pause());
         ScopedResumeExternalDaemon resume_daemon(cluster_->master(j));
         string table_name = Substitute("table-$0-$1", i, j);
 

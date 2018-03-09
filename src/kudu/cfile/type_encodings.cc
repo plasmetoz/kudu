@@ -16,11 +16,10 @@
 // under the License.
 #include "kudu/cfile/type_encodings.h"
 
-#include <unordered_map>
+#include <cstddef>
 #include <memory>
+#include <unordered_map>
 #include <utility>
-
-#include <glog/logging.h>
 
 #include "kudu/cfile/bshuf_block.h"
 #include "kudu/cfile/plain_bitmap_block.h"
@@ -30,14 +29,19 @@
 #include "kudu/cfile/binary_plain_block.h"
 #include "kudu/cfile/binary_prefix_block.h"
 #include "kudu/common/types.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/singleton.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/slice.h"
+
+
+using std::make_pair;
+using std::pair;
+using std::shared_ptr;
+using std::unordered_map;
 
 namespace kudu {
 namespace cfile {
-
-using std::unordered_map;
-using std::shared_ptr;
-
 
 template<DataType Type, EncodingType Encoding>
 struct DataTypeEncodingTraits {};
@@ -46,8 +50,8 @@ struct DataTypeEncodingTraits {};
 template<DataType Type, EncodingType Encoding> struct TypeEncodingTraits
   : public DataTypeEncodingTraits<Type, Encoding> {
 
-  static const DataType type = Type;
-  static const EncodingType encoding_type = Encoding;
+  static const DataType kType = Type;
+  static const EncodingType kEncodingType = Encoding;
 };
 
 // Generic, fallback, partial specialization that should work for all
@@ -185,7 +189,7 @@ struct DataTypeEncodingTraits<IntType, RLE> {
 
 template<typename TypeEncodingTraitsClass>
 TypeEncodingInfo::TypeEncodingInfo(TypeEncodingTraitsClass t)
-    : encoding_type_(TypeEncodingTraitsClass::encoding_type),
+    : encoding_type_(TypeEncodingTraitsClass::kEncodingType),
       create_builder_func_(TypeEncodingTraitsClass::CreateBlockBuilder),
       create_decoder_func_(TypeEncodingTraitsClass::CreateBlockDecoder) {
 }
@@ -270,6 +274,10 @@ class TypeEncodingResolver {
     AddMapping<BINARY, PREFIX_ENCODING>();
     AddMapping<BOOL, RLE>();
     AddMapping<BOOL, PLAIN_ENCODING>();
+    AddMapping<INT128, BIT_SHUFFLE>();
+    AddMapping<INT128, PLAIN_ENCODING>();
+    // TODO: Add 128 bit support to RLE
+    // AddMapping<INT128, RLE>();
   }
 
   template<DataType type, EncodingType encoding> void AddMapping() {
@@ -280,7 +288,7 @@ class TypeEncodingResolver {
     }
     mapping_.insert(
         make_pair(make_pair(type, encoding),
-                  shared_ptr<TypeEncodingInfo>(new TypeEncodingInfo(traits))));
+                  std::make_shared<TypeEncodingInfo>(traits)));
   }
 
   unordered_map<pair<DataType, EncodingType>,

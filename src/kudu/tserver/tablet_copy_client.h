@@ -17,40 +17,44 @@
 #ifndef KUDU_TSERVER_TABLET_COPY_CLIENT_H
 #define KUDU_TSERVER_TABLET_COPY_CLIENT_H
 
+#include <cstdint>
 #include <string>
 #include <memory>
 #include <vector>
 
 #include <gtest/gtest_prod.h>
 
-#include "kudu/fs/block_id.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/random.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
+class BlockId;
 class BlockIdPB;
 class FsManager;
 class HostPort;
 
 namespace consensus {
 class ConsensusMetadata;
+class ConsensusMetadataManager;
 class ConsensusStatePB;
-class RaftConfigPB;
-class RaftPeerPB;
 } // namespace consensus
 
+namespace fs {
+class BlockCreationTransaction;
+} // namespace fs
+
 namespace rpc {
-class ErrorStatusPB;
 class Messenger;
 class RpcController;
 } // namespace rpc
 
 namespace tablet {
 class TabletMetadata;
-class TabletPeer;
-class TabletStatusListener;
+class TabletReplica;
 class TabletSuperBlockPB;
 } // namespace tablet
 
@@ -58,6 +62,14 @@ namespace tserver {
 class DataIdPB;
 class DataChunkPB;
 class TabletCopyServiceProxy;
+
+// Server-wide tablet copy metrics.
+struct TabletCopyClientMetrics {
+  explicit TabletCopyClientMetrics(const scoped_refptr<MetricEntity>& metric_entity);
+
+  scoped_refptr<Counter> bytes_fetched;
+  scoped_refptr<AtomicGauge<int32_t>> open_client_sessions;
+};
 
 // Client class for using tablet copy to copy a tablet from another host.
 // This class is not thread-safe.
@@ -71,7 +83,9 @@ class TabletCopyClient {
   // Construct the tablet copy client.
   // 'fs_manager' and 'messenger' must remain valid until this object is destroyed.
   TabletCopyClient(std::string tablet_id, FsManager* fs_manager,
-                        std::shared_ptr<rpc::Messenger> messenger);
+                   scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager,
+                   std::shared_ptr<rpc::Messenger> messenger,
+                   TabletCopyClientMetrics* tablet_copy_metrics);
 
   // Attempt to clean up resources on the remote end by sending an
   // EndTabletCopySession() RPC
@@ -93,16 +107,21 @@ class TabletCopyClient {
   // in progress. If the 'metadata' pointer is passed as NULL, it is ignored,
   // otherwise the TabletMetadata object resulting from the initial remote
   // bootstrap response is returned.
+  //
+  // Upon success, tablet metadata will be created and the tablet will be
+  // assigned to a data directory group.
   Status Start(const HostPort& copy_source_addr,
                scoped_refptr<tablet::TabletMetadata>* meta);
 
   // Runs a "full" tablet copy, copying the physical layout of a tablet
   // from the leader of the specified consensus configuration.
-  Status FetchAll(tablet::TabletStatusListener* status_listener);
+  // Adds all downloaded blocks during copying to the tablet copy's transaction,
+  // which will be closed together at Finish().
+  Status FetchAll(const scoped_refptr<tablet::TabletReplica>& tablet_replica);
 
-  // After downloading all files successfully, write out the completed
-  // replacement superblock. Must be called after Start() and FetchAll().
-  // Must not be called after Abort().
+  // After downloading all files successfully, commit all downloaded blocks.
+  // Write out the completed replacement superblock.
+  // Must be called after Start() and FetchAll(). Must not be called after Abort().
   Status Finish();
 
   // Abort an in-progress transfer and immediately delete the data blocks and
@@ -110,6 +129,7 @@ class TabletCopyClient {
   Status Abort();
 
  private:
+  FRIEND_TEST(TabletCopyClientTest, TestNoBlocksAtStart);
   FRIEND_TEST(TabletCopyClientTest, TestBeginEndSession);
   FRIEND_TEST(TabletCopyClientTest, TestDownloadBlock);
   FRIEND_TEST(TabletCopyClientTest, TestVerifyData);
@@ -123,15 +143,15 @@ class TabletCopyClient {
     kFinished,
   };
 
-  // Extract the embedded Status message from the given ErrorStatusPB.
-  // The given ErrorStatusPB must extend TabletCopyErrorPB.
-  static Status ExtractRemoteError(const rpc::ErrorStatusPB& remote_error);
-
   static Status UnwindRemoteError(const Status& status, const rpc::RpcController& controller);
 
-  // Update the bootstrap StatusListener with a message.
+  // Returns an error if any directories in the tablet's directory group are
+  // unhealthy.
+  Status CheckHealthyDirGroup() const;
+
+  // Set a new status message on the TabletReplica.
   // The string "TabletCopy: " will be prepended to each message.
-  void UpdateStatusMessage(const std::string& message);
+  void SetStatusMessage(const std::string& message);
 
   // End the tablet copy session.
   Status EndRemoteSession();
@@ -148,27 +168,36 @@ class TabletCopyClient {
   // downloaded as part of initiating the tablet copy session.
   Status WriteConsensusMetadata();
 
-  // Count the number of blocks contained in 'superblock_'.
-  int CountBlocks() const;
+  // Count the number of blocks on the remote (from 'remote_superblock_').
+  int CountRemoteBlocks() const;
 
-  // Download all blocks belonging to a tablet sequentially.
+  // Download all blocks belonging to a tablet sequentially. Add all
+  // downloaded blocks to the tablet copy's transaction.
   //
   // Blocks are given new IDs upon creation. On success, 'superblock_'
   // is populated to reflect the new block IDs.
   Status DownloadBlocks();
 
-  // Download the block specified by 'block_id'.
+  // Download the remote block specified by 'src_block_id'. 'num_blocks' should
+  // be given as the total number of blocks there are to download (for logging
+  // purposes). Add the block to the tablet copy's transaction, to close blocks
+  // belonging to the transaction together when the copying is complete.
   //
   // On success:
-  // - 'block_id' is set to the new ID of the downloaded block.
-  // - 'block_count' is incremented.
-  Status DownloadAndRewriteBlock(BlockIdPB* block_id, int* block_count, int num_blocks);
+  // - 'dest_block_id' is set to the new ID of the downloaded block.
+  // - 'block_count' is incremented by 1.
+  Status DownloadAndRewriteBlock(const BlockIdPB& src_block_id,
+                                 int num_blocks,
+                                 int* block_count,
+                                 BlockIdPB* dest_block_id);
 
   // Download a single block.
-  // Data block is opened with options so that it will fsync() on close.
+  // Data block is opened with new ID. After downloading, the block is finalized
+  // and added to the tablet copy's transaction.
   //
   // On success, 'new_block_id' is set to the new ID of the downloaded block.
-  Status DownloadBlock(const BlockId& old_block_id, BlockId* new_block_id);
+  Status DownloadBlock(const BlockId& old_block_id,
+                       BlockId* new_block_id);
 
   // Download a single remote file. The block and WAL implementations delegate
   // to this method when downloading files.
@@ -182,12 +211,18 @@ class TabletCopyClient {
 
   Status VerifyData(uint64_t offset, const DataChunkPB& resp);
 
+  // Runs the provided functor, which must send an RPC and return the result
+  // status, until it succeeds, times out, or fails with a non-retriable error.
+  template<typename F>
+  Status SendRpcWithRetry(rpc::RpcController* controller, F f);
+
   // Return standard log prefix.
   std::string LogPrefix();
 
   // Set-once members.
   const std::string tablet_id_;
   FsManager* const fs_manager_;
+  const scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager_;
   const std::shared_ptr<rpc::Messenger> messenger_;
 
   // State of the progress of the tablet copy operation.
@@ -200,18 +235,26 @@ class TabletCopyClient {
   scoped_refptr<tablet::TabletMetadata> meta_;
 
   // Local Consensus metadata file. This may initially be NULL if this is
-  // bootstrapping a new replica (rather than replacing an old one).
-  std::unique_ptr<consensus::ConsensusMetadata> cmeta_;
+  // bootstrapping a new replica (rather than replacing an old one) but it is
+  // guaranteed to be set after a successful call to Start().
+  scoped_refptr<consensus::ConsensusMetadata> cmeta_;
 
-  tablet::TabletStatusListener* status_listener_;
+  scoped_refptr<tablet::TabletReplica> tablet_replica_;
   std::shared_ptr<TabletCopyServiceProxy> proxy_;
   std::string session_id_;
   uint64_t session_idle_timeout_millis_;
-  std::unique_ptr<tablet::TabletSuperBlockPB> old_superblock_;
+  std::unique_ptr<tablet::TabletSuperBlockPB> remote_superblock_;
   std::unique_ptr<tablet::TabletSuperBlockPB> superblock_;
-  std::unique_ptr<consensus::ConsensusStatePB> remote_committed_cstate_;
+  std::unique_ptr<consensus::ConsensusStatePB> remote_cstate_;
   std::vector<uint64_t> wal_seqnos_;
   int64_t start_time_micros_;
+
+  Random rng_;
+
+  TabletCopyClientMetrics* tablet_copy_metrics_;
+
+  // Block transaction for the tablet copy.
+  std::unique_ptr<fs::BlockCreationTransaction> transaction_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletCopyClient);
 };

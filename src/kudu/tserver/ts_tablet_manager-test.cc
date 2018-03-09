@@ -17,20 +17,36 @@
 
 #include "kudu/tserver/ts_tablet_manager.h"
 
-#include <gtest/gtest.h>
+#include <cstdint>
+#include <ostream>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/schema.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/fs/fs_manager.h"
+#include "kudu/consensus/opid_util.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/master/master.pb.h"
-#include "kudu/tablet/tablet_peer.h"
-#include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet-harness.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/heartbeater.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 #define ASSERT_REPORT_HAS_UPDATED_TABLET(report, tablet_id) \
@@ -39,14 +55,21 @@
 #define ASSERT_MONOTONIC_REPORT_SEQNO(report_seqno, tablet_report) \
   ASSERT_NO_FATAL_FAILURE(AssertMonotonicReportSeqno(report_seqno, tablet_report))
 
+using std::string;
+using std::vector;
+
 namespace kudu {
+
+class FsManager;
+
 namespace tserver {
 
 using consensus::kInvalidOpIdIndex;
 using consensus::RaftConfigPB;
 using master::ReportedTabletPB;
 using master::TabletReportPB;
-using tablet::TabletPeer;
+using pb_util::SecureShortDebugString;
+using tablet::TabletReplica;
 
 static const char* const kTabletId = "my-tablet-id";
 
@@ -59,9 +82,8 @@ class TsTabletManagerTest : public KuduTest {
 
   virtual void SetUp() OVERRIDE {
     KuduTest::SetUp();
-
-    mini_server_.reset(
-        new MiniTabletServer(GetTestPath("TsTabletManagerTest-fsroot"), 0));
+    mini_server_.reset(new MiniTabletServer(GetTestPath("TsTabletManagerTest-fsroot"),
+                                            HostPort("127.0.0.1", 0)));
     ASSERT_OK(mini_server_->Start());
     mini_server_->FailHeartbeats();
 
@@ -78,22 +100,22 @@ class TsTabletManagerTest : public KuduTest {
 
   Status CreateNewTablet(const std::string& tablet_id,
                          const Schema& schema,
-                         scoped_refptr<tablet::TabletPeer>* out_tablet_peer) {
+                         scoped_refptr<tablet::TabletReplica>* out_tablet_replica) {
     Schema full_schema = SchemaBuilder(schema).Build();
     std::pair<PartitionSchema, Partition> partition = tablet::CreateDefaultPartition(full_schema);
 
-    scoped_refptr<tablet::TabletPeer> tablet_peer;
+    scoped_refptr<tablet::TabletReplica> tablet_replica;
     RETURN_NOT_OK(tablet_manager_->CreateNewTablet(tablet_id, tablet_id, partition.second,
                                                    tablet_id,
                                                    full_schema, partition.first,
                                                    config_,
-                                                   &tablet_peer));
-    if (out_tablet_peer) {
-      (*out_tablet_peer) = tablet_peer;
+                                                   &tablet_replica));
+    if (out_tablet_replica) {
+      (*out_tablet_replica) = tablet_replica;
     }
 
-    RETURN_NOT_OK(tablet_peer->WaitUntilConsensusRunning(MonoDelta::FromMilliseconds(2000)));
-    return tablet_peer->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10));
+    RETURN_NOT_OK(tablet_replica->WaitUntilConsensusRunning(MonoDelta::FromMilliseconds(2000)));
+    return tablet_replica->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10));
   }
 
   void GenerateFullTabletReport(TabletReportPB* report) {
@@ -126,24 +148,24 @@ class TsTabletManagerTest : public KuduTest {
 
 TEST_F(TsTabletManagerTest, TestCreateTablet) {
   // Create a new tablet.
-  scoped_refptr<TabletPeer> peer;
-  ASSERT_OK(CreateNewTablet(kTabletId, schema_, &peer));
-  ASSERT_EQ(kTabletId, peer->tablet()->tablet_id());
-  peer.reset();
+  scoped_refptr<TabletReplica> replica;
+  ASSERT_OK(CreateNewTablet(kTabletId, schema_, &replica));
+  ASSERT_EQ(kTabletId, replica->tablet()->tablet_id());
+  replica.reset();
 
   // Re-load the tablet manager from the filesystem.
   LOG(INFO) << "Shutting down tablet manager";
   mini_server_->Shutdown();
   LOG(INFO) << "Restarting tablet manager";
-  mini_server_.reset(
-      new MiniTabletServer(GetTestPath("TsTabletManagerTest-fsroot"), 0));
+  mini_server_.reset(new MiniTabletServer(GetTestPath("TsTabletManagerTest-fsroot"),
+                                          HostPort("127.0.0.1", 0)));
   ASSERT_OK(mini_server_->Start());
   ASSERT_OK(mini_server_->WaitStarted());
   tablet_manager_ = mini_server_->server()->tablet_manager();
 
   // Ensure that the tablet got re-loaded and re-opened off disk.
-  ASSERT_TRUE(tablet_manager_->LookupTablet(kTabletId, &peer));
-  ASSERT_EQ(kTabletId, peer->tablet()->tablet_id());
+  ASSERT_TRUE(tablet_manager_->LookupTablet(kTabletId, &replica));
+  ASSERT_EQ(kTabletId, replica->tablet()->tablet_id());
 }
 
 static void AssertMonotonicReportSeqno(int64_t* report_seqno,
@@ -156,22 +178,22 @@ static void AssertReportHasUpdatedTablet(const TabletReportPB& report,
                                          const string& tablet_id) {
   ASSERT_GE(report.updated_tablets_size(), 0);
   bool found_tablet = false;
-  for (ReportedTabletPB reported_tablet : report.updated_tablets()) {
+  for (const ReportedTabletPB& reported_tablet : report.updated_tablets()) {
     if (reported_tablet.tablet_id() == tablet_id) {
       found_tablet = true;
-      ASSERT_TRUE(reported_tablet.has_committed_consensus_state());
-      ASSERT_TRUE(reported_tablet.committed_consensus_state().has_current_term())
+      ASSERT_TRUE(reported_tablet.has_consensus_state());
+      ASSERT_TRUE(reported_tablet.consensus_state().has_current_term())
           << SecureShortDebugString(reported_tablet);
-      ASSERT_TRUE(reported_tablet.committed_consensus_state().has_leader_uuid())
+      ASSERT_FALSE(reported_tablet.consensus_state().leader_uuid().empty())
           << SecureShortDebugString(reported_tablet);
-      ASSERT_TRUE(reported_tablet.committed_consensus_state().has_config());
-      const RaftConfigPB& committed_config = reported_tablet.committed_consensus_state().config();
+      ASSERT_TRUE(reported_tablet.consensus_state().has_committed_config());
+      const RaftConfigPB& committed_config = reported_tablet.consensus_state().committed_config();
       ASSERT_EQ(kInvalidOpIdIndex, committed_config.opid_index());
       ASSERT_EQ(1, committed_config.peers_size());
       ASSERT_TRUE(committed_config.peers(0).has_permanent_uuid())
           << SecureShortDebugString(reported_tablet);
       ASSERT_EQ(committed_config.peers(0).permanent_uuid(),
-                reported_tablet.committed_consensus_state().leader_uuid())
+                reported_tablet.consensus_state().leader_uuid())
           << SecureShortDebugString(reported_tablet);
     }
   }
@@ -228,7 +250,7 @@ TEST_F(TsTabletManagerTest, TestTabletReports) {
   ASSERT_OK(CreateNewTablet("tablet-2", schema_, nullptr));
 
   // Wait up to 10 seconds to get a tablet report from tablet-2.
-  // TabletPeer does not mark tablets dirty until after it commits the
+  // TabletReplica does not mark tablets dirty until after it commits the
   // initial configuration change, so there is also a window for tablet-1 to
   // have been marked dirty since the last report.
   MonoDelta timeout(MonoDelta::FromSeconds(10));

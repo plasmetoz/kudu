@@ -17,12 +17,19 @@
 #ifndef KUDU_INTEGRATION_TESTS_TEST_WORKLOAD_H
 #define KUDU_INTEGRATION_TESTS_TEST_WORKLOAD_H
 
+#include <cstdint>
+#include <ostream>
 #include <string>
+#include <thread>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
+
 #include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/monotime.h"
@@ -30,8 +37,11 @@
 
 namespace kudu {
 
-class MiniClusterBase;
-class Thread;
+class Status;
+
+namespace cluster {
+class MiniCluster;
+} // namespace cluster
 
 // Utility class for generating a workload against a test cluster.
 //
@@ -47,7 +57,7 @@ class TestWorkload {
  public:
   static const char* const kDefaultTableName;
 
-  explicit TestWorkload(MiniClusterBase* cluster);
+  explicit TestWorkload(cluster::MiniCluster* cluster);
   ~TestWorkload();
 
   void set_payload_bytes(int n) {
@@ -70,6 +80,14 @@ class TestWorkload {
     client_builder_.default_rpc_timeout(MonoDelta::FromMilliseconds(t));
   }
 
+  void set_client_default_admin_operation_timeout_millis(int t) {
+    client_builder_.default_admin_operation_timeout(MonoDelta::FromMilliseconds(t));
+  }
+
+  void set_read_timeout_millis(int t) {
+    read_timeout_millis_ = t;
+  }
+
   void set_write_timeout_millis(int t) {
     write_timeout_millis_ = t;
   }
@@ -82,6 +100,10 @@ class TestWorkload {
 
   void set_network_error_allowed(bool allowed) {
     network_error_allowed_ = allowed;
+  }
+
+  void set_remote_error_allowed(bool allowed) {
+    remote_error_allowed_ = allowed;
   }
 
   // Set whether to fail if we see a NotFound() error inserting a row.
@@ -97,6 +119,9 @@ class TestWorkload {
   void set_already_present_allowed(bool allowed) {
     already_present_allowed_ = allowed;
   }
+
+  // Override the default "simple" schema.
+  void set_schema(const client::KuduSchema& schema);
 
   void set_num_replicas(int r) {
     num_replicas_ = r;
@@ -153,6 +178,8 @@ class TestWorkload {
     }
   }
 
+  client::sp::shared_ptr<client::KuduClient> CreateClient();
+
   // Sets up the internal client and creates the table which will be used for
   // writing, if it doesn't already exist.
   void Setup();
@@ -162,6 +189,9 @@ class TestWorkload {
 
   // Stop the writers and wait for them to exit.
   void StopAndJoin();
+
+  // Delete created table, etc.
+  Status Cleanup();
 
   // Return the number of rows inserted so far. This may be called either
   // during or after the write workload.
@@ -178,26 +208,31 @@ class TestWorkload {
     return batches_completed_.Load();
   }
 
+  client::sp::shared_ptr<client::KuduClient> client() const { return client_; }
+
  private:
   void OpenTable(client::sp::shared_ptr<client::KuduTable>* table);
   void WriteThread();
   void ReadThread();
 
-  MiniClusterBase* cluster_;
+  cluster::MiniCluster* cluster_;
   client::KuduClientBuilder client_builder_;
   client::sp::shared_ptr<client::KuduClient> client_;
   ThreadSafeRandom rng_;
 
-  int payload_bytes_;
+  boost::optional<int> payload_bytes_;
   int num_write_threads_;
   int num_read_threads_;
+  int read_timeout_millis_;
   int write_batch_size_;
   int write_timeout_millis_;
   bool timeout_allowed_;
   bool not_found_allowed_;
   bool already_present_allowed_;
   bool network_error_allowed_;
+  bool remote_error_allowed_;
   WritePattern write_pattern_;
+  client::KuduSchema schema_;
 
   int num_replicas_;
   int num_tablets_;
@@ -209,7 +244,7 @@ class TestWorkload {
   AtomicInt<int64_t> batches_completed_;
   AtomicInt<int32_t> sequential_key_gen_;
 
-  std::vector<scoped_refptr<Thread> > threads_;
+  std::vector<std::thread> threads_;
 
   DISALLOW_COPY_AND_ASSIGN(TestWorkload);
 };

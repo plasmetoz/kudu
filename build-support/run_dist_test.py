@@ -27,6 +27,7 @@
 # We also 'cat' the test log upon completion so that the test logs are
 # uploaded by the test slave back.
 
+import glob
 import optparse
 import os
 import re
@@ -122,14 +123,15 @@ def main():
   fixup_rpaths(os.path.join(ROOT, "build"))
   fixup_rpaths(os.path.join(ROOT, "thirdparty"))
 
+  # Add environment variables for Java dependencies. These environment variables
+  # are used in mini_hms.cc.
+  env['HIVE_HOME'] = glob.glob(os.path.join(ROOT, "thirdparty/src/apache-hive-*-bin"))[0]
+  env['HADOOP_HOME'] = glob.glob(os.path.join(ROOT, "thirdparty/src/hadoop-*"))[0]
+  env['JAVA_HOME'] = glob.glob("/usr/lib/jvm/java-1.8.0-*")[0]
+
   env['LD_LIBRARY_PATH'] = ":".join(
     [os.path.join(ROOT, "build/dist-test-system-libs/"),
      os.path.abspath(os.path.join(test_dir, "..", "lib"))])
-
-  # GTEST_OUTPUT must be canonicalized and have a trailing slash for gtest to
-  # properly interpret it as a directory.
-  env['GTEST_OUTPUT'] = 'xml:' + os.path.abspath(
-    os.path.join(test_dir, "..", "test-logs")) + '/'
 
   # Don't pollute /tmp in dist-test setting. If a test crashes, the dist-test slave
   # will clear up our working directory but won't be able to find and clean up things

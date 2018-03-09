@@ -17,15 +17,15 @@
 #ifndef KUDU_UTIL_LOGGING_H
 #define KUDU_UTIL_LOGGING_H
 
+#include <iosfwd>
 #include <string>
-#include <gflags/gflags_declare.h>
+
 #include <glog/logging.h>
 
 #include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/walltime.h"
-#include "kudu/util/flags.h"
 #include "kudu/util/logging_callback.h"
 #include "kudu/util/status.h"
 
@@ -59,7 +59,8 @@
 // Evaluates to 'true' if the caller should redact any user data in the current scope.
 // Most callers should instead use KUDU_REDACT(...) defined below, but this can be useful
 // to short-circuit expensive logic.
-#define KUDU_SHOULD_REDACT() (kudu::g_should_redact_log && kudu::tls_redact_user_data)
+#define KUDU_SHOULD_REDACT() ((kudu::g_should_redact == kudu::RedactContext::ALL ||    \
+  kudu::g_should_redact == kudu::RedactContext::LOG) && kudu::tls_redact_user_data)
 
 // Either evaluate and return 'expr', or return the string "<redacted>", depending on whether
 // redaction is enabled in the current scope.
@@ -86,11 +87,14 @@ extern __thread bool tls_redact_user_data;
 // Redacted log messages are replaced with this constant.
 extern const char* const kRedactionMessage;
 
-// Flag for checking if log redaction is enabled or disabled.
-extern bool g_should_redact_log;
+enum class RedactContext {
+  ALL,
+  LOG,
+  NONE
+};
 
-// Flag for checking if flag redaction is enabled or disabled.
-extern bool g_should_redact_flag;
+// Flag to indicate which redaction context is enabled.
+extern kudu::RedactContext g_should_redact;
 
 class ScopedDisableRedaction {
  public:
@@ -102,6 +106,7 @@ class ScopedDisableRedaction {
   ~ScopedDisableRedaction() {
     tls_redact_user_data = old_val_;
   }
+
  private:
   bool old_val_;
 };
@@ -287,6 +292,9 @@ void UnregisterLoggingCallback();
 // file corresponding to this severity
 void GetFullLogFilename(google::LogSeverity severity, std::string* filename);
 
+// Format a timestamp in the same format as used by GLog.
+std::string FormatTimestampForLog(MicrosecondsInt64 micros_since_epoch);
+
 // Shuts down the google logging library. Call before exit to ensure that log files are
 // flushed.
 void ShutdownLoggingSafe();
@@ -334,7 +342,7 @@ class LogThrottler {
   }
  private:
   Atomic32 num_suppressed_;
-  uint64_t last_ts_;
+  MicrosecondsInt64 last_ts_;
   const char* last_tag_;
 };
 } // namespace logging

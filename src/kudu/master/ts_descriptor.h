@@ -17,11 +17,16 @@
 #ifndef KUDU_MASTER_TS_DESCRIPTOR_H
 #define KUDU_MASTER_TS_DESCRIPTOR_H
 
+#include <cstdint>
 #include <memory>
 #include <mutex>
 #include <string>
 
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/make_shared.h"
 #include "kudu/util/monotime.h"
@@ -124,7 +129,9 @@ class TSDescriptor {
   explicit TSDescriptor(std::string perm_id);
 
   // Uses DNS to resolve registered hosts to a single Sockaddr.
-  Status ResolveSockaddr(Sockaddr* addr) const;
+  // Returns the resolved address as well as the hostname associated with it
+  // in 'addr' and 'host'.
+  Status ResolveSockaddr(Sockaddr* addr, std::string* host) const;
 
   void DecayRecentReplicaCreationsUnlocked();
 

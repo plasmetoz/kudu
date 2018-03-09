@@ -18,27 +18,29 @@
 #include "kudu/tablet/mvcc.h"
 
 #include <algorithm>
-#include <glog/logging.h>
 #include <mutex>
+#include <ostream>
+#include <utility>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/mathlimits.h"
 #include "kudu/gutil/port.h"
-#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/server/logical_clock.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/debug/trace_event.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/util/monotime.h"
 
-namespace kudu { namespace tablet {
+namespace kudu {
+namespace tablet {
 
 using strings::Substitute;
 
 MvccManager::MvccManager()
   : safe_time_(Timestamp::kMin),
-    earliest_in_flight_(Timestamp::kMax) {
+    earliest_in_flight_(Timestamp::kMax),
+    open_(true) {
   cur_snap_.all_committed_before_ = Timestamp::kInitialTimestamp;
   cur_snap_.none_committed_at_or_after_ = Timestamp::kInitialTimestamp;
 }
@@ -90,6 +92,15 @@ void MvccManager::AbortTransaction(Timestamp timestamp) {
 
   // Remove from our in-flight list.
   TxnState old_state = RemoveInFlightAndGetStateUnlocked(timestamp);
+
+  // If the tablet is shutting down, we can ignore the state of the
+  // transactions.
+  if (PREDICT_FALSE(!is_open())) {
+    LOG(WARNING) << "aborting transaction with timestamp " << timestamp.ToString()
+        << " in state " << old_state << "; MVCC is closed";
+    return;
+  }
+
   CHECK_EQ(old_state, RESERVED) << "transaction with timestamp " << timestamp.ToString()
                                 << " cannot be aborted in state " << old_state;
 
@@ -159,10 +170,10 @@ void MvccManager::AdvanceEarliestInFlightTimestamp() {
 
 void MvccManager::AdjustSafeTime(Timestamp safe_time) {
   std::lock_guard<LockType> l(lock_);
-
   // No more transactions will start with a ts that is lower than or equal
   // to 'safe_time', so we adjust the snapshot accordingly.
   if (PREDICT_TRUE(safe_time_ <= safe_time)) {
+    DVLOG(4) << "Adjusting safe time to: " << safe_time;
     safe_time_ = safe_time;
   } else {
     // TODO(dralves) This shouldn't happen, the safe time passed to MvccManager should be
@@ -191,6 +202,16 @@ static void FilterTimestamps(std::vector<Timestamp::val_type>* v,
   v->resize(j);
 }
 
+void MvccManager::Close() {
+  open_.store(false);
+  std::lock_guard<LockType> l(lock_);
+  auto iter = waiters_.begin();
+  while (iter != waiters_.end()) {
+    (*iter)->latch->CountDown();
+    iter = waiters_.erase(iter);
+  }
+}
+
 void MvccManager::AdjustCleanTime() {
   // There are two possibilities:
   //
@@ -212,8 +233,17 @@ void MvccManager::AdjustCleanTime() {
     cur_snap_.all_committed_before_ = safe_time_;
   }
 
+  DVLOG(4) << "Adjusted clean time to: " << cur_snap_.all_committed_before_;
+
   // Filter out any committed timestamps that now fall below the watermark
   FilterTimestamps(&cur_snap_.committed_timestamps_, cur_snap_.all_committed_before_.value());
+
+  // If the current snapshot doesn't have any committed timestamps, then make sure we still
+  // advance the 'none_committed_at_or_after_' watermark so that it never falls below
+  // 'all_committed_before_'.
+  if (cur_snap_.committed_timestamps_.empty()) {
+    cur_snap_.none_committed_at_or_after_ = cur_snap_.all_committed_before_;
+  }
 
   // it may also have unblocked some waiters.
   // Check if someone is waiting for transactions to be committed.
@@ -236,6 +266,8 @@ Status MvccManager::WaitUntil(WaitFor wait_for, Timestamp ts, const MonoTime& de
                "wait_for", wait_for == ALL_COMMITTED ? "all_committed" : "none_applying",
                "ts", ts.ToUint64())
 
+  // If MVCC is closed, there's no point in waiting.
+  RETURN_NOT_OK(CheckOpen());
   CountDownLatch latch(1);
   WaitingState waiting_state;
   {
@@ -248,15 +280,16 @@ Status MvccManager::WaitUntil(WaitFor wait_for, Timestamp ts, const MonoTime& de
     waiters_.push_back(&waiting_state);
   }
   if (waiting_state.latch->WaitUntil(deadline)) {
-    return Status::OK();
+    // If the wait ended because MVCC is shutting down, return an error.
+    return CheckOpen();
   }
   // We timed out. We need to clean up our entry in the waiters_ array.
 
   std::lock_guard<LockType> l(lock_);
-  // It's possible that while we were re-acquiring the lock, we did get
+  // It's possible that while we were re-acquiring the lock, we did not get
   // notified. In that case, we have no cleanup to do.
   if (waiting_state.latch->count() == 0) {
-    return Status::OK();
+    return CheckOpen();
   }
 
   waiters_.erase(std::find(waiters_.begin(), waiters_.end(), &waiting_state));
@@ -273,6 +306,13 @@ bool MvccManager::IsDoneWaitingUnlocked(const WaitingState& waiter) const {
       return !AnyApplyingAtOrBeforeUnlocked(waiter.timestamp);
   }
   LOG(FATAL); // unreachable
+}
+
+Status MvccManager::CheckOpen() const {
+  if (PREDICT_TRUE(is_open())) {
+    return Status::OK();
+  }
+  return Status::Aborted("MVCC is closed");
 }
 
 bool MvccManager::AreAllTransactionsCommittedUnlocked(Timestamp ts) const {
@@ -311,8 +351,9 @@ Status MvccManager::WaitForSnapshotWithAllCommitted(Timestamp timestamp,
   return Status::OK();
 }
 
-void MvccManager::WaitForApplyingTransactionsToCommit() const {
+Status MvccManager::WaitForApplyingTransactionsToCommit() const {
   TRACE_EVENT0("tablet", "MvccManager::WaitForApplyingTransactionsToCommit");
+  RETURN_NOT_OK(CheckOpen());
 
   // Find the highest timestamp of an APPLYING transaction.
   Timestamp wait_for = Timestamp::kMin;
@@ -331,9 +372,9 @@ void MvccManager::WaitForApplyingTransactionsToCommit() const {
   // succeed.
   if (wait_for == Timestamp::kMin) {
     // None were APPLYING: we can just return.
-    return;
+    return Status::OK();
   }
-  CHECK_OK(WaitUntil(NONE_APPLYING, wait_for, MonoTime::Max()));
+  return WaitUntil(NONE_APPLYING, wait_for, MonoTime::Max());
 }
 
 bool MvccManager::AreAllTransactionsCommitted(Timestamp ts) const {
@@ -413,7 +454,7 @@ bool MvccSnapshot::MayHaveUncommittedTransactionsAtOrBefore(const Timestamp& tim
 }
 
 std::string MvccSnapshot::ToString() const {
-  string ret("MvccSnapshot[committed={T|");
+  std::string ret("MvccSnapshot[committed={T|");
 
   if (committed_timestamps_.size() == 0) {
     StrAppend(&ret, "T < ", all_committed_before_.ToString(),"}]");

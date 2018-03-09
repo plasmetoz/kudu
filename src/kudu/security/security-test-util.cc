@@ -17,12 +17,17 @@
 
 #include "kudu/security/security-test-util.h"
 
-#include <glog/logging.h>
+#include <cstdint>
+#include <string>
+
+#include <boost/optional/optional.hpp>
 
 #include "kudu/security/ca/cert_management.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
+#include "kudu/security/test/test_certs.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/util/test_util.h"
 
 namespace kudu {
 namespace security {
@@ -49,6 +54,7 @@ std::ostream& operator<<(std::ostream& o, PkiConfig c) {
       case PkiConfig::SELF_SIGNED: o << "SELF_SIGNED"; break;
       case PkiConfig::TRUSTED: o << "TRUSTED"; break;
       case PkiConfig::SIGNED: o << "SIGNED"; break;
+      case PkiConfig::EXTERNALLY_SIGNED: o << "EXTERNALLY_SIGNED"; break;
     }
     return o;
 }
@@ -72,6 +78,13 @@ Status ConfigureTlsContext(PkiConfig config,
       RETURN_NOT_OK(CertSigner(&ca_cert, &ca_key).Sign(*tls_context->GetCsrIfNecessary(), &cert));
       RETURN_NOT_OK(tls_context->AdoptSignedCert(cert));
       break;
+    };
+    case PkiConfig::EXTERNALLY_SIGNED: {
+      std::string cert_path, key_path;
+      // Write certificate and private key to file.
+      RETURN_NOT_OK(CreateTestSSLCertWithPlainKey(GetTestDataDirectory(), &cert_path, &key_path));
+      RETURN_NOT_OK(tls_context->LoadCertificateAndKey(cert_path, key_path));
+      RETURN_NOT_OK(tls_context->LoadCertificateAuthority(cert_path));
     };
   }
   return Status::OK();

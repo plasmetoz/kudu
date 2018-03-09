@@ -15,10 +15,20 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/rpc/reactor.h"
+#include <memory>
 
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <boost/function.hpp>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc-test-base.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/thread.h"
 
 using std::shared_ptr;
 
@@ -28,8 +38,12 @@ namespace rpc {
 class ReactorTest : public RpcTestBase {
  public:
   ReactorTest()
-    : messenger_(CreateMessenger("my_messenger", 4)),
-      latch_(1) {
+    : latch_(1) {
+  }
+
+  void SetUp() override {
+    RpcTestBase::SetUp();
+    ASSERT_OK(CreateMessenger("my_messenger", &messenger_, 4));
   }
 
   void ScheduledTask(const Status& status, const Status& expected_status) {
@@ -52,7 +66,7 @@ class ReactorTest : public RpcTestBase {
   }
 
  protected:
-  const shared_ptr<Messenger> messenger_;
+  shared_ptr<Messenger> messenger_;
   CountDownLatch latch_;
 };
 

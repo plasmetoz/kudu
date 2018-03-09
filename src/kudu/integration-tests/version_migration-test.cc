@@ -15,17 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/integration-tests/linked_list-test-util.h"
 #include "kudu/integration-tests/log_verifier.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 DEFINE_string(test_version_a_bin, "", "Directory to find the binaries for \"Version A\"");
@@ -47,6 +53,14 @@ const char* kTableName = "test_table";
 const int kNumTabletServers = 3;
 
 namespace kudu {
+
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
+
+namespace client {
+class KuduClient;
+}
+
 namespace itest {
 
 // A test suite designed to test the ability to migrate between two (or more)
@@ -79,10 +93,10 @@ void VersionMigrationTest::StartCluster(const vector<string>& extra_ts_flags,
   if (!bin_path.empty()) opts.daemon_bin_path = bin_path;
   opts.num_tablet_servers = num_tablet_servers;
   opts.extra_master_flags = extra_master_flags;
-  opts.extra_master_flags.push_back("--undefok=unlock_experimental_flags,unlock_unsafe_flags");
+  opts.extra_master_flags.emplace_back("--undefok=unlock_experimental_flags,unlock_unsafe_flags");
   opts.extra_tserver_flags = extra_ts_flags;
-  opts.extra_tserver_flags.push_back("--undefok=unlock_experimental_flags,unlock_unsafe_flags");
-  cluster_.reset(new ExternalMiniCluster(opts));
+  opts.extra_tserver_flags.emplace_back("--undefok=unlock_experimental_flags,unlock_unsafe_flags");
+  cluster_.reset(new ExternalMiniCluster(std::move(opts)));
   verifier_.reset(new LogVerifier(cluster_.get()));
   ASSERT_OK(cluster_->Start());
   ASSERT_OK(cluster_->CreateClient(nullptr, &client_));

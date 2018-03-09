@@ -17,48 +17,59 @@
 
 #include "kudu/security/init.h"
 
-#include <krb5/krb5.h>
-
 #include <algorithm>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ctime>
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <random>
 #include <string>
-#include <vector>
+#include <type_traits>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <krb5/krb5.h>
 
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
-#include "kudu/util/flags.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 
-DEFINE_string(keytab_file, "",
-              "Path to the Kerberos Keytab file for this server. Specifying a "
-              "keytab file will cause the server to kinit, and enable Kerberos "
-              "to be used to authenticate RPC connections.");
-TAG_FLAG(keytab_file, stable);
+#ifndef __APPLE__
+static constexpr bool kDefaultSystemAuthToLocal = true;
+#else
+// macOS's Heimdal library has a no-op implementation of
+// krb5_aname_to_localname, so instead we just use the simple
+// implementation.
+static constexpr bool kDefaultSystemAuthToLocal = false;
+#endif
+DEFINE_bool(use_system_auth_to_local, kDefaultSystemAuthToLocal,
+            "When enabled, use the system krb5 library to map Kerberos principal "
+            "names to local (short) usernames. If not enabled, the first component "
+            "of the principal will be used as the short name. For example, "
+            "'kudu/foo.example.com@EXAMPLE' will map to 'kudu'.");
+TAG_FLAG(use_system_auth_to_local, advanced);
 
-DEFINE_string(principal, "kudu/_HOST",
-              "Kerberos principal that this daemon will log in as. The special token "
-              "_HOST will be replaced with the FQDN of the local host.");
-TAG_FLAG(principal, experimental);
-// This is currently tagged as unsafe because there is no way for users to configure
-// clients to expect a non-default principal. As such, configuring a server to login
-// as a different one would end up with a cluster that can't be connected to.
-// See KUDU-1884.
-TAG_FLAG(principal, unsafe);
 
 using std::mt19937;
 using std::random_device;
 using std::string;
 using std::uniform_int_distribution;
 using std::uniform_real_distribution;
-using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 namespace security {
@@ -70,12 +81,12 @@ class KinitContext;
 // Global context for usage of the Krb5 library.
 krb5_context g_krb5_ctx;
 
-// Global instance of the context used by the kinit/renewal thread.
+// Global instance of the context used by the kinit/reacquire thread.
 KinitContext* g_kinit_ctx;
 
-// This lock is used to avoid a race while renewing the kerberos ticket.
+// This lock is used to avoid a race while reacquiring the kerberos ticket.
 // The race can occur between the time we reinitialize the cache and the
-// time when we actually store the renewed credential back in the cache.
+// time when we actually store the new credentials back in the cache.
 RWMutex* g_kerberos_reinit_lock;
 
 class KinitContext {
@@ -159,7 +170,7 @@ Status Krb5UnparseName(krb5_principal princ, string* name) {
   char* c_name;
   KRB5_RETURN_NOT_OK_PREPEND(krb5_unparse_name(g_krb5_ctx, princ, &c_name),
                              "krb5_unparse_name");
-  auto cleanup_name = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
       krb5_free_unparsed_name(g_krb5_ctx, c_name);
     });
   *name = c_name;
@@ -186,15 +197,15 @@ void RenewThread() {
 int32_t KinitContext::GetNextRenewInterval(uint32_t num_retries) {
   int32_t time_remaining = ticket_end_timestamp_ - time(nullptr);
 
-  // If the last ticket renewal was a failure, we back off our retry attempts exponentially.
+  // If the last ticket reacqusition was a failure, we back off our retry attempts exponentially.
   if (num_retries > 0) return GetBackedOffRenewInterval(time_remaining, num_retries);
 
   // If the time remaining between now and ticket expiry is:
-  // * > 10 minutes:   We attempt to renew the ticket between 5 seconds and 5 minutes before the
+  // * > 10 minutes:   We attempt to reacquire the ticket between 5 seconds and 5 minutes before the
   //                   ticket expires.
-  // * 5 - 10 minutes: We attempt to renew the ticket betwen 5 seconds and 1 minute before the
+  // * 5 - 10 minutes: We attempt to reacquire the ticket betwen 5 seconds and 1 minute before the
   //                   ticket expires.
-  // * < 5 minutes:    Attempt to renew the ticket every 'time_remaining'.
+  // * < 5 minutes:    Attempt to reacquire the ticket every 'time_remaining'.
   // The jitter is added to make sure that every server doesn't flood the KDC at the same time.
   random_device rd;
   mt19937 generator(rd());
@@ -224,7 +235,7 @@ Status KinitContext::DoRenewal() {
   // Setup a cursor to iterate through the credential cache.
   KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_start_seq_get(g_krb5_ctx, ccache_, &cursor),
                              "Failed to peek into ccache");
-  auto cleanup_cursor = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
       krb5_cc_end_seq_get(g_krb5_ctx, ccache_, &cursor); });
 
   krb5_creds creds;
@@ -233,11 +244,11 @@ Status KinitContext::DoRenewal() {
   krb5_error_code rc;
   // Iterate through the credential cache.
   while (!(rc = krb5_cc_next_cred(g_krb5_ctx, ccache_, &cursor, &creds))) {
-    auto cleanup_creds = MakeScopedCleanup([&]() {
+    SCOPED_CLEANUP({
         krb5_free_cred_contents(g_krb5_ctx, &creds); });
     if (krb5_is_config_principal(g_krb5_ctx, creds.server)) continue;
 
-    // We only want to renew the TGT (Ticket Granting Ticket). Ignore all other tickets.
+    // We only want to reacquire the TGT (Ticket Granting Ticket). Ignore all other tickets.
     // This follows the same format as is_local_tgt() from krb5:src/clients/klist/klist.c
     if (creds.server->length != 2 ||
         data_eq(creds.server->data[1], principal_->realm) == 0 ||
@@ -246,58 +257,30 @@ Status KinitContext::DoRenewal() {
       continue;
     }
 
-    time_t now = time(nullptr);
-    time_t ticket_expiry = creds.times.endtime;
-    time_t renew_till = creds.times.renew_till;
-    time_t renew_deadline = renew_till - 30;
-
     krb5_creds new_creds;
     memset(&new_creds, 0, sizeof(krb5_creds));
-    auto cleanup_new_creds = MakeScopedCleanup([&]() {
+    SCOPED_CLEANUP({
         krb5_free_cred_contents(g_krb5_ctx, &new_creds); });
-    // If the ticket has already expired or if there's only a short period before which the
-    // renew window closes, we acquire a new ticket.
-    if (ticket_expiry < now || renew_deadline < now) {
-      // Acquire a new ticket using the keytab. This ticket will automatically be put into the
-      // credential cache.
-      {
-        std::lock_guard<RWMutex> l(*g_kerberos_reinit_lock);
-        KRB5_RETURN_NOT_OK_PREPEND(krb5_get_init_creds_keytab(g_krb5_ctx, &new_creds, principal_,
-                                                              keytab_, 0 /* valid from now */,
-                                                              nullptr /* TKT service name */,
-                                                              opts_),
-                                   "Reacquire error: unable to login from keytab");
+    // Acquire a new ticket using the keytab. This ticket will automatically be put into the
+    // credential cache.
+    {
+      std::lock_guard<RWMutex> l(*g_kerberos_reinit_lock);
+      KRB5_RETURN_NOT_OK_PREPEND(krb5_get_init_creds_keytab(g_krb5_ctx, &new_creds, principal_,
+                                                            keytab_, 0 /* valid from now */,
+                                                            nullptr /* TKT service name */,
+                                                            opts_),
+                                 "Reacquire error: unable to login from keytab");
 #ifdef __APPLE__
-        // Heimdal krb5 doesn't have the 'krb5_get_init_creds_opt_set_out_ccache' option,
-        // so use this alternate route.
-        KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_initialize(g_krb5_ctx, ccache_, principal_),
-                                   "Reacquire error: could not init ccache");
+      // Heimdal krb5 doesn't have the 'krb5_get_init_creds_opt_set_out_ccache' option,
+      // so use this alternate route.
+      KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_initialize(g_krb5_ctx, ccache_, principal_),
+                                 "Reacquire error: could not init ccache");
 
-        KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_store_cred(g_krb5_ctx, ccache_, &creds),
-                                   "Reacquire error: could not store creds in cache");
+      KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_store_cred(g_krb5_ctx, ccache_, &creds),
+                                 "Reacquire error: could not store creds in cache");
 #endif
-      }
-      LOG(INFO) << "Successfully reacquired a new kerberos TGT";
-    } else {
-      // Renew existing ticket.
-      KRB5_RETURN_NOT_OK_PREPEND(krb5_get_renewed_creds(g_krb5_ctx, &new_creds, principal_,
-                                                        ccache_, nullptr),
-                                 "Failed to renew ticket");
-
-      {
-        // Take the write lock here so that any connections undergoing negotiation have to wait
-        // until the new credentials are placed in the cache.
-        std::lock_guard<RWMutex> l(*g_kerberos_reinit_lock);
-        // Clear existing credentials in cache.
-        KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_initialize(g_krb5_ctx, ccache_, principal_),
-                                   "Failed to re-initialize ccache");
-
-        // Store the new credentials in the cache.
-        KRB5_RETURN_NOT_OK_PREPEND(krb5_cc_store_cred(g_krb5_ctx, ccache_, &new_creds),
-                                   "Failed to store credentials in ccache");
-      }
-      LOG(INFO) << "Successfully renewed kerberos TGT";
     }
+    LOG(INFO) << "Successfully reacquired a new kerberos TGT";
     ticket_end_timestamp_ = new_creds.times.endtime;
     break;
   }
@@ -330,7 +313,7 @@ Status KinitContext::Kinit(const string& keytab_path, const string& principal) {
                                                         0 /* valid from now */,
                                                         nullptr /* TKT service name */, opts_),
                              "unable to login from keytab");
-  auto cleanup_creds = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
       krb5_free_cred_contents(g_krb5_ctx, &creds); });
 
   ticket_end_timestamp_ = creds.times.endtime;
@@ -359,15 +342,23 @@ Status KinitContext::Kinit(const string& keytab_path, const string& principal) {
   return Status::OK();
 }
 
-Status GetConfiguredPrincipal(string* principal) {
-  string p = FLAGS_principal;
-  string hostname;
-  // Try to fill in either the FQDN or hostname.
-  if (!GetFQDN(&hostname).ok()) {
-    RETURN_NOT_OK(GetHostname(&hostname));
+// 'in_principal' is the user specified principal to use with Kerberos. It may have a token
+// in the string of the form '_HOST', which if present, needs to be replaced with the FQDN of the
+// current host.
+// 'out_principal' has the final principal with which one may Kinit.
+Status GetConfiguredPrincipal(const std::string& in_principal, string* out_principal) {
+  *out_principal = in_principal;
+  const auto& kHostToken = "_HOST";
+  if (in_principal.find(kHostToken) != string::npos) {
+    string hostname;
+    // Try to fill in either the FQDN or hostname.
+    if (!GetFQDN(&hostname).ok()) {
+      RETURN_NOT_OK(GetHostname(&hostname));
+    }
+    // Hosts in principal names are canonicalized to lower-case.
+    std::transform(hostname.begin(), hostname.end(), hostname.begin(), tolower);
+    GlobalReplaceSubstring(kHostToken, hostname, out_principal);
   }
-  GlobalReplaceSubstring("_HOST", hostname, &p);
-  *principal = p;
   return Status::OK();
 }
 } // anonymous namespace
@@ -382,7 +373,7 @@ Status CanonicalizeKrb5Principal(std::string* principal) {
   krb5_principal princ;
   KRB5_RETURN_NOT_OK_PREPEND(krb5_parse_name(g_krb5_ctx, principal->c_str(), &princ),
                              "could not parse principal");
-  auto cleanup = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
       krb5_free_principal(g_krb5_ctx, princ);
     });
   RETURN_NOT_OK_PREPEND(Krb5UnparseName(princ, principal),
@@ -395,22 +386,23 @@ Status MapPrincipalToLocalName(const std::string& principal, std::string* local_
   krb5_principal princ;
   KRB5_RETURN_NOT_OK_PREPEND(krb5_parse_name(g_krb5_ctx, principal.c_str(), &princ),
                              "could not parse principal");
-  auto cleanup = MakeScopedCleanup([&]() {
+  SCOPED_CLEANUP({
       krb5_free_principal(g_krb5_ctx, princ);
     });
   char buf[1024];
-  krb5_error_code rc;
-#ifndef __APPLE__
-  rc = krb5_aname_to_localname(g_krb5_ctx, princ, arraysize(buf), buf);
-#else
-  // macOS's Heimdal library has a no-op implementation of
-  // krb5_aname_to_localname, so instead we fall down to below and grab the
-  // first component of the principal.
-  rc = KRB5_LNAME_NOTRANS;
-#endif
-  if (rc == KRB5_LNAME_NOTRANS) {
-    // No name mapping specified. We fall back to simply taking the first component
-    // of the principal, for compatibility with the default behavior of Hadoop.
+  krb5_error_code rc = KRB5_LNAME_NOTRANS;
+  if (FLAGS_use_system_auth_to_local) {
+    rc = krb5_aname_to_localname(g_krb5_ctx, princ, arraysize(buf), buf);
+  }
+  if (rc == KRB5_LNAME_NOTRANS || rc == KRB5_PLUGIN_NO_HANDLE) {
+    // No name mapping specified, or krb5-based name mapping is disabled.
+    //
+    // We fall back to simply taking the first component of the principal, for
+    // compatibility with the default behavior of Hadoop.
+    //
+    // NOTE: KRB5_PLUGIN_NO_HANDLE isn't typically expected here, but works around
+    // a bug in SSSD's auth_to_local implementation: https://pagure.io/SSSD/sssd/issue/3459
+    //
     // TODO(todd): we should support custom configured auth-to-local mapping, since
     // most Hadoop ecosystem components do not load them from krb5.conf.
     if (princ->length > 0) {
@@ -440,31 +432,31 @@ boost::optional<string> GetLoggedInUsernameFromKeytab() {
   return g_kinit_ctx->username_str();
 }
 
-Status InitKerberosForServer() {
-  if (FLAGS_keytab_file.empty()) return Status::OK();
+Status InitKerberosForServer(const std::string& raw_principal, const std::string& keytab_file,
+    const std::string& krb5ccname, bool disable_krb5_replay_cache) {
+  if (keytab_file.empty()) return Status::OK();
 
-  // Have the daemons use an in-memory ticket cache, so they don't accidentally
-  // pick up credentials from test cases or any other daemon.
-  // TODO(todd): extract these krb5 env vars into some constants since they're
-  // typo-prone.
-  setenv("KRB5CCNAME", "MEMORY:kudu", 1);
-  setenv("KRB5_KTNAME", FLAGS_keytab_file.c_str(), 1);
+  setenv("KRB5CCNAME", krb5ccname.c_str(), 1);
+  setenv("KRB5_KTNAME", keytab_file.c_str(), 1);
 
-  // KUDU-1897: disable the Kerberos replay cache. The KRPC protocol includes a
-  // per-connection server-generated nonce to protect against replay attacks
-  // when authenticating via Kerberos. The replay cache has many performance and
-  // implementation issues.
-  setenv("KRB5RCACHETYPE", "none", 1);
+  if (disable_krb5_replay_cache) {
+    // KUDU-1897: disable the Kerberos replay cache. The KRPC protocol includes a
+    // per-connection server-generated nonce to protect against replay attacks
+    // when authenticating via Kerberos. The replay cache has many performance and
+    // implementation issues.
+    setenv("KRB5RCACHETYPE", "none", 1);
+  }
 
   g_kinit_ctx = new KinitContext();
-  string principal;
-  RETURN_NOT_OK(GetConfiguredPrincipal(&principal));
-  RETURN_NOT_OK_PREPEND(g_kinit_ctx->Kinit(FLAGS_keytab_file, principal), "unable to kinit");
+  string configured_principal;
+  RETURN_NOT_OK(GetConfiguredPrincipal(raw_principal, &configured_principal));
+  RETURN_NOT_OK_PREPEND(g_kinit_ctx->Kinit(
+      keytab_file, configured_principal), "unable to kinit");
 
   g_kerberos_reinit_lock = new RWMutex(RWMutex::Priority::PREFER_WRITING);
-  scoped_refptr<Thread> renew_thread;
-  // Start the renewal thread.
-  RETURN_NOT_OK(Thread::Create("kerberos", "renewal thread", &RenewThread, &renew_thread));
+  scoped_refptr<Thread> reacquire_thread;
+  // Start the reacquire thread.
+  RETURN_NOT_OK(Thread::Create("kerberos", "reacquire thread", &RenewThread, &reacquire_thread));
 
   return Status::OK();
 }

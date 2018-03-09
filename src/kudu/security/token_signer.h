@@ -25,6 +25,7 @@
 #include <gtest/gtest_prod.h>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/rw_mutex.h"
 
 namespace kudu {
@@ -32,10 +33,8 @@ class Status;
 
 namespace security {
 class SignedTokenPB;
-class TokenSigner;
 class TokenSigningPrivateKey;
 class TokenSigningPrivateKeyPB;
-class TokenSigningPublicKeyPB;
 class TokenVerifier;
 
 // Class responsible for managing Token Signing Keys (TSKs) and signing tokens.
@@ -51,7 +50,7 @@ class TokenVerifier;
 // (a.k.a. next key) is not used. Rather, the second-most-recent key, if exists,
 // is used. This ensures that there is plenty of time to transmit the public
 // part of the new TSK to all TokenVerifiers (e.g. on other servers via
-// heatbeats or by other means), before the new key enters usage.
+// heartbeats or by other means), before the new key enters usage.
 //
 // On a fresh instance, with only one key, there is no "second most recent"
 // key. Thus, we fall back to signing tokens with the only available key.
@@ -64,7 +63,7 @@ class TokenVerifier;
 // key rotation is performed more frequently than the validity period
 // of the key, so that at any given point in time there are several valid keys.
 //
-// Below is the lifecycle of a TSK (token signing key):
+// Below is the life cycle of a TSK (token signing key):
 //
 //      <---AAAAA===============>
 //      ^                       ^
@@ -94,6 +93,10 @@ class TokenVerifier;
 // NOTE: The very first key created on the system bootstrap does not have
 //       propagation interval -- it turns active immediately.
 //
+// NOTE: One other result of the above is that the first key (Key 1) is actually
+//       active for longer than the rest. This has some potential security
+//       implications, so it's worth considering rolling twice at startup.
+//
 // For example, consider the following configuration for token signing keys:
 //   validity period:      4 days
 //   rotation interval:    1 days
@@ -106,6 +109,8 @@ class TokenVerifier;
 // Key 3:             <----AAAAA==========>
 // Key 4:                  <----AAAAA==========>
 //                              ...............
+// authn token:                     <**********>
+//
 // 'A' indicates the 'Originator Usage Period' (a.k.a. 'Activity Interval'),
 // i.e. the period in which the key is being used to sign tokens.
 //
@@ -113,20 +118,33 @@ class TokenVerifier;
 // the verifier may get tokens signed by the TSK and should consider them
 // for verification. The start of the recipient usage period is not crucial
 // in that regard, but the end of that period is -- after the TSK is expired,
-// a verifier should consider tokens signed by that TSK invalid
-// and stop accepting them even if the token signature is correct.
+// a verifier should consider tokens signed by that TSK invalid and stop
+// accepting them even if the token signature is correct and the expiration.
 //
-// When configuring the rotation and validity, consider the following constraint:
+// '<***>' indicates the validity interval for an authn token.
 //
-//   max_token_validity < tsk_validity_period - tsk_propagation_interval
+// When configuring key rotation and authn token validity interval durations,
+// consider the following constraint:
 //
-// In the example above, this means that no token may be issued with a validity
-// period longer than or equal to 3 days, without risking that the
-// signing/verification key would expire before the token.
+//   max_token_validity < tsk_validity_period -
+//       (tsk_propagation_interval + tsk_rotation_interval)
 //
-// NOTE: One other result of the above is that the first key (Key 1) is actually
-//       active for longer than the rest. This has some potential security
-//       implications, so it's worth considering rolling twice at startup.
+// The idea is that the token validity interval should be contained in the
+// corresponding TSK's validity interval. If the TSK is already expired at the
+// time of token verification, the token is considered invalid and the
+// verification of the token fails. This means that no token may be issued with
+// a validity period longer than or equal to TSK inactivity interval, without
+// risking that the signing/verification key would expire before the token
+// itself. The edge case is demonstrated by the following scenario:
+//
+// * A TSK is issued at 00:00:00 on day 4.
+// * An authn token generated and signed by current/active TSK at 23:59:59 on
+//   day 6. That's at the very end of the TSK's activity interval.
+// * From the diagram above it's clear that if the authn token validity
+//   interval were set to something longer than TSK inactivity interval
+//   (which is 2 days with for the specified parameters), an attempt to verify
+//   the token at 00:00:00 on day 8 or later would fail due to the expiration
+//   the corresponding TSK.
 //
 // NOTE: Current implementation of TokenSigner assumes the propagation
 //       interval is equal to the rotation interval.
@@ -172,7 +190,7 @@ class TokenSigner {
   // The 'authn_token_validity_seconds' parameter is used to specify validity
   // interval for the generated authn tokens and with 'key_rotation_seconds'
   // it defines validity interval of the newly generated TSK:
-  //   key_validity = key_rotation + authn_token_validity.
+  //   key_validity = 2 * key_rotation + authn_token_validity.
   //
   // That corresponds to the maximum possible token lifetime for the effective
   // TSK validity and rotation intervals: see the class comment above for
@@ -194,25 +212,46 @@ class TokenSigner {
 
   // Check whether it's time to generate and add a new key. If so, the new key
   // is generated and output into the 'tsk' parameter so it's possible to
-  // examine and otherwise process the key as needed (e.g. store it).
-  // After that, use AddKey() method to actually add the key into the
-  // TokenSigner's key queue.
+  // examine and process the key as needed (e.g. store it). After that, use the
+  // AddKey() method to actually add the key into the TokenSigner's key queue.
   //
-  // Every non-null key returned by this methods has key sequence number.
-  // The key sequence number always increases with newly generated keys.
+  // Every non-null key returned by this method has key sequence number.
   // It's not a problem to call this method multiple times but call the AddKey()
   // method only once, effectively discarding all the generated keys except for
-  // the key passed to the AddKey() call as a parameter. In other words,
-  // it's possible and not a problem to have 'holes' in the key sequence
-  // numbers. Other components working with verification of the signed tokens
-  // should take that into account.
+  // the key passed to the AddKey() call as a parameter. The key sequence number
+  // always increments with every newly added key (i.e. every successful call of
+  // the AddKey() method). The result key number sequence would not contain
+  // any 'holes'.
+  //
+  // In other words, sequence of calls like
+  //
+  //   CheckNeedKey(k);
+  //   CheckNeedKey(k);
+  //   ...
+  //   CheckNeedKey(k);
+  //   AddKey(k);
+  //
+  // would increase the key sequence number just by 1. Due to that fact, the
+  // following sequence of calls to CheckNeedKey()/AddKey() would work fine:
+  //
+  //   CheckNeedKey(k0);
+  //   AddKey(k0);
+  //   CheckNeedKey(k1);
+  //   AddKey(k1);
+  //
+  // but the sequence below would fail at AddKey(k1):
+  //
+  //   CheckNeedKey(k0);
+  //   CheckNeedKey(k1);
+  //   AddKey(k0);
+  //   AddKey(k1);
   //
   // See the class comment above for more information about the intended usage.
   Status CheckNeedKey(std::unique_ptr<TokenSigningPrivateKey>* tsk) const
       WARN_UNUSED_RESULT;
 
   // Add the new key into the token signing keys queue. Call TryRotateKey()
-  // to make this key active when it's time.
+  // to make the newly added key active when it's time.
   //
   // See the class comment above for more information about the intended usage.
   Status AddKey(std::unique_ptr<TokenSigningPrivateKey> tsk) WARN_UNUSED_RESULT;
@@ -251,7 +290,9 @@ class TokenSigner {
   const int64_t authn_token_validity_seconds_;
 
   // TSK rotation interval: number of seconds between consecutive activations
-  // of new token signing keys.
+  // of new token signing keys. Note that in current implementation it defines
+  // the propagation interval as well, i.e. the TSK propagation interval is
+  // equal to the TSK rotation interval.
   const int64_t key_rotation_seconds_;
 
   // Period of validity for newly created token signing keys. In other words,
@@ -261,12 +302,8 @@ class TokenSigner {
   // Protects next_seq_num_ and tsk_deque_ members.
   mutable RWMutex lock_;
 
-  // The sequence number to assign to next generated key.
-  // It's allowable to have 'holes' in the key sequence numbers, i.e. it's
-  // acceptable to have sequence numbers which do not correspond to any
-  // existing TSK. The only crucial point is to keep the key sequence numbers
-  // increasing.
-  mutable int64_t next_key_seq_num_;
+  // The sequence number of the last generated/imported key.
+  int64_t last_key_seq_num_;
 
   // The currently active key is in the front of the queue,
   // the newly added ones are pushed into back of the queue.

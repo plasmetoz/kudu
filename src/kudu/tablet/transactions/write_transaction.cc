@@ -18,23 +18,44 @@
 #include "kudu/tablet/transactions/write_transaction.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <ctime>
+#include <new>
+#include <ostream>
+#include <type_traits>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/gutil/stl_util.h"
-#include "kudu/gutil/strings/numbers.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/gutil/dynamic_annotations.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
-#include "kudu/rpc/rpc_context.h"
-#include "kudu/server/hybrid_clock.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tablet/lock_manager.h"
+#include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/row_op.h"
 #include "kudu/tablet/tablet.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/tablet/tablet_metrics.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/rw_semaphore.h"
 #include "kudu/util/trace.h"
 
 DEFINE_int32(tablet_inject_latency_on_apply_write_txn_ms, 0,
@@ -43,18 +64,22 @@ DEFINE_int32(tablet_inject_latency_on_apply_write_txn_ms, 0,
 TAG_FLAG(tablet_inject_latency_on_apply_write_txn_ms, unsafe);
 TAG_FLAG(tablet_inject_latency_on_apply_write_txn_ms, runtime);
 
+using std::string;
+using std::unique_ptr;
+using std::vector;
+using strings::Substitute;
+
 namespace kudu {
 namespace tablet {
 
-using consensus::ReplicateMsg;
+using pb_util::SecureShortDebugString;
 using consensus::CommitMsg;
 using consensus::DriverType;
+using consensus::ReplicateMsg;
 using consensus::WRITE_OP;
 using tserver::TabletServerErrorPB;
 using tserver::WriteRequestPB;
 using tserver::WriteResponsePB;
-using std::unique_ptr;
-using strings::Substitute;
 
 WriteTransaction::WriteTransaction(unique_ptr<WriteTransactionState> state, DriverType type)
   : Transaction(state.get(), type, Transaction::WRITE_TXN),
@@ -86,7 +111,7 @@ Status WriteTransaction::Prepare() {
     return s;
   }
 
-  Tablet* tablet = state()->tablet_peer()->tablet();
+  Tablet* tablet = state()->tablet_replica()->tablet();
 
   Status s = tablet->DecodeWriteOperations(&client_schema, state());
   if (!s.ok()) {
@@ -112,8 +137,8 @@ Status WriteTransaction::Start() {
   DCHECK(!state_->has_timestamp());
   DCHECK(state_->consensus_round()->replicate_msg()->has_timestamp());
   state_->set_timestamp(Timestamp(state_->consensus_round()->replicate_msg()->timestamp()));
-  state_->tablet_peer()->tablet()->StartTransaction(state_.get());
-  TRACE("Timestamp: $0", state_->tablet_peer()->clock()->Stringify(state_->timestamp()));
+  state_->tablet_replica()->tablet()->StartTransaction(state_.get());
+  TRACE("Timestamp: $0", state_->tablet_replica()->clock()->Stringify(state_->timestamp()));
   return Status::OK();
 }
 
@@ -130,9 +155,8 @@ Status WriteTransaction::Apply(gscoped_ptr<CommitMsg>* commit_msg) {
     SleepFor(MonoDelta::FromMilliseconds(FLAGS_tablet_inject_latency_on_apply_write_txn_ms));
   }
 
-  Tablet* tablet = state()->tablet_peer()->tablet();
-
-  tablet->ApplyRowOperations(state());
+  Tablet* tablet = state()->tablet_replica()->tablet();
+  RETURN_NOT_OK(tablet->ApplyRowOperations(state()));
 
   // Add per-row errors to the result, update metrics.
   int i = 0;
@@ -171,7 +195,7 @@ void WriteTransaction::Finish(TransactionResult result) {
 
   TRACE("FINISH: updating metrics");
 
-  TabletMetrics* metrics = state_->tablet_peer()->tablet()->metrics();
+  TabletMetrics* metrics = state_->tablet_replica()->tablet()->metrics();
   if (metrics) {
     // TODO: should we change this so it's actually incremented by the
     // Tablet code itself instead of this wrapper code?
@@ -210,11 +234,11 @@ string WriteTransaction::ToString() const {
                     DriverType_Name(type()), abs_time_formatted, state_->ToString());
 }
 
-WriteTransactionState::WriteTransactionState(TabletPeer* tablet_peer,
+WriteTransactionState::WriteTransactionState(TabletReplica* tablet_replica,
                                              const tserver::WriteRequestPB *request,
                                              const rpc::RequestIdPB* request_id,
                                              tserver::WriteResponsePB *response)
-  : TransactionState(tablet_peer),
+  : TransactionState(tablet_replica),
     request_(DCHECK_NOTNULL(request)),
     response_(response),
     mvcc_tx_(nullptr),
@@ -251,6 +275,28 @@ void WriteTransactionState::ReleaseSchemaLock() {
   shared_lock<rw_semaphore> temp;
   schema_lock_.swap(temp);
   TRACE("Released schema lock");
+}
+
+void WriteTransactionState::SetRowOps(vector<DecodedRowOperation> decoded_ops) {
+  std::lock_guard<simple_spinlock> l(txn_state_lock_);
+  row_ops_.clear();
+  row_ops_.reserve(decoded_ops.size());
+
+  Arena* arena = this->arena();
+  for (DecodedRowOperation& op : decoded_ops) {
+    row_ops_.push_back(arena->NewObject<RowOp>(std::move(op)));
+  }
+
+  // Allocate the ProbeStats objects from the transaction's arena, so
+  // they're all contiguous and we don't need to do any central allocation.
+  stats_array_ = static_cast<ProbeStats*>(
+      arena->AllocateBytesAligned(sizeof(ProbeStats) * row_ops_.size(),
+                                  alignof(ProbeStats)));
+
+  // Manually run the constructor to clear the stats to 0 before collecting them.
+  for (int i = 0; i < row_ops_.size(); i++) {
+    new (&stats_array_[i]) ProbeStats();
+  }
 }
 
 void WriteTransactionState::StartApplying() {
@@ -343,7 +389,11 @@ void WriteTransactionState::ResetRpcFields() {
   std::lock_guard<simple_spinlock> l(txn_state_lock_);
   request_ = nullptr;
   response_ = nullptr;
-  STLDeleteElements(&row_ops_);
+  // these are allocated from the arena, so just run the dtors.
+  for (RowOp* op : row_ops_) {
+    op->~RowOp();
+  }
+  row_ops_.clear();
 }
 
 string WriteTransactionState::ToString() const {

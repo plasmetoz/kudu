@@ -15,8 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef KUDU_UTIL_MAKE_SHARED_H_
-#define KUDU_UTIL_MAKE_SHARED_H_
+#pragma once
 
 #include <memory>
 
@@ -60,5 +59,3 @@
 #else
   #error "Need to implement ALLOW_MAKE_SHARED for your platform!"
 #endif
-
-#endif // KUDU_UTIL_MAKE_SHARED_H_

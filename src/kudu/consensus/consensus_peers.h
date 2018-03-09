@@ -18,42 +18,37 @@
 #ifndef KUDU_CONSENSUS_CONSENSUS_PEERS_H_
 #define KUDU_CONSENSUS_CONSENSUS_PEERS_H_
 
+#include <cstdint>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/rpc_controller.h"
-#include "kudu/util/countdown_latch.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/resettable_heartbeater.h"
-#include "kudu/util/semaphore.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 class HostPort;
-class ThreadPool;
-
-namespace log {
-class Log;
-}
+class ThreadPoolToken;
 
 namespace rpc {
 class Messenger;
-class RpcController;
+class PeriodicTimer;
 }
 
 namespace consensus {
 class ConsensusServiceProxy;
-class OpId;
 class PeerProxy;
-class PeerProxyFactory;
 class PeerMessageQueue;
-class VoteRequestPB;
-class VoteResponsePB;
 
 // A remote peer in consensus.
 //
@@ -72,7 +67,7 @@ class VoteResponsePB;
 // The actual request construction is delegated to a PeerMessageQueue
 // object, and performed on a thread pool (since it may do IO). When a
 // response is received, the peer updates the PeerMessageQueue
-// using PeerMessageQueue::ResponseFromPeer(...) on the same threadpool.
+// using PeerMessageQueue::ResponseFromPeer(...) on the same thread pool.
 class Peer : public std::enable_shared_from_this<Peer> {
  public:
   // Initializes a peer and start sending periodic heartbeats.
@@ -92,9 +87,9 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // However, when they do finish, the results will be disregarded, so this
   // is safe to call at any point.
   //
-  // This method must be called before the Peer's associated ThreadPool
+  // This method must be called before the Peer's associated ThreadPoolToken
   // is destructed. Once this method returns, it is safe to destruct
-  // the ThreadPool.
+  // the ThreadPoolToken.
   void Close();
 
   ~Peer();
@@ -102,31 +97,37 @@ class Peer : public std::enable_shared_from_this<Peer> {
   // Creates a new remote peer and makes the queue track it.'
   //
   // Requests to this peer (which may end up doing IO to read non-cached
-  // log entries) are assembled on 'thread_pool'.
+  // log entries) are assembled on 'raft_pool_token'.
   // Response handling may also involve IO related to log-entry lookups and is
-  // also done on 'thread_pool'.
-  static Status NewRemotePeer(const RaftPeerPB& peer_pb,
-                              const std::string& tablet_id,
-                              const std::string& leader_uuid,
+  // also done on 'raft_pool_token'.
+  static Status NewRemotePeer(RaftPeerPB peer_pb,
+                              std::string tablet_id,
+                              std::string leader_uuid,
                               PeerMessageQueue* queue,
-                              ThreadPool* thread_pool,
+                              ThreadPoolToken* raft_pool_token,
                               gscoped_ptr<PeerProxy> proxy,
+                              std::shared_ptr<rpc::Messenger> messenger,
                               std::shared_ptr<Peer>* peer);
 
  private:
-  Peer(const RaftPeerPB& peer_pb, std::string tablet_id, std::string leader_uuid,
-       gscoped_ptr<PeerProxy> proxy, PeerMessageQueue* queue,
-       ThreadPool* thread_pool);
+  Peer(RaftPeerPB peer_pb,
+       std::string tablet_id,
+       std::string leader_uuid,
+       PeerMessageQueue* queue,
+       ThreadPoolToken* raft_pool_token,
+       gscoped_ptr<PeerProxy> proxy,
+       std::shared_ptr<rpc::Messenger> messenger);
 
   void SendNextRequest(bool even_if_queue_empty);
 
   // Signals that a response was received from the peer.
+  //
   // This method is called from the reactor thread and calls
-  // DoProcessResponse() on thread_pool_ to do any work that requires IO or
+  // DoProcessResponse() on raft_pool_token_ to do any work that requires IO or
   // lock-taking.
   void ProcessResponse();
 
-  // Run on 'thread_pool'. Does response handling that requires IO or may block.
+  // Run on 'raft_pool_token'. Does response handling that requires IO or may block.
   void DoProcessResponse();
 
   // Fetch the desired tablet copy request from the queue and set up
@@ -172,14 +173,15 @@ class Peer : public std::enable_shared_from_this<Peer> {
 
   rpc::RpcController controller_;
 
-  // Heartbeater for remote peer implementations.
-  // This will send status only requests to the remote peers
-  // whenever we go more than 'FLAGS_raft_heartbeat_interval_ms'
-  // without sending actual data.
-  ResettableHeartbeater heartbeater_;
+  std::shared_ptr<rpc::Messenger> messenger_;
 
-  // Thread pool used to construct requests to this peer.
-  ThreadPool* thread_pool_;
+  // Thread pool token used to construct requests to this peer.
+  //
+  // RaftConsensus owns this shared token and is responsible for destroying it.
+  ThreadPoolToken* raft_pool_token_;
+
+  // Repeating timer responsible for scheduling heartbeats to this peer.
+  std::shared_ptr<rpc::PeriodicTimer> heartbeater_;
 
   // lock that protects Peer state changes, initialization, etc.
   mutable simple_spinlock peer_lock_;
@@ -226,6 +228,8 @@ class PeerProxyFactory {
                           gscoped_ptr<PeerProxy>* proxy) = 0;
 
   virtual ~PeerProxyFactory() {}
+
+  virtual const std::shared_ptr<rpc::Messenger>& messenger() const = 0;
 };
 
 // PeerProxy implementation that does RPC calls
@@ -261,10 +265,15 @@ class RpcPeerProxyFactory : public PeerProxyFactory {
  public:
   explicit RpcPeerProxyFactory(std::shared_ptr<rpc::Messenger> messenger);
 
-  virtual Status NewProxy(const RaftPeerPB& peer_pb,
-                          gscoped_ptr<PeerProxy>* proxy) OVERRIDE;
+  Status NewProxy(const RaftPeerPB& peer_pb,
+                  gscoped_ptr<PeerProxy>* proxy) override;
 
-  virtual ~RpcPeerProxyFactory();
+  ~RpcPeerProxyFactory();
+
+  const std::shared_ptr<rpc::Messenger>& messenger() const override {
+    return messenger_;
+  }
+
  private:
   std::shared_ptr<rpc::Messenger> messenger_;
 };

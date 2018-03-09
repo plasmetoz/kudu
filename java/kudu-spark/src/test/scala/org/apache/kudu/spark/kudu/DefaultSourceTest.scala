@@ -25,18 +25,17 @@ import scala.collection.immutable.IndexedSeq
 import scala.util.control.NonFatal
 
 import com.google.common.collect.ImmutableList
-
-import org.apache.spark.sql.functions._
 import org.apache.spark.sql.SQLContext
-import org.apache.spark.sql.types.{DataTypes, StructField, StructType};
+import org.apache.spark.sql.functions._
+import org.apache.spark.sql.types.{DataTypes, StructField, StructType}
 import org.junit.Assert._
 import org.junit.runner.RunWith
-import org.scalatest.{BeforeAndAfter, FunSuite, Matchers}
 import org.scalatest.junit.JUnitRunner
+import org.scalatest.{BeforeAndAfter, FunSuite, Matchers}
 
 import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder
-import org.apache.kudu.{Schema, Type}
 import org.apache.kudu.client.CreateTableOptions
+import org.apache.kudu.{Schema, Type}
 
 @RunWith(classOf[JUnitRunner])
 class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter with Matchers {
@@ -66,16 +65,15 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
   var kuduOptions : Map[String, String] = _
 
   before {
-    val rowCount = 10
     rows = insertRows(rowCount)
 
-    sqlContext = new SQLContext(sc)
+    sqlContext = ss.sqlContext
 
     kuduOptions = Map(
       "kudu.table" -> tableName,
       "kudu.master" -> miniCluster.getMasterAddresses)
 
-    sqlContext.read.options(kuduOptions).kudu.registerTempTable(tableName)
+    sqlContext.read.options(kuduOptions).kudu.createOrReplaceTempView(tableName)
   }
 
   test("table creation") {
@@ -87,6 +85,41 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     kuduContext.createTable(tableName, df.schema, Seq("key"),
                             new CreateTableOptions().setRangePartitionColumns(List("key").asJava)
                                                     .setNumReplicas(1))
+    kuduContext.insertRows(df, tableName)
+
+    // now use new options to refer to the new table name
+    val newOptions: Map[String, String] = Map(
+      "kudu.table" -> tableName,
+      "kudu.master" -> miniCluster.getMasterAddresses)
+    val checkDf = sqlContext.read.options(newOptions).kudu
+
+    assert(checkDf.schema === df.schema)
+    assertTrue(kuduContext.tableExists(tableName))
+    assert(checkDf.count == 10)
+
+    kuduContext.deleteTable(tableName)
+    assertFalse(kuduContext.tableExists(tableName))
+  }
+
+  test("table creation with partitioning") {
+    val tableName = "testcreatepartitionedtable"
+    if (kuduContext.tableExists(tableName)) {
+      kuduContext.deleteTable(tableName)
+    }
+    val df = sqlContext.read.options(kuduOptions).kudu
+
+    val kuduSchema = kuduContext.createSchema(df.schema, Seq("key"))
+    val lower = kuduSchema.newPartialRow()
+    lower.addInt("key", 0)
+    val upper = kuduSchema.newPartialRow()
+    upper.addInt("key", Integer.MAX_VALUE)
+
+    kuduContext.createTable(tableName, kuduSchema,
+      new CreateTableOptions()
+        .addHashPartitions(List("key").asJava, 2)
+        .setRangePartitionColumns(List("key").asJava)
+        .addRangePartition(lower, upper)
+        .setNumReplicas(1))
     kuduContext.insertRows(df, tableName)
 
     // now use new options to refer to the new table name
@@ -197,11 +230,25 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     val df = sqlContext.read.options(kuduOptions).kudu.select( "c2_s", "c1_i", "key")
     val collected = df.collect()
     assert(collected(0).getString(0).equals("0"))
-
   }
 
-  test("table scan") {
+  test("table non fault tolerant scan") {
     val results = sqlContext.sql(s"SELECT * FROM $tableName").collectAsList()
+    assert(results.size() == rowCount)
+
+    assert(!results.get(0).isNullAt(2))
+    assert(results.get(1).isNullAt(2))
+  }
+
+  test("table fault tolerant scan") {
+    kuduOptions = Map(
+      "kudu.table" -> tableName,
+      "kudu.master" -> miniCluster.getMasterAddresses,
+      "kudu.faultTolerantScan" -> "true")
+
+    val table = "faultTolerantScanTest"
+    sqlContext.read.options(kuduOptions).kudu.createOrReplaceTempView(table)
+    val results = sqlContext.sql(s"SELECT * FROM $table").collectAsList()
     assert(results.size() == rowCount)
 
     assert(!results.get(0).isNullAt(2))
@@ -237,7 +284,18 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
                  sqlContext.sql(s"""SELECT key, c7_float FROM $tableName where c7_float > 5""").count())
 
   }
-
+  test("table scan with projection and predicate decimal32") {
+    assertEquals(rows.count { case (key, i, s, ts) => i > 5},
+      sqlContext.sql(s"""SELECT key, c11_decimal32 FROM $tableName where c11_decimal32 > 5""").count())
+  }
+  test("table scan with projection and predicate decimal64") {
+    assertEquals(rows.count { case (key, i, s, ts) => i > 5},
+      sqlContext.sql(s"""SELECT key, c12_decimal64 FROM $tableName where c12_decimal64 > 5""").count())
+  }
+  test("table scan with projection and predicate decimal128") {
+    assertEquals(rows.count { case (key, i, s, ts) => i > 5},
+      sqlContext.sql(s"""SELECT key, c13_decimal128 FROM $tableName where c13_decimal128 > 5""").count())
+  }
   test("table scan with projection and predicate ") {
     assertEquals(rows.count { case (key, i, s, ts) => s != null && s > "5" },
       sqlContext.sql(s"""SELECT key FROM $tableName where c2_s > "5"""").count())
@@ -345,7 +403,7 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     val testTable = kuduClient.createTable(testTableName, schema, tableOptions)
 
     val kuduSession = kuduClient.newSession()
-    val chars = List('a', 'b', '乕', Char.MaxValue, '\0')
+    val chars = List('a', 'b', '乕', Char.MaxValue, '\u0000')
     val keys = for (x <- chars; y <- chars; z <- chars; w <- chars) yield Array(x, y, z, w).mkString
     keys.foreach { key =>
       val insert = testTable.newInsert
@@ -357,7 +415,7 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     val options: Map[String, String] = Map(
       "kudu.table" -> testTableName,
       "kudu.master" -> miniCluster.getMasterAddresses)
-    sqlContext.read.options(options).kudu.registerTempTable(testTableName)
+    sqlContext.read.options(options).kudu.createOrReplaceTempView(testTableName)
 
     val checkPrefixCount = { prefix: String =>
       val results = sqlContext.sql(s"SELECT key FROM $testTableName WHERE key LIKE '$prefix%'")
@@ -403,7 +461,7 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     val newOptions: Map[String, String] = Map(
       "kudu.table" -> insertTable,
       "kudu.master" -> miniCluster.getMasterAddresses)
-    sqlContext.read.options(newOptions).kudu.registerTempTable(insertTable)
+    sqlContext.read.options(newOptions).kudu.createOrReplaceTempView(insertTable)
 
     sqlContext.sql(s"INSERT INTO TABLE $insertTable SELECT * FROM $tableName")
     val results = sqlContext.sql(s"SELECT key FROM $insertTable").collectAsList()
@@ -422,7 +480,7 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     val newOptions: Map[String, String] = Map(
       "kudu.table" -> insertTable,
       "kudu.master" -> miniCluster.getMasterAddresses)
-    sqlContext.read.options(newOptions).kudu.registerTempTable(insertTable)
+    sqlContext.read.options(newOptions).kudu.createOrReplaceTempView(insertTable)
 
     try {
       sqlContext.sql(s"INSERT OVERWRITE TABLE $insertTable SELECT * FROM $tableName")
@@ -462,7 +520,7 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     ))
 
     val dfDefaultSchema = sqlContext.read.options(kuduOptions).kudu
-    assertEquals(11, dfDefaultSchema.schema.fields.length)
+    assertEquals(14, dfDefaultSchema.schema.fields.length)
 
     val dfWithUserSchema = sqlContext.read.options(kuduOptions).schema(userSchema).kudu
     assertEquals(2, dfWithUserSchema.schema.fields.length)
@@ -482,6 +540,60 @@ class DefaultSourceTest extends FunSuite with TestContext with BeforeAndAfter wi
     intercept[IllegalArgumentException] {
       sqlContext.read.options(kuduOptions).schema(userSchema).kudu
     }.getMessage should include ("Unknown column: foo")
+  }
 
+  test("scan locality") {
+    kuduOptions = Map(
+      "kudu.table" -> tableName,
+      "kudu.master" -> miniCluster.getMasterAddresses,
+      "kudu.scanLocality" -> "closest_replica")
+
+    val table = "scanLocalityTest"
+    sqlContext.read.options(kuduOptions).kudu.createOrReplaceTempView(table)
+    val results = sqlContext.sql(s"SELECT * FROM $table").collectAsList()
+    assert(results.size() == rowCount)
+
+    assert(!results.get(0).isNullAt(2))
+    assert(results.get(1).isNullAt(2))
+  }
+
+  // Verify that the propagated timestamp is properly updated inside
+  // the same client.
+  test("timestamp propagation") {
+    val df = sqlContext.read.options(kuduOptions).kudu
+    val insertDF = df.limit(1)
+                      .withColumn("key", df("key")
+                      .plus(100))
+                      .withColumn("c2_s", lit("abc"))
+
+    // Initiate a write via KuduContext, and verify that the client should
+    // have propagated timestamp.
+    kuduContext.insertRows(insertDF, tableName)
+    assert(kuduContext.syncClient.getLastPropagatedTimestamp > 0)
+    var prevTimestamp = kuduContext.syncClient.getLastPropagatedTimestamp
+
+    // Initiate a read via DataFrame, and verify that the client should
+    // move the propagated timestamp further.
+    val newDF = sqlContext.read.options(kuduOptions).kudu
+    val collected = newDF.filter("key = 100").collect()
+    assertEquals("abc", collected(0).getAs[String]("c2_s"))
+    assert(kuduContext.syncClient.getLastPropagatedTimestamp > prevTimestamp)
+    prevTimestamp = kuduContext.syncClient.getLastPropagatedTimestamp
+
+    // Initiate a read via KuduContext, and verify that the client should
+    // move the propagated timestamp further.
+    val rdd = kuduContext.kuduRDD(ss.sparkContext, tableName, List("key"))
+    assert(rdd.collect.length == 11)
+    assert(kuduContext.syncClient.getLastPropagatedTimestamp > prevTimestamp)
+    prevTimestamp = kuduContext.syncClient.getLastPropagatedTimestamp
+
+    // Initiate another write via KuduContext, and verify that the client should
+    // move the propagated timestamp further.
+    val updateDF = df.limit(1)
+                     .withColumn("key", df("key")
+                     .plus(100))
+                     .withColumn("c2_s", lit("def"))
+    kuduContext.insertIgnoreRows(updateDF, tableName)
+    assert(kuduContext.syncClient.getLastPropagatedTimestamp > prevTimestamp)
   }
 }

@@ -38,23 +38,25 @@ GFLAGS_VERSION=2.2.0
 GFLAGS_NAME=gflags-$GFLAGS_VERSION
 GFLAGS_SOURCE=$TP_SOURCE_DIR/$GFLAGS_NAME
 
-GLOG_VERSION=0.3.4
+GLOG_VERSION=0.3.5
 GLOG_NAME=glog-$GLOG_VERSION
 GLOG_SOURCE=$TP_SOURCE_DIR/$GLOG_NAME
 
-GMOCK_VERSION=1.7.0
-GMOCK_NAME=gmock-$GMOCK_VERSION
+GMOCK_VERSION=1.8.0
+GMOCK_NAME=googletest-release-$GMOCK_VERSION
 GMOCK_SOURCE=$TP_SOURCE_DIR/$GMOCK_NAME
 
-GPERFTOOLS_VERSION=2.2.1
+GPERFTOOLS_VERSION=2.6.3
 GPERFTOOLS_NAME=gperftools-$GPERFTOOLS_VERSION
 GPERFTOOLS_SOURCE=$TP_SOURCE_DIR/$GPERFTOOLS_NAME
 
-PROTOBUF_VERSION=2.6.1
+PROTOBUF_VERSION=3.4.1
 PROTOBUF_NAME=protobuf-$PROTOBUF_VERSION
 PROTOBUF_SOURCE=$TP_SOURCE_DIR/$PROTOBUF_NAME
 
-CMAKE_VERSION=3.6.1
+# Note: CMake gets patched on SLES12SP0. When changing the CMake version, please check if
+# cmake-issue-15873-dont-use-select.patch needs to be updated.
+CMAKE_VERSION=3.9.0
 CMAKE_NAME=cmake-$CMAKE_VERSION
 CMAKE_SOURCE=$TP_SOURCE_DIR/$CMAKE_NAME
 
@@ -91,9 +93,20 @@ RAPIDJSON_SOURCE=$TP_SOURCE_DIR/$RAPIDJSON_NAME
 #  export NAME=squeasel-$(git rev-parse HEAD)
 #  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
 #  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
-SQUEASEL_VERSION=c304d3f3481b07bf153979155f02e0aab24d01de
+SQUEASEL_VERSION=9335b81317a6451d5a37c5dc7ec088eecbf68c82
 SQUEASEL_NAME=squeasel-$SQUEASEL_VERSION
 SQUEASEL_SOURCE=$TP_SOURCE_DIR/$SQUEASEL_NAME
+
+# Hash of the mustache git revision to use.
+# (from https://github.com/henryr/cpp-mustache)
+#
+# To re-build this tarball use the following in the mustache repo:
+#  export NAME=mustache-$(git rev-parse HEAD)
+#  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
+#  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
+MUSTACHE_VERSION=87a592e8aa04497764c533acd6e887618ca7b8a8
+MUSTACHE_NAME=mustache-$MUSTACHE_VERSION
+MUSTACHE_SOURCE=$TP_SOURCE_DIR/$MUSTACHE_NAME
 
 # git revision of google style guide:
 # https://github.com/google/styleguide
@@ -111,38 +124,27 @@ CURL_NAME=curl-$CURL_VERSION
 CURL_SOURCE=$TP_SOURCE_DIR/$CURL_NAME
 
 # Hash of the crcutil git revision to use.
-# (from http://github.mtv.cloudera.com/CDH/crcutil)
+# (from http://github.com/adembo/crcutil)
 #
 # To re-build this tarball use the following in the crcutil repo:
 #  export NAME=crcutil-$(git rev-parse HEAD)
 #  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
 #  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
-CRCUTIL_VERSION=440ba7babeff77ffad992df3a10c767f184e946e
+CRCUTIL_VERSION=42148a6df6986a257ab21c80f8eca2e54544ac4d
 CRCUTIL_NAME=crcutil-$CRCUTIL_VERSION
 CRCUTIL_SOURCE=$TP_SOURCE_DIR/$CRCUTIL_NAME
 
-LIBUNWIND_VERSION=1.1a
+LIBUNWIND_VERSION=1.3-rc1
 LIBUNWIND_NAME=libunwind-$LIBUNWIND_VERSION
 LIBUNWIND_SOURCE=$TP_SOURCE_DIR/$LIBUNWIND_NAME
 
-# Our llvm tarball includes clang, extra clang tools, lld, and compiler-rt.
-#
-# See http://clang.llvm.org/get_started.html and http://lld.llvm.org/ for
-# details on how they're laid out in the llvm tarball.
-#
-# Summary:
-# 1. Unpack the llvm tarball
-# 2. Unpack the clang tarball as tools/clang (rename from cfe-<version> to clang)
-# 3. Unpack the extra clang tools tarball as tools/clang/tools/extra
-# 4. Unpack the lld tarball as tools/lld
-# 5. Unpack the compiler-rt tarball as projects/compiler-rt
-# 6. Unpack the libc++ tarball as projects/libcxx
-# 7. Unpack the libc++abi tarball as projects/libcxxabi
-# 8. Create new tarball from the resulting source tree
-#
-LLVM_VERSION=3.9.1
+# See package-llvm.sh for details on the LLVM tarball.
+LLVM_VERSION=4.0.0
 LLVM_NAME=llvm-$LLVM_VERSION.src
 LLVM_SOURCE=$TP_SOURCE_DIR/$LLVM_NAME
+
+# The include-what-you-use is built along with LLVM in its source tree.
+IWYU_VERSION=0.8
 
 # Python 2.7 is required to build LLVM 3.6+. It is only built and installed if
 # the system Python version is not 2.7.
@@ -175,3 +177,47 @@ OPENSSL_WORKAROUND_DIR="$TP_DIR/installed/openssl-el6-workaround"
 BREAKPAD_VERSION=f78d953511606348173911ae0b62572ebec1bbc4
 BREAKPAD_NAME=breakpad-$BREAKPAD_VERSION
 BREAKPAD_SOURCE=$TP_SOURCE_DIR/$BREAKPAD_NAME
+
+# Hash of the sparsehash-c11 git revision to use.
+# (from http://github.com/sparsehash/sparsehash-c11)
+#
+# To re-build this tarball use the following in the sparsehash-c11 repo:
+#  export NAME=sparsehash-c11-$(git rev-parse HEAD)
+#  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
+#  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
+SPARSEHASH_VERSION=47a55825ca3b35eab1ca22b7ab82b9544e32a9af
+SPARSEHASH_NAME=sparsehash-c11-$SPARSEHASH_VERSION
+SPARSEHASH_SOURCE=$TP_SOURCE_DIR/$SPARSEHASH_NAME
+
+# Hash of the sparsepp git revision to use.
+# (from https://github.com/greg7mdp/sparsepp)
+#
+# To re-build this tarball use the following in the sparsepp repo:
+#  export NAME=sparsepp-$(git rev-parse HEAD)
+#  git archive HEAD --prefix=$NAME/ -o /tmp/$NAME.tar.gz
+#  s3cmd put -P /tmp/$NAME.tar.gz s3://cloudera-thirdparty-libs/$NAME.tar.gz
+SPARSEPP_VERSION=824860bb76893d163efbcff330734b9f62eecb17
+SPARSEPP_NAME=sparsepp-$SPARSEPP_VERSION
+SPARSEPP_SOURCE=$TP_SOURCE_DIR/$SPARSEPP_NAME
+
+THRIFT_VERSION=0.11.0
+THRIFT_NAME=thrift-$THRIFT_VERSION
+THRIFT_SOURCE=$TP_SOURCE_DIR/$THRIFT_NAME
+
+BISON_VERSION=3.0.4
+BISON_NAME=bison-$BISON_VERSION
+BISON_SOURCE=$TP_SOURCE_DIR/$BISON_NAME
+
+# TODO(dan): bump to a release version once HIVE-17747 is published. The SHA
+# below is the current head of branch-2.
+# Note: The Hive release binary tarball is stripped of unnecessary jars before
+# being uploaded. See thirdparty/package-hive.sh for details.
+HIVE_VERSION=6189dbdea543939e977f97170f9a37389f46eb29
+HIVE_NAME=apache-hive-$HIVE_VERSION-bin
+HIVE_SOURCE=$TP_SOURCE_DIR/$HIVE_NAME
+
+# Note: The Hadoop release tarball is stripped of unnecessary jars before being
+# uploaded. See thirdparty/package-hadoop.sh for details.
+HADOOP_VERSION=2.8.2
+HADOOP_NAME=hadoop-$HADOOP_VERSION
+HADOOP_SOURCE=$TP_SOURCE_DIR/$HADOOP_NAME

@@ -17,30 +17,47 @@
 
 #include "kudu/rpc/rpcz_store.h"
 
-#include <algorithm>
+#include <algorithm>  // IWYU pragma: keep
 #include <array>
-#include <glog/stl_logging.h>
+#include <cstdint>
 #include <mutex> // for unique_lock
+#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <google/protobuf/message.h>
+
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/service_if.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/trace.h"
-
+#include "kudu/util/trace_metrics.h"
 
 DEFINE_bool(rpc_dump_all_traces, false,
             "If true, dump all RPC traces at INFO level");
 TAG_FLAG(rpc_dump_all_traces, advanced);
 TAG_FLAG(rpc_dump_all_traces, runtime);
 
+DEFINE_int32(rpc_duration_too_long_ms, 1000,
+             "Threshold (in milliseconds) above which a RPC is considered too long and its "
+             "duration and method name are logged at INFO level. The time measured is between "
+             "when a RPC is accepted and when its call handler completes.");
+TAG_FLAG(rpc_duration_too_long_ms, advanced);
+TAG_FLAG(rpc_duration_too_long_ms, runtime);
+
 using std::pair;
+using std::string;
 using std::vector;
 using std::unique_ptr;
 
@@ -74,7 +91,7 @@ class MethodSampler {
   // This function recurses through the parent-child relationship graph,
   // keeping the current tree path in 'child_path' (empty at the root).
   static void GetTraceMetrics(const Trace& t,
-                              const std::string& child_path,
+                              const string& child_path,
                               RpczSamplePB* sample_pb);
 
   // An individual recorded sample.
@@ -149,7 +166,7 @@ void MethodSampler::SampleCall(InboundCall* call) {
       std::swap(bucket->sample, new_sample);
       bucket->last_sample_time.Store(now);
     }
-    VLOG(1) << "Sampled call " << call->ToString();
+    VLOG(2) << "Sampled call " << call->ToString();
   }
 }
 
@@ -233,7 +250,7 @@ void RpczStore::LogTrace(InboundCall* call) {
       // The traces may also be too large to fit in a log message.
       LOG(WARNING) << call->ToString() << " took " << duration_ms << "ms (client timeout "
                    << call->header_.timeout_millis() << ").";
-      std::string s = call->trace()->DumpToString();
+      string s = call->trace()->DumpToString();
       if (!s.empty()) {
         LOG(WARNING) << "Trace:\n" << s;
       }
@@ -244,7 +261,7 @@ void RpczStore::LogTrace(InboundCall* call) {
   if (PREDICT_FALSE(FLAGS_rpc_dump_all_traces)) {
     LOG(INFO) << call->ToString() << " took " << duration_ms << "ms. Trace:";
     call->trace()->Dump(&LOG(INFO), true);
-  } else if (duration_ms > 1000) {
+  } else if (duration_ms > FLAGS_rpc_duration_too_long_ms) {
     LOG(INFO) << call->ToString() << " took " << duration_ms << "ms. "
               << "Request Metrics: " << call->trace()->MetricsAsJSON();
   }

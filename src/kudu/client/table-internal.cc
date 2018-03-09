@@ -18,6 +18,9 @@
 #include "kudu/client/table-internal.h"
 
 #include <string>
+#include <utility>
+
+using std::string;
 
 namespace kudu {
 namespace client {

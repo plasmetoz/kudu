@@ -15,29 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#ifndef KUDU_TABLET_TRANSACTION_DRIVER_H_
-#define KUDU_TABLET_TRANSACTION_DRIVER_H_
+#pragma once
 
 #include <string>
-#include <kudu/rpc/result_tracker.h>
 
-#include "kudu/consensus/consensus.h"
+#include <gtest/gtest_prod.h>
+
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/walltime.h"
-#include "kudu/server/clock.h"
 #include "kudu/tablet/transactions/transaction.h"
+#include "kudu/util/locks.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 #include "kudu/util/trace.h"
 
 namespace kudu {
+class Timestamp;
 class ThreadPool;
+class ThreadPoolToken;
 
 namespace log {
 class Log;
 } // namespace log
 
-namespace rpc {
-class ResultTracker;
+namespace consensus {
+class RaftConsensus;
 }
 
 namespace tablet {
@@ -69,7 +75,7 @@ class TransactionTracker;
 //      follower and ReplicationFinished() has already been called, then we can move
 //      on to ApplyAsync().
 //
-//  4 - The Consensus implementation calls ReplicationFinished()
+//  4 - RaftConsensus calls ReplicationFinished()
 //
 //      This is triggered by consensus when the commit index moves past our own
 //      OpId. On followers, this can happen before Prepare() finishes, and thus
@@ -220,16 +226,16 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   // Construct TransactionDriver. TransactionDriver does not take ownership
   // of any of the objects pointed to in the constructor's arguments.
   TransactionDriver(TransactionTracker* txn_tracker,
-                    consensus::Consensus* consensus,
+                    consensus::RaftConsensus* consensus,
                     log::Log* log,
-                    ThreadPool* prepare_pool,
+                    ThreadPoolToken* prepare_pool_token,
                     ThreadPool* apply_pool,
                     TransactionOrderVerifier* order_verifier);
 
   // Perform any non-constructor initialization. Sets the transaction
   // that will be executed.
   Status Init(gscoped_ptr<Transaction> transaction,
-              consensus::DriverType driver);
+              consensus::DriverType type);
 
   // Returns the OpId of the transaction being executed or an uninitialized
   // OpId if none has been assigned. Returns a copy and thus should not
@@ -247,7 +253,7 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   // at the next synchronization point.
   void Abort(const Status& status);
 
-  // Callback from Consensus when replication is complete, and thus the operation
+  // Callback from RaftConsensus when replication is complete, and thus the operation
   // is considered "committed" from the consensus perspective (ie it will be
   // applied on every node, and not ever truncated from the state machine history).
   // If status is anything different from OK() we don't proceed with the apply.
@@ -272,6 +278,7 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   Trace* trace() { return trace_.get(); }
 
  private:
+  FRIEND_TEST(TabletReplicaTest, TestShuttingDownMVCC);
   friend class RefCountedThreadSafe<TransactionDriver>;
   enum ReplicationState {
     // The operation has not yet been sent to consensus for replication
@@ -307,7 +314,7 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   // Submits ApplyTask to the apply pool.
   Status ApplyAsync();
 
-  // Calls Transaction::Apply() followed by Consensus::Commit() with the
+  // Calls Transaction::Apply() followed by RaftConsensus::Commit() with the
   // results from the Apply().
   void ApplyTask();
 
@@ -316,7 +323,8 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   Status CommitWait();
 
   // Handle a failure in any of the stages of the operation.
-  // In some cases, this will end the operation and call its callback.
+  // In cases where we can recover or where the transaction's Tablet has been
+  // stopped, this will end the operation and call its callback.
   // In others, where we can't recover, this will FATAL.
   void HandleFailure(const Status& s);
 
@@ -343,9 +351,9 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   void RegisterFollowerTransactionOnResultTracker();
 
   TransactionTracker* const txn_tracker_;
-  consensus::Consensus* const consensus_;
+  consensus::RaftConsensus* const consensus_;
   log::Log* const log_;
-  ThreadPool* const prepare_pool_;
+  ThreadPoolToken* const prepare_pool_token_;
   ThreadPool* const apply_pool_;
   TransactionOrderVerifier* const order_verifier_;
 
@@ -355,7 +363,7 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
   mutable simple_spinlock lock_;
 
   // A copy of the transaction's OpId, set when the transaction first
-  // receives one from Consensus and uninitialized until then.
+  // receives one from RaftConsensus and uninitialized until then.
   // TODO(todd): we have three separate copies of this now -- in TransactionState,
   // CommitMsg, and here... we should be able to consolidate!
   consensus::OpId op_id_copy_;
@@ -388,4 +396,3 @@ class TransactionDriver : public RefCountedThreadSafe<TransactionDriver> {
 }  // namespace tablet
 }  // namespace kudu
 
-#endif /* KUDU_TABLET_TRANSACTION_DRIVER_H_ */

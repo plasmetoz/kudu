@@ -240,6 +240,10 @@ changed to a GPL license. squeasel was forked from a revision of mongoose
 obtained prior to the license change.
 
 --------------------------------------------------------------------------------
+thirdparty/mustache-*/: Apache 2.0 license
+Source: https://github.com/henryr/cpp-mustache
+
+--------------------------------------------------------------------------------
 thirdparty/protobuf-*/: BSD 3-clause
 Source: https://github.com/google/protobuf
 
@@ -615,7 +619,9 @@ Source: http://www.boost.org/
   ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER
   DEALINGS IN THE SOFTWARE.
 
-
+--------------------------------------------------------------------------------
+thirdparty/thrift-*/: Apache License v2.0
+Source: https://thrift.apache.org
 
 ================================================================================
 BUILD-ONLY DEPENDENCIES
@@ -651,3 +657,17 @@ thirdparty/python-*: Python 2.7 license (https://www.python.org/download/release
 Source: http://www.python.org/
 NOTE: optional build-time dependency, not linked or bundled.
 
+--------------------------------------------------------------------------------
+thirdparty/bison: GPLv3 license (https://www.gnu.org/licenses/gpl.html)
+Source: https://www.gnu.org/software/bison
+NOTE: build-time dependency
+
+--------------------------------------------------------------------------------
+thirdparty/hadoop-*/: Apache License v2.0
+Source: https://hadoop.apache.org
+NOTE: build-time dependency
+
+--------------------------------------------------------------------------------
+thirdparty/hive-*/: Apache License v2.0
+Source: https://hive.apache.org
+NOTE: build-time dependency

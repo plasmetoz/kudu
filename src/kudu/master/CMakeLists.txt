@@ -37,24 +37,24 @@ set(MASTER_SRCS
   master.cc
   master_cert_authority.cc
   master_options.cc
+  master_path_handlers.cc
   master_service.cc
-  master-path-handlers.cc
   mini_master.cc
   sys_catalog.cc
   ts_descriptor.cc
-  ts_manager.cc
-)
+  ts_manager.cc)
 
 add_library(master ${MASTER_SRCS})
 target_link_libraries(master
+  clock
   gutil
   krpc
+  kserver
   kudu_common
   kudu_util
   master_proto
   rpc_header_proto
   security
-  server_common
   server_process
   tablet
   token_proto
@@ -71,6 +71,7 @@ set(KUDU_TEST_LINK_LIBS
 
 ADD_KUDU_TEST(catalog_manager-test)
 ADD_KUDU_TEST(master-test RESOURCE_LOCK "master-web-port")
+ADD_KUDU_TEST(mini_master-test RESOURCE_LOCK "master-web-port")
 ADD_KUDU_TEST(sys_catalog-test RESOURCE_LOCK "master-web-port")
 
 # Actual master executable

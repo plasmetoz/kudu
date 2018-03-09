@@ -13,7 +13,12 @@
 #ifndef KUDU_UTIL_STATUS_H_
 #define KUDU_UTIL_STATUS_H_
 
+// NOTE: using stdint.h instead of cstdint and errno.h instead of errno because
+// this file is supposed to be processed by a compiler lacking C++11 support.
+#include <errno.h>
 #include <stdint.h>
+
+#include <cstddef>
 #include <string>
 
 #ifdef KUDU_HEADERS_NO_STUBS
@@ -45,6 +50,15 @@
 #define KUDU_RETURN_NOT_OK_RET(to_call, to_return) do { \
     const ::kudu::Status& s = (to_call);                \
     if (PREDICT_FALSE(!s.ok())) return (to_return);  \
+  } while (0);
+
+/// @brief Return the given status if it is not OK, evaluating `on_error` if so.
+#define KUDU_RETURN_NOT_OK_EVAL(s, on_error) do { \
+    const ::kudu::Status& _s = (s); \
+    if (PREDICT_FALSE(!_s.ok())) { \
+      (on_error); \
+      return _s; \
+    } \
   } while (0);
 
 /// @brief Emit a warning if @c to_call returns a bad status.
@@ -110,6 +124,7 @@
 #define RETURN_NOT_OK         KUDU_RETURN_NOT_OK
 #define RETURN_NOT_OK_PREPEND KUDU_RETURN_NOT_OK_PREPEND
 #define RETURN_NOT_OK_RET     KUDU_RETURN_NOT_OK_RET
+#define RETURN_NOT_OK_EVAL    KUDU_RETURN_NOT_OK_EVAL
 #define WARN_NOT_OK           KUDU_WARN_NOT_OK
 #define LOG_AND_RETURN        KUDU_LOG_AND_RETURN
 #define RETURN_NOT_OK_LOG     KUDU_RETURN_NOT_OK_LOG
@@ -152,14 +167,43 @@ class KUDU_EXPORT Status {
   ///
   /// @param [in] s
   ///   rvalue reference to a Status object.
-  Status(Status&& s);
+  Status(Status&& s) noexcept;
 
   /// Assign the specified status using move semantics (C++11).
   ///
   /// @param [in] s
   ///   rvalue reference to a Status object.
   /// @return The reference to the modified object.
-  Status& operator=(Status&& s);
+  Status& operator=(Status&& s) noexcept;
+
+  /// If this status is OK, calls 'op' and returns the result, otherwise returns
+  /// this status.
+  ///
+  /// This method can be used to chain together multiple Status-returning
+  /// operations, short circuiting after the first one to fail.
+  ///
+  /// Example:
+  ///
+  /// @code
+  /// unique_ptr<SequentialFile> file;
+  /// Status s = Env::Default()
+  ///               ->NewSequentialFile("/tmp/example.txt", &file)
+  ///               .AndThen([&] {
+  ///                 return file->Write(0, "some data")
+  ///                             .CloneAndPrepend("failed to write to example file");
+  ///               });
+  /// @endcode
+  ///
+  /// @param [in] op
+  ///   Status-returning closure or function to run.
+  /// @return 'this', if this is not OK, or the result of running op.
+  template<typename F>
+  Status AndThen(F op) {
+    if (ok()) {
+      return op();
+    }
+    return *this;
+  }
 #endif
 
   /// @return A success status.
@@ -308,6 +352,18 @@ class KUDU_EXPORT Status {
   /// @return @c true iff the status indicates end of file.
   bool IsEndOfFile() const { return code() == kEndOfFile; }
 
+  /// @return @c true iff the status indicates a disk failure.
+  bool IsDiskFailure() const {
+    switch (posix_code()) {
+      case EIO:
+      case ENODEV:
+      case ENXIO:
+      case EROFS:
+        return true;
+    }
+    return false;
+  }
+
   /// @return A string representation of this status suitable for printing.
   ///   Returns the string "OK" for success.
   std::string ToString() const;
@@ -330,7 +386,9 @@ class KUDU_EXPORT Status {
   ///   or @c -1 if there is none.
   int16_t posix_code() const;
 
-  /// Clone the object and add the specified prefix to the clone's message.
+  /// Clone this status and add the specified prefix to the message.
+  ///
+  /// If this status is OK, then an OK status will be returned.
   ///
   /// @param [in] msg
   ///   The message to prepend.
@@ -338,7 +396,9 @@ class KUDU_EXPORT Status {
   ///   leading message.
   Status CloneAndPrepend(const Slice& msg) const;
 
-  /// Clone the object and add the specified suffix to the clone's message.
+  /// Clone this status and add the specified suffix to the message.
+  ///
+  /// If this status is OK, then an OK status will be returned.
   ///
   /// @param [in] msg
   ///   The message to append.
@@ -414,11 +474,11 @@ inline Status& Status::operator=(const Status& s) {
 }
 
 #if __cplusplus >= 201103L
-inline Status::Status(Status&& s) : state_(s.state_) {
+inline Status::Status(Status&& s) noexcept : state_(s.state_) {
   s.state_ = nullptr;
 }
 
-inline Status& Status::operator=(Status&& s) {
+inline Status& Status::operator=(Status&& s) noexcept {
   if (state_ != s.state_) {
     delete[] state_;
     state_ = s.state_;

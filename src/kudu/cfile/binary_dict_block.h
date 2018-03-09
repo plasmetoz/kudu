@@ -36,23 +36,39 @@
 #ifndef KUDU_CFILE_BINARY_DICT_BLOCK_H
 #define KUDU_CFILE_BINARY_DICT_BLOCK_H
 
-#include <string>
-#include <unordered_map>
-#include <vector>
+#include <sys/types.h>
 
+#include <cstddef>
+#include <cstdint>
+
+#include <sparsehash/dense_hash_map>
+
+#include "kudu/common/rowid.h"
 #include "kudu/cfile/block_encodings.h"
-#include "kudu/cfile/block_pointer.h"
-#include "kudu/cfile/cfile.pb.h"
 #include "kudu/cfile/binary_plain_block.h"
+#include "kudu/gutil/casts.h"
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+
+template <class X>
+struct GoodFastHash;
 
 namespace kudu {
-class Arena;
+
+class ColumnDataView;
+class ColumnMaterializationContext;
+class SelectionVectorView;
+
 namespace cfile {
+
+class CFileFooterPB;
+class CFileWriter;
 
 struct WriterOptions;
 
@@ -91,6 +107,9 @@ class BinaryDictBlockBuilder final : public BlockBuilder {
  private:
   int AddCodeWords(const uint8_t* vals, size_t count);
 
+  ATTRIBUTE_COLD
+  bool AddToDict(Slice val, uint32_t* codeword);
+
   faststring buffer_;
   bool finished_;
   const WriterOptions* options_;
@@ -102,7 +121,7 @@ class BinaryDictBlockBuilder final : public BlockBuilder {
   // They should NOT be cleared in the Reset() method.
   BinaryPlainBlockBuilder dict_block_;
 
-  std::unordered_map<StringPiece, uint32_t, GoodFastHash<StringPiece> > dictionary_;
+  google::dense_hash_map<StringPiece, uint32_t, GoodFastHash<StringPiece> > dictionary_;
   // Memory to hold the actual content for strings in the dictionary_.
   //
   // The size of it should be bigger than the size limit for dictionary block
@@ -176,7 +195,8 @@ class BinaryDictBlockDecoder final : public BlockDecoder {
 } // namespace kudu
 
 // Defined for tight_enum_test_cast<> -- has to be defined outside of any namespace.
-MAKE_ENUM_LIMITS(kudu::cfile::DictEncodingMode, kudu::cfile::DictEncodingMode_min,
+MAKE_ENUM_LIMITS(kudu::cfile::DictEncodingMode,
+                 kudu::cfile::DictEncodingMode_min,
                  kudu::cfile::DictEncodingMode_max);
 
 #endif // KUDU_CFILE_BINARY_DICT_BLOCK_H

@@ -39,17 +39,17 @@ import java.util.Map;
 
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.Message;
-import com.google.protobuf.ZeroCopyLiteralByteString;
+import com.google.protobuf.UnsafeByteOperations;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.tserver.Tserver;
 import org.apache.kudu.util.Pair;
 
@@ -169,6 +169,8 @@ public final class AsyncKuduScanner {
    */
   private final byte[] endPrimaryKey;
 
+  private byte[] lastPrimaryKey;
+
   private final boolean prefetching;
 
   private final boolean cacheBlocks;
@@ -176,6 +178,8 @@ public final class AsyncKuduScanner {
   private final ReadMode readMode;
 
   private final Common.OrderMode orderMode;
+
+  private final boolean isFaultTolerant;
 
   private long htTimestamp;
 
@@ -218,14 +222,14 @@ public final class AsyncKuduScanner {
   final long scanRequestTimeout;
 
   AsyncKuduScanner(AsyncKuduClient client, KuduTable table, List<String> projectedNames,
-                   List<Integer> projectedIndexes, ReadMode readMode, Common.OrderMode orderMode,
+                   List<Integer> projectedIndexes, ReadMode readMode, boolean isFaultTolerant,
                    long scanRequestTimeout,
                    Map<String, KuduPredicate> predicates, long limit,
                    boolean cacheBlocks, boolean prefetching,
                    byte[] startPrimaryKey, byte[] endPrimaryKey,
                    long htTimestamp, int batchSizeBytes, PartitionPruner pruner,
                    ReplicaSelection replicaSelection) {
-    checkArgument(batchSizeBytes > 0, "Need a strictly positive number of bytes, " +
+    checkArgument(batchSizeBytes >= 0, "Need non-negative number of bytes, " +
         "got %s", batchSizeBytes);
     checkArgument(limit > 0, "Need a strictly positive number for the limit, " +
         "got %s", limit);
@@ -235,16 +239,20 @@ public final class AsyncKuduScanner {
       checkArgument(readMode == ReadMode.READ_AT_SNAPSHOT, "When specifying a " +
           "HybridClock timestamp, the read mode needs to be set to READ_AT_SNAPSHOT");
     }
-    if (orderMode == Common.OrderMode.ORDERED) {
-      checkArgument(readMode == ReadMode.READ_AT_SNAPSHOT, "Returning rows in primary key order " +
+
+    this.isFaultTolerant = isFaultTolerant;
+    if (this.isFaultTolerant) {
+      checkArgument(readMode == ReadMode.READ_AT_SNAPSHOT, "Use of fault tolerance scanner " +
           "requires the read mode to be set to READ_AT_SNAPSHOT");
+      this.orderMode = Common.OrderMode.ORDERED;
+    } else {
+      this.orderMode = Common.OrderMode.UNORDERED;
     }
 
     this.client = client;
     this.table = table;
     this.pruner = pruner;
     this.readMode = readMode;
-    this.orderMode = orderMode;
     this.scanRequestTimeout = scanRequestTimeout;
     this.predicates = predicates;
     this.limit = limit;
@@ -254,6 +262,7 @@ public final class AsyncKuduScanner {
     this.endPrimaryKey = endPrimaryKey;
     this.htTimestamp = htTimestamp;
     this.batchSizeBytes = batchSizeBytes;
+    this.lastPrimaryKey = AsyncKuduClient.EMPTY_ARRAY;
 
     // Map the column names to actual columns in the table schema.
     // If the user set this to 'null', we scan all columns.
@@ -294,6 +303,7 @@ public final class AsyncKuduScanner {
   private static ColumnSchema getStrippedColumnSchema(ColumnSchema columnToClone) {
     return new ColumnSchema.ColumnSchemaBuilder(columnToClone.getName(), columnToClone.getType())
         .nullable(columnToClone.isNullable())
+        .typeAttributes(columnToClone.getTypeAttributes())
         .build();
   }
 
@@ -382,6 +392,11 @@ public final class AsyncKuduScanner {
           if (resp.propagatedTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
             client.updateLastPropagatedTimestamp(resp.propagatedTimestamp);
           }
+
+          if (isFaultTolerant && resp.lastPrimaryKey != null) {
+            lastPrimaryKey = resp.lastPrimaryKey;
+          }
+
           if (!resp.more || resp.scannerId == null) {
             scanFinished();
             return Deferred.fromResult(resp.data); // there might be data to return
@@ -483,14 +498,24 @@ public final class AsyncKuduScanner {
   /**
    * Creates a new errback to handle errors while trying to get more rows.
    */
-  private final Callback<Exception, Exception> nextRowErrback() {
-    return new Callback<Exception, Exception>() {
-      public Exception call(final Exception error) {
+  private final Callback<Deferred<RowResultIterator>, Exception> nextRowErrback() {
+    return new Callback<Deferred<RowResultIterator>, Exception>() {
+      @Override
+      public Deferred<RowResultIterator> call(Exception e) throws Exception {
         final RemoteTablet old_tablet = tablet;  // Save before invalidate().
-        String message = old_tablet + " pretends to not know " + AsyncKuduScanner.this;
-        LOG.warn(message, error);
         invalidate();  // If there was an error, don't assume we're still OK.
-        return error;  // Let the error propagate.
+        // If encountered FaultTolerantScannerExpiredException, it means the
+        // fault tolerant scanner on the server side expired. Therefore, open
+        // a new scanner.
+        if (e instanceof FaultTolerantScannerExpiredException) {
+          scannerId = null;
+          sequenceId = 0;
+          LOG.warn("Scanner expired, creating a new one {}", AsyncKuduScanner.this);
+          return nextRows();
+        } else {
+          LOG.warn("{} pretends to not know {}", old_tablet, AsyncKuduScanner.this, e);
+          return Deferred.fromError(e); // Let the error propagate.
+        }
       }
 
       public String toString() {
@@ -514,6 +539,7 @@ public final class AsyncKuduScanner {
     }
     scannerId = null;
     sequenceId = 0;
+    lastPrimaryKey = AsyncKuduClient.EMPTY_ARRAY;
     invalidate();
   }
 
@@ -530,9 +556,7 @@ public final class AsyncKuduScanner {
     if (closed) {
       return Deferred.fromResult(null);
     }
-    final Deferred<RowResultIterator> d =
-        client.closeScanner(this).addCallback(closedCallback()); // TODO errBack ?
-    return d;
+    return client.closeScanner(this).addCallback(closedCallback()); // TODO errBack ?
   }
 
   /** Callback+Errback invoked when the TabletServer closed our scanner.  */
@@ -544,7 +568,7 @@ public final class AsyncKuduScanner {
           LOG.debug("Scanner " + Bytes.pretty(scannerId) + " closed on " +
               tablet);
         }
-        tablet = null;
+        invalidate();
         scannerId = "client debug closed".getBytes();   // Make debugging easier.
         return response == null ? null : response.data;
       }
@@ -601,25 +625,34 @@ public final class AsyncKuduScanner {
   }
 
   /**
+   * Gets the replica selection mechanism being used.
+   *
+   * @return the replica selection mechanism.
+   */
+  ReplicaSelection getReplicaSelection() {
+    return replicaSelection;
+  }
+
+  /**
    * Returns an RPC to open this scanner.
    */
   KuduRpc<Response> getOpenRequest() {
     checkScanningNotStarted();
-    return new ScanRequest(table, State.OPENING);
+    return new ScanRequest(table, State.OPENING, tablet);
   }
 
   /**
    * Returns an RPC to fetch the next rows.
    */
   KuduRpc<Response> getNextRowsRequest() {
-    return new ScanRequest(table, State.NEXT);
+    return new ScanRequest(table, State.NEXT, tablet);
   }
 
   /**
    * Returns an RPC to close this scanner.
    */
   KuduRpc<Response> getCloseRequest() {
-    return new ScanRequest(table, State.CLOSING);
+    return new ScanRequest(table, State.CLOSING, tablet);
   }
 
   /**
@@ -666,23 +699,27 @@ public final class AsyncKuduScanner {
      */
     private final long propagatedTimestamp;
 
+    private final byte[] lastPrimaryKey;
+
     Response(final byte[] scannerId,
              final RowResultIterator data,
              final boolean more,
              final long scanTimestamp,
-             final long propagatedTimestamp) {
+             final long propagatedTimestamp,
+             final byte[] lastPrimaryKey) {
       this.scannerId = scannerId;
       this.data = data;
       this.more = more;
       this.scanTimestamp = scanTimestamp;
       this.propagatedTimestamp = propagatedTimestamp;
+      this.lastPrimaryKey = lastPrimaryKey;
     }
 
     public String toString() {
-      String ret = "AsyncKuduScanner$Response(scannerId=" + Bytes.pretty(scannerId) +
-          ", data=" + data + ", more=" + more;
+      String ret = "AsyncKuduScanner$Response(scannerId = " + Bytes.pretty(scannerId) +
+          ", data = " + data + ", more = " + more;
       if (scanTimestamp != AsyncKuduClient.NO_TIMESTAMP) {
-        ret += ", responseScanTimestamp =" + scanTimestamp;
+        ret += ", responseScanTimestamp = " + scanTimestamp;
       }
       ret += ")";
       return ret;
@@ -698,12 +735,13 @@ public final class AsyncKuduScanner {
   /**
    * RPC sent out to fetch the next rows from the TabletServer.
    */
-  private final class ScanRequest extends KuduRpc<Response> {
+  final class ScanRequest extends KuduRpc<Response> {
 
     State state;
 
-    ScanRequest(KuduTable table, State state) {
+    ScanRequest(KuduTable table, State state, RemoteTablet tablet) {
       super(table);
+      setTablet(tablet);
       this.state = state;
       this.setTimeoutMillis(scanRequestTimeout);
     }
@@ -744,7 +782,7 @@ public final class AsyncKuduScanner {
           NewScanRequestPB.Builder newBuilder = NewScanRequestPB.newBuilder();
           newBuilder.setLimit(limit); // currently ignored
           newBuilder.addAllProjectedColumns(ProtobufHelper.schemaToListPb(schema));
-          newBuilder.setTabletId(ZeroCopyLiteralByteString.wrap(tablet.getTabletIdAsBytes()));
+          newBuilder.setTabletId(UnsafeByteOperations.unsafeWrap(tablet.getTabletIdAsBytes()));
           newBuilder.setOrderMode(AsyncKuduScanner.this.getOrderMode());
           newBuilder.setCacheBlocks(cacheBlocks);
           // if the last propagated timestamp is set send it with the scan
@@ -759,12 +797,18 @@ public final class AsyncKuduScanner {
             newBuilder.setSnapTimestamp(AsyncKuduScanner.this.getSnapshotTimestamp());
           }
 
+          if (isFaultTolerant) {
+            if (AsyncKuduScanner.this.lastPrimaryKey.length > 0) {
+              newBuilder.setLastPrimaryKey(UnsafeByteOperations.unsafeWrap(lastPrimaryKey));
+            }
+          }
+
           if (AsyncKuduScanner.this.startPrimaryKey.length > 0) {
-            newBuilder.setStartPrimaryKey(ZeroCopyLiteralByteString.copyFrom(startPrimaryKey));
+            newBuilder.setStartPrimaryKey(UnsafeByteOperations.unsafeWrap(startPrimaryKey));
           }
 
           if (AsyncKuduScanner.this.endPrimaryKey.length > 0) {
-            newBuilder.setStopPrimaryKey(ZeroCopyLiteralByteString.copyFrom(endPrimaryKey));
+            newBuilder.setStopPrimaryKey(UnsafeByteOperations.unsafeWrap(endPrimaryKey));
           }
 
           for (KuduPredicate pred : predicates.values()) {
@@ -774,14 +818,12 @@ public final class AsyncKuduScanner {
                  .setBatchSizeBytes(batchSizeBytes);
           break;
         case NEXT:
-          setTablet(AsyncKuduScanner.this.tablet);
-          builder.setScannerId(ZeroCopyLiteralByteString.wrap(scannerId))
+          builder.setScannerId(UnsafeByteOperations.unsafeWrap(scannerId))
                  .setCallSeqId(AsyncKuduScanner.this.sequenceId)
                  .setBatchSizeBytes(batchSizeBytes);
           break;
         case CLOSING:
-          setTablet(AsyncKuduScanner.this.tablet);
-          builder.setScannerId(ZeroCopyLiteralByteString.wrap(scannerId))
+          builder.setScannerId(UnsafeByteOperations.unsafeWrap(scannerId))
                  .setBatchSizeBytes(0)
                  .setCloseScanner(true);
           break;
@@ -801,14 +843,27 @@ public final class AsyncKuduScanner {
       final byte[] id = resp.getScannerId().toByteArray();
       TabletServerErrorPB error = resp.hasError() ? resp.getError() : null;
 
-      if (error != null && error.getCode().equals(TabletServerErrorPB.Code.TABLET_NOT_FOUND)) {
-        if (state == State.OPENING) {
-          // Doing this will trigger finding the new location.
-          return new Pair<Response, Object>(null, error);
-        } else {
-          Status statusIncomplete = Status.Incomplete("Cannot continue scanning, " +
-              "the tablet has moved and this isn't a fault tolerant scan");
-          throw new NonRecoverableException(statusIncomplete);
+      // Error handling.
+      if (error != null) {
+        switch (error.getCode()) {
+          case TABLET_NOT_FOUND:
+          case TABLET_NOT_RUNNING:
+            if (state == State.OPENING || (state == State.NEXT && isFaultTolerant)) {
+              // Doing this will trigger finding the new location.
+              return new Pair<Response, Object>(null, error);
+            } else {
+              Status statusIncomplete = Status.Incomplete("Cannot continue scanning, " +
+                  "the tablet has moved and this isn't a fault tolerant scan");
+              throw new NonRecoverableException(statusIncomplete);
+            }
+          case SCANNER_EXPIRED:
+            if (isFaultTolerant) {
+              Status status = Status.fromTabletServerErrorPB(error);
+              throw new FaultTolerantScannerExpiredException(status);
+            }
+            // fall through
+          default:
+            break;
         }
       }
       RowResultIterator iterator = RowResultIterator.makeRowResultIterator(
@@ -816,7 +871,7 @@ public final class AsyncKuduScanner {
           callResponse);
 
       boolean hasMore = resp.getHasMoreResults();
-      if (id.length  != 0 && scannerId != null && !Bytes.equals(scannerId, id)) {
+      if (id.length != 0 && scannerId != null && !Bytes.equals(scannerId, id)) {
         Status statusIllegalState = Status.IllegalState("Scan RPC response was for scanner" +
             " ID " + Bytes.pretty(id) + " but we expected " +
             Bytes.pretty(scannerId));
@@ -826,16 +881,17 @@ public final class AsyncKuduScanner {
           resp.hasSnapTimestamp() ? resp.getSnapTimestamp()
                                   : AsyncKuduClient.NO_TIMESTAMP,
           resp.hasPropagatedTimestamp() ? resp.getPropagatedTimestamp()
-                                        : AsyncKuduClient.NO_TIMESTAMP);
+                                        : AsyncKuduClient.NO_TIMESTAMP,
+          resp.getLastPrimaryKey().toByteArray());
       if (LOG.isDebugEnabled()) {
-        LOG.debug(response.toString());
+        LOG.debug("{} for scanner {}", response.toString(), AsyncKuduScanner.this);
       }
       return new Pair<Response, Object>(response, error);
     }
 
     public String toString() {
       return "ScanRequest(scannerId=" + Bytes.pretty(scannerId) +
-          (tablet != null ? ", tabletSlice=" + tablet.getTabletId() : "") +
+          (tablet != null ? ", tablet=" + tablet.getTabletId() : "") +
           ", attempt=" + attempt + ", " + super.toString() + ")";
     }
 
@@ -865,7 +921,7 @@ public final class AsyncKuduScanner {
      */
     public AsyncKuduScanner build() {
       return new AsyncKuduScanner(
-          client, table, projectedColumnNames, projectedColumnIndexes, readMode, orderMode,
+          client, table, projectedColumnNames, projectedColumnIndexes, readMode, isFaultTolerant,
           scanRequestTimeout, predicates, limit, cacheBlocks,
           prefetching, lowerBoundPrimaryKey, upperBoundPrimaryKey,
           htTimestamp, batchSizeBytes, PartitionPruner.create(this), replicaSelection);

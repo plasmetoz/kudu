@@ -31,6 +31,12 @@
 #
 # If KUDU_REPORT_TEST_RESULTS is non-zero, then tests are reported to the
 # central test server.
+#
+# If KUDU_MEASURE_TEST_CPU_CONSUMPTION is non-zero, then tests will be wrapped
+# in a 'perf stat' command which measures the CPU consumption on a periodic
+# basis, writing the output into '<test>.<shard>.perf.txt' logs in the test log
+# directory. This is handy in order to determine an appropriate value for the
+# 'PROCESSORS' property passed to 'ADD_KUDU_TEST' in CMakeLists.txt.
 
 # Path to the test executable or script to be run.
 # May be relative or absolute.
@@ -52,14 +58,20 @@ TEST_DIRNAME=$(cd $(dirname $TEST_PATH); pwd)
 TEST_FILENAME=$(basename $TEST_PATH)
 ABS_TEST_PATH=$TEST_DIRNAME/$TEST_FILENAME
 shift
-TEST_NAME=$(echo $TEST_FILENAME | perl -pe 's/\..+?$//') # Remove path and extension (if any).
+# Remove path and extension (if any).
+
+# The "short" test name doesn't include the shard number.
+SHORT_TEST_NAME=$(echo $TEST_FILENAME | perl -pe 's/\..+?$//')
+
+# The full test name does include the shard number.
+TEST_NAME=${SHORT_TEST_NAME}.${GTEST_SHARD_INDEX:-0}
 
 # Determine whether the test is a known flaky by comparing against the user-specified
 # list.
 TEST_EXECUTION_ATTEMPTS=1
 if [ -n "$KUDU_FLAKY_TEST_LIST" ]; then
   if [ -f "$KUDU_FLAKY_TEST_LIST" ]; then
-    IS_KNOWN_FLAKY=$(grep --count --line-regexp "$TEST_NAME" "$KUDU_FLAKY_TEST_LIST")
+    IS_KNOWN_FLAKY=$(grep --count --line-regexp "$SHORT_TEST_NAME" "$KUDU_FLAKY_TEST_LIST")
   else
     echo "Flaky test list file $KUDU_FLAKY_TEST_LIST missing"
     IS_KNOWN_FLAKY=0
@@ -82,6 +94,7 @@ set -o pipefail
 
 LOGFILE=$TEST_LOGDIR/$TEST_NAME.txt
 XMLFILE=$TEST_LOGDIR/$TEST_NAME.xml
+export GTEST_OUTPUT="xml:$XMLFILE" # Enable JUnit-compatible XML output.
 
 # Remove both the compressed and uncompressed output, so the developer
 # doesn't accidentally get confused and read output from a prior test
@@ -104,6 +117,9 @@ fi
 # Configure TSAN (ignored if this isn't a TSAN build).
 TSAN_OPTIONS="$TSAN_OPTIONS suppressions=$SOURCE_ROOT/build-support/tsan-suppressions.txt"
 TSAN_OPTIONS="$TSAN_OPTIONS history_size=7"
+#   Flush TSAN memory every 10 seconds - this prevents RSS blowup in unit tests
+#   which can cause tests to get killed by the OOM killer.
+TSAN_OPTIONS="$TSAN_OPTIONS flush_memory_ms=10000"
 TSAN_OPTIONS="$TSAN_OPTIONS external_symbolizer_path=$ASAN_SYMBOLIZER_PATH"
 export TSAN_OPTIONS
 
@@ -114,6 +130,9 @@ export LSAN_OPTIONS
 # Set a 15-minute timeout for tests run via 'make test'.
 # This keeps our jenkins builds from hanging in the case that there's
 # a deadlock or anything.
+#
+# NOTE: this should be kept in sync with the default value of ARG_TIMEOUT
+# in the definition of ADD_KUDU_TEST in the top-level CMakeLists.txt.
 KUDU_TEST_TIMEOUT=${KUDU_TEST_TIMEOUT:-900}
 
 # Allow for collecting core dumps.
@@ -149,8 +168,14 @@ for ATTEMPT_NUMBER in $(seq 1 $TEST_EXECUTION_ATTEMPTS) ; do
     addr2line_filter="$SOURCE_ROOT/build-support/stacktrace_addr2line.pl $ABS_TEST_PATH"
   fi
   echo "Running $TEST_NAME, redirecting output into $LOGFILE" \
-    "(attempt ${ATTEMPT_NUMBER}/$TEST_EXECUTION_ATTEMPTS)"
-  $ABS_TEST_PATH "$@" --test_timeout_after $KUDU_TEST_TIMEOUT 2>&1 \
+       "(attempt ${ATTEMPT_NUMBER}/$TEST_EXECUTION_ATTEMPTS)"
+  test_command=$ABS_TEST_PATH
+  if [ -n "$KUDU_MEASURE_TEST_CPU_CONSUMPTION" ] && [ "$KUDU_MEASURE_TEST_CPU_CONSUMPTION" -ne 0 ] ; then
+    perf_file=$TEST_LOGDIR/$TEST_NAME.perf.txt
+    echo "Will wrap test in perf-stat, output to ${perf_file}..."
+    test_command="perf stat -I1000 -e task-clock -o $perf_file $test_command"
+  fi
+  $test_command "$@" --test_timeout_after $KUDU_TEST_TIMEOUT 2>&1 \
     | $addr2line_filter \
     | $pipe_cmd > $LOGFILE
   STATUS=$?
@@ -189,7 +214,7 @@ for ATTEMPT_NUMBER in $(seq 1 $TEST_EXECUTION_ATTEMPTS) ; do
     done
   fi
 
-  if [ -n "$KUDU_REPORT_TEST_RESULTS" ]; then
+  if [ -n "$KUDU_REPORT_TEST_RESULTS" ] && [ "$KUDU_REPORT_TEST_RESULTS" -ne 0 ]; then
     echo Reporting results
     $SOURCE_ROOT/build-support/report-test.sh "$ABS_TEST_PATH" "$LOGFILE" "$STATUS" &
 

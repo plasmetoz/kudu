@@ -19,11 +19,13 @@
 
 #include <memory>
 #include <unordered_map>
+#include <utility>
 
 #include "kudu/gutil/singleton.h"
 #include "kudu/util/logging.h"
 
 using std::shared_ptr;
+using std::string;
 using std::unordered_map;
 
 namespace kudu {
@@ -82,11 +84,15 @@ class TypeInfoResolver {
     AddMapping<FLOAT>();
     AddMapping<DOUBLE>();
     AddMapping<BINARY>();
+    AddMapping<INT128>();
+    AddMapping<DECIMAL32>();
+    AddMapping<DECIMAL64>();
+    AddMapping<DECIMAL128>();
   }
 
   template<DataType type> void AddMapping() {
     TypeTraits<type> traits;
-    mapping_.insert(make_pair(type, shared_ptr<TypeInfo>(new TypeInfo(traits))));
+    mapping_.insert(make_pair(type, std::make_shared<TypeInfo>(traits)));
   }
 
   unordered_map<DataType,

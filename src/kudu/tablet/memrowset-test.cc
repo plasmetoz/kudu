@@ -15,19 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <cstdio>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/clock/clock.h"
+#include "kudu/clock/logical_clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/row.h"
-#include "kudu/common/scan_spec.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/server/logical_clock.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/tablet/memrowset.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/mem_tracker.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
 DEFINE_int32(roundtrip_num_rows, 10000,
              "Number of rows to use for the round-trip test");
@@ -40,6 +65,8 @@ namespace tablet {
 using consensus::OpId;
 using log::LogAnchorRegistry;
 using std::shared_ptr;
+using std::string;
+using std::vector;
 
 class TestMemRowSet : public KuduTest {
  public:
@@ -48,7 +75,7 @@ class TestMemRowSet : public KuduTest {
       log_anchor_registry_(new LogAnchorRegistry()),
       schema_(CreateSchema()),
       key_schema_(schema_.CreateKeyProjection()),
-      clock_(server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
+      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
   }
 
   static Schema CreateSchema() {
@@ -165,7 +192,7 @@ class TestMemRowSet : public KuduTest {
     gscoped_ptr<MemRowSet::Iterator> iter(mrs->NewIterator(&schema_, snap));
     CHECK_OK(iter->Init(NULL));
 
-    Arena arena(1024, 256*1024);
+    Arena arena(1024);
     RowBlock block(schema_, 100, &arena);
     int fetched = 0;
     while (iter->HasNext()) {
@@ -181,7 +208,7 @@ class TestMemRowSet : public KuduTest {
   faststring mutation_buf_;
   const Schema schema_;
   const Schema key_schema_;
-  scoped_refptr<server::Clock> clock_;
+  scoped_refptr<clock::Clock> clock_;
   MvccManager mvcc_;
 };
 
@@ -474,10 +501,10 @@ TEST_F(TestMemRowSet, TestInsertionMVCC) {
     }
 
     // Transaction is committed. Save the snapshot after this commit.
-    snapshots.push_back(MvccSnapshot(mvcc_));
+    snapshots.emplace_back(mvcc_);
   }
   LOG(INFO) << "MemRowSet after inserts:";
-  ASSERT_OK(mrs->DebugDump());
+  ASSERT_OK(mrs->DebugDump(nullptr));
 
   ASSERT_EQ(5, snapshots.size());
   for (int i = 0; i < 5; i++) {
@@ -503,7 +530,7 @@ TEST_F(TestMemRowSet, TestUpdateMVCC) {
 
   vector<MvccSnapshot> snapshots;
   // First snapshot is after insertion
-  snapshots.push_back(MvccSnapshot(mvcc_));
+  snapshots.emplace_back(mvcc_);
 
   // Update the row 5 times (setting its int column to increasing ints 1-5)
   for (uint32_t i = 1; i <= 5; i++) {
@@ -513,11 +540,11 @@ TEST_F(TestMemRowSet, TestUpdateMVCC) {
     ASSERT_EQ(0L, result.mutated_stores(0).mrs_id());
 
     // Transaction is committed. Save the snapshot after this commit.
-    snapshots.push_back(MvccSnapshot(mvcc_));
+    snapshots.emplace_back(mvcc_);
   }
 
   LOG(INFO) << "MemRowSet after updates:";
-  ASSERT_OK(mrs->DebugDump());
+  ASSERT_OK(mrs->DebugDump(nullptr));
 
   // Validate that each snapshot returns the expected value
   ASSERT_EQ(6, snapshots.size());

@@ -17,20 +17,29 @@
 
 #include "kudu/common/key_util.h"
 
+#include <cstdint>
+#include <limits>
+#include <string>
+
 #include <gtest/gtest.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/mathlimits.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/test_macros.h"
 
 namespace kudu {
 
 class KeyUtilTest : public KuduTest {
  public:
-  KeyUtilTest()
-    : arena_(1024, 4096) {}
+  KeyUtilTest() : arena_(1024) {}
 
  protected:
   uint8_t* row_data(KuduPartialRow* row) {
@@ -57,6 +66,25 @@ TEST_F(KeyUtilTest, TestIncrementNonCompositePrimaryKey) {
   EXPECT_OK(p_row.SetInt32(0, MathLimits<int32_t>::kMax));
   EXPECT_FALSE(key_util::IncrementPrimaryKey(&row, &arena_));
   EXPECT_EQ("int32 key=-2147483648", p_row.ToString());
+}
+
+TEST_F(KeyUtilTest, TestIncrementInt128PrimaryKey) {
+  Schema schema({ ColumnSchema("key", INT128),
+                  ColumnSchema("other_col", INT32),
+                  ColumnSchema("other_col2", STRING, true) },
+                1);
+  KuduPartialRow p_row(&schema);
+  ContiguousRow row(&schema, row_data(&p_row));
+
+  // Normal increment.
+  EXPECT_OK(p_row.Set<TypeTraits<INT128>>(0, 1000));
+  EXPECT_TRUE(key_util::IncrementPrimaryKey(&row, &arena_));
+  EXPECT_EQ("int128 key=1001", p_row.ToString());
+
+  // Overflow increment.
+  EXPECT_OK(p_row.Set<TypeTraits<INT128>>(0, INT128_MAX));
+  EXPECT_FALSE(key_util::IncrementPrimaryKey(&row, &arena_));
+  EXPECT_EQ("int128 key=-170141183460469231731687303715884105728", p_row.ToString());
 }
 
 TEST_F(KeyUtilTest, TestIncrementCompositePrimaryKey) {
@@ -151,9 +179,21 @@ TEST_F(KeyUtilTest, TestTryDecrementCell) {
   }
   {
     ColumnSchema col_int32("a", INT32);
-    int32_t orig = numeric_limits<int32_t>::min();
+    int32_t orig = std::numeric_limits<int32_t>::min();
     EXPECT_EQ(key_util::TryDecrementCell(col_int32, &orig), false);
-    EXPECT_EQ(orig, numeric_limits<int32_t>::min());
+    EXPECT_EQ(orig, std::numeric_limits<int32_t>::min());
+  }
+  {
+    ColumnSchema col_int128("a", INT128);
+    int128_t orig = 0;
+    EXPECT_EQ(key_util::TryDecrementCell(col_int128, &orig), true);
+    EXPECT_EQ(orig, -1);
+  }
+  {
+    ColumnSchema col_int128("a", INT128);
+    int128_t orig = INT128_MIN;
+    EXPECT_EQ(key_util::TryDecrementCell(col_int128, &orig), false);
+    EXPECT_EQ(orig, INT128_MIN);
   }
   {
     ColumnSchema col_bool("a", BOOL);

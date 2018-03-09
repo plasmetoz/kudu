@@ -17,25 +17,36 @@
 #ifndef KUDU_TABLET_ROWSET_H
 #define KUDU_TABLET_ROWSET_H
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <vector>
 
-#include "kudu/cfile/cfile_util.h"
-#include "kudu/common/iterator.h"
+#include <glog/logging.h>
+
+#include "kudu/common/common.pb.h"
+#include "kudu/common/encoded_key.h"
+#include "kudu/common/row.h"
 #include "kudu/common/rowid.h"
-#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/tablet/mvcc.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/bloom_filter.h"
-#include "kudu/util/faststring.h"
-#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+// IWYU pragma: no_include "kudu/util/monotime.h"
 
 namespace kudu {
 
+class MonoTime; // IWYU pragma: keep
 class RowChangeList;
+class RowwiseIterator;
+class Schema;
+class Slice;
 
 namespace consensus {
 class OpId;
@@ -108,14 +119,22 @@ class RowSet {
                            std::string* max_encoded_key) const = 0;
 
   // Return a displayable string for this rowset.
-  virtual string ToString() const = 0;
+  virtual std::string ToString() const = 0;
 
   // Dump the full contents of this rowset, for debugging.
   // This is very verbose so only useful within unit tests.
-  virtual Status DebugDump(vector<string> *lines = NULL) = 0;
+  virtual Status DebugDump(std::vector<std::string> *lines = NULL) = 0;
 
-  // Estimate the number of bytes on-disk
-  virtual uint64_t EstimateOnDiskSize() const = 0;
+  // Return the size of this rowset on disk, in bytes.
+  virtual uint64_t OnDiskSize() const = 0;
+
+  // Return the size of this rowset's base data on disk, in bytes.
+  // Excludes bloomfiles and the ad hoc index.
+  virtual uint64_t OnDiskBaseDataSize() const = 0;
+
+  // Return the size, in bytes, of this rowset's base data and REDO deltas.
+  // Does not include bloomfiles, the ad hoc index, or UNDO deltas.
+  virtual uint64_t OnDiskBaseDataSizeWithRedos() const = 0;
 
   // Return the lock used for including this DiskRowSet in a compaction.
   // This prevents multiple compactions and flushes from trying to include
@@ -209,13 +228,19 @@ class RowSet {
     // makes compaction selection at a time on a given Tablet due to
     // Tablet::compact_select_lock_.
     std::unique_lock<std::mutex> try_lock(*compact_flush_lock(), std::try_to_lock);
-    return try_lock.owns_lock();
+    return try_lock.owns_lock() && !has_been_compacted();
   }
 
+  // Checked while validating that a rowset is available for compaction.
+  virtual bool has_been_compacted() const = 0;
+
+  // Set after a compaction has completed to indicate that the rowset has been
+  // removed from the rowset tree and is thus longer available for compaction.
+  virtual void set_has_been_compacted() = 0;
 };
 
 // Used often enough, may as well typedef it.
-typedef vector<std::shared_ptr<RowSet> > RowSetVector;
+typedef std::vector<std::shared_ptr<RowSet> > RowSetVector;
 // Structure which caches an encoded and hashed key, suitable
 // for probing against rowsets.
 class RowSetKeyProbe {
@@ -226,7 +251,7 @@ class RowSetKeyProbe {
   // NOTE: row_key is not copied and must be valid for the lifetime
   // of this object.
   explicit RowSetKeyProbe(ConstContiguousRow row_key)
-      : row_key_(std::move(row_key)) {
+      : row_key_(row_key) {
     encoded_key_ = EncodedKey::FromContiguousRow(row_key_);
     bloom_probe_ = BloomKeyProbe(encoded_key_slice());
   }
@@ -326,11 +351,18 @@ class DuplicatingRowSet : public RowSet {
   virtual Status GetBounds(std::string* min_encoded_key,
                            std::string* max_encoded_key) const OVERRIDE;
 
-  uint64_t EstimateOnDiskSize() const OVERRIDE;
+  // Return the total size on-disk of this rowset, in bytes.
+  uint64_t OnDiskSize() const OVERRIDE;
 
-  string ToString() const OVERRIDE;
+  // Return the total size on-disk of this rowset's data (i.e. excludes metadata), in bytes.
+  uint64_t OnDiskBaseDataSize() const OVERRIDE;
 
-  virtual Status DebugDump(vector<string> *lines = NULL) OVERRIDE;
+  // Return the size, in bytes, of this rowset's data, not including UNDOs.
+  uint64_t OnDiskBaseDataSizeWithRedos() const OVERRIDE;
+
+  std::string ToString() const OVERRIDE;
+
+  virtual Status DebugDump(std::vector<std::string> *lines = NULL) OVERRIDE;
 
   std::shared_ptr<RowSetMetadata> metadata() OVERRIDE;
 
@@ -342,6 +374,14 @@ class DuplicatingRowSet : public RowSet {
 
   virtual bool IsAvailableForCompaction() OVERRIDE {
     return false;
+  }
+
+  virtual bool has_been_compacted() const OVERRIDE {
+    return false;
+  }
+
+  virtual void set_has_been_compacted() OVERRIDE {
+    LOG(FATAL) << "Cannot be compacted";
   }
 
   ~DuplicatingRowSet();

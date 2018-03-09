@@ -18,9 +18,14 @@
 #include "kudu/security/token_verifier.h"
 
 #include <algorithm>
+#include <iterator>
 #include <mutex>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/walltime.h"
@@ -28,6 +33,7 @@
 #include "kudu/security/token_signing_key.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/status.h"
 
 using std::lock_guard;
 using std::string;
@@ -156,6 +162,9 @@ const char* VerificationResultToString(VerificationResult r) {
       return "authentication token signed with unknown key";
     case security::VerificationResult::INCOMPATIBLE_FEATURE:
       return "authentication token uses incompatible feature";
+    default:
+      LOG(FATAL) << "unexpected VerificationResult value: "
+                 << static_cast<int>(r);
   }
 }
 

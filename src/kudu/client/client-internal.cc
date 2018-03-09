@@ -18,38 +18,51 @@
 #include "kudu/client/client-internal.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <boost/function.hpp>
+#include <glog/logging.h>
 
 #include "kudu/client/master_rpc.h"
 #include "kudu/client/meta_cache.h"
+#include "kudu/client/schema.h"
+#include "kudu/common/partition.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/human_readable.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/sysinfo.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/request_tracker.h"
-#include "kudu/rpc/rpc.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/security/cert.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/util/async_util.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/net/dns_resolver.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/thread_restrictions.h"
+#include "kudu/rpc/connection.h"
 
+using std::pair;
 using std::set;
 using std::shared_ptr;
 using std::string;
@@ -58,7 +71,6 @@ using std::vector;
 
 namespace kudu {
 
-using consensus::RaftPeerPB;
 using master::AlterTableRequestPB;
 using master::AlterTableResponsePB;
 using master::CreateTableRequestPB;
@@ -73,6 +85,8 @@ using master::IsAlterTableDoneRequestPB;
 using master::IsAlterTableDoneResponsePB;
 using master::IsCreateTableDoneRequestPB;
 using master::IsCreateTableDoneResponsePB;
+using master::ListMastersRequestPB;
+using master::ListMastersResponsePB;
 using master::ListTablesRequestPB;
 using master::ListTablesResponsePB;
 using master::ListTabletServersRequestPB;
@@ -80,8 +94,10 @@ using master::ListTabletServersResponsePB;
 using master::MasterErrorPB;
 using master::MasterFeatures;
 using master::MasterServiceProxy;
+using master::TableIdentifierPB;
+using pb_util::SecureShortDebugString;
+using rpc::CredentialsPolicy;
 using rpc::ErrorStatusPB;
-using rpc::Rpc;
 using rpc::RpcController;
 using strings::Substitute;
 
@@ -168,9 +184,9 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     // deadline so that we reserve some time with which to find a new
     // leader master and retry before the overall deadline expires.
     //
-    // TODO: KUDU-683 tracks cleanup for this.
+    // TODO(KUDU-683): cleanup this up
     MonoTime rpc_deadline = now + client->default_rpc_timeout();
-    rpc.set_deadline(MonoTime::Earliest(rpc_deadline, deadline));
+    rpc.set_deadline(std::min(rpc_deadline, deadline));
 
     for (uint32_t required_feature_flag : required_feature_flags) {
       rpc.RequireServerFeature(required_feature_flag);
@@ -184,7 +200,10 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
       const ErrorStatusPB* err = rpc.error_response();
       if (err &&
           err->has_code() &&
-          err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY) {
+          (err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY ||
+           err->code() == ErrorStatusPB::ERROR_UNAVAILABLE)) {
+        // The UNAVAILABLE error code is a broader counterpart of the
+        // SERVER_TOO_BUSY. In both cases it's necessary to retry a bit later.
         continue;
       }
     }
@@ -202,6 +221,23 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
         LOG(INFO) << "Determining the new leader Master and retrying...";
         WARN_NOT_OK(ConnectToCluster(client, deadline),
                     "Unable to determine the new leader Master");
+        continue;
+      }
+    }
+
+    if (s.IsNotAuthorized()) {
+      const ErrorStatusPB* err = rpc.error_response();
+      if (err && err->has_code() &&
+          err->code() == ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN) {
+        // Assuming the token has expired: it's necessary to get a new one.
+        LOG(INFO) << "Reconnecting to the cluster for a new authn token";
+        const Status connect_status = ConnectToCluster(
+            client, deadline, CredentialsPolicy::PRIMARY_CREDENTIALS);
+        if (PREDICT_FALSE(!connect_status.ok())) {
+          KLOG_EVERY_N_SECS(WARNING, 1)
+              << "Unable to reconnect to the cluster for a new authn token: "
+              << connect_status.ToString();
+        }
         continue;
       }
     }
@@ -290,6 +326,18 @@ Status KuduClient::Data::SyncLeaderMasterRpc(
     const boost::function<Status(MasterServiceProxy*,
                                  const ListTabletServersRequestPB&,
                                  ListTabletServersResponsePB*,
+                                 RpcController*)>& func,
+    vector<uint32_t> required_feature_flags);
+template
+Status KuduClient::Data::SyncLeaderMasterRpc(
+    const MonoTime& deadline,
+    KuduClient* client,
+    const ListMastersRequestPB& req,
+    ListMastersResponsePB* resp,
+    const char* func_name,
+    const boost::function<Status(MasterServiceProxy*,
+                                 const ListMastersRequestPB&,
+                                 ListMastersResponsePB*,
                                  RpcController*)>& func,
     vector<uint32_t> required_feature_flags);
 
@@ -395,27 +443,26 @@ Status KuduClient::Data::GetTabletServer(KuduClient* client,
 
 Status KuduClient::Data::CreateTable(KuduClient* client,
                                      const CreateTableRequestPB& req,
-                                     const KuduSchema& schema,
+                                     CreateTableResponsePB* resp,
                                      const MonoTime& deadline,
                                      bool has_range_partition_bounds) {
-  CreateTableResponsePB resp;
-
   vector<uint32_t> features;
   if (has_range_partition_bounds) {
     features.push_back(MasterFeatures::RANGE_PARTITION_BOUNDS);
   }
   return SyncLeaderMasterRpc<CreateTableRequestPB, CreateTableResponsePB>(
-      deadline, client, req, &resp, "CreateTable",
+      deadline, client, req, resp, "CreateTable",
       &MasterServiceProxy::CreateTable, features);
 }
 
-Status KuduClient::Data::IsCreateTableInProgress(KuduClient* client,
-                                                 const string& table_name,
-                                                 const MonoTime& deadline,
-                                                 bool *create_in_progress) {
+Status KuduClient::Data::IsCreateTableInProgress(
+    KuduClient* client,
+    TableIdentifierPB table,
+    const MonoTime& deadline,
+    bool* create_in_progress) {
   IsCreateTableDoneRequestPB req;
   IsCreateTableDoneResponsePB resp;
-  req.mutable_table()->set_table_name(table_name);
+  *req.mutable_table() = std::move(table);
 
   // TODO(aserbin): Add client rpc timeout and use
   // 'default_admin_operation_timeout_' as the default timeout for all
@@ -433,14 +480,15 @@ Status KuduClient::Data::IsCreateTableInProgress(KuduClient* client,
   return Status::OK();
 }
 
-Status KuduClient::Data::WaitForCreateTableToFinish(KuduClient* client,
-                                                    const string& table_name,
-                                                    const MonoTime& deadline) {
+Status KuduClient::Data::WaitForCreateTableToFinish(
+    KuduClient* client,
+    TableIdentifierPB table,
+    const MonoTime& deadline) {
   return RetryFunc(deadline,
                    "Waiting on Create Table to be completed",
                    "Timed out waiting for Table Creation",
                    boost::bind(&KuduClient::Data::IsCreateTableInProgress,
-                               this, client, table_name, _1, _2));
+                               this, client, std::move(table), _1, _2));
 }
 
 Status KuduClient::Data::DeleteTable(KuduClient* client,
@@ -457,31 +505,32 @@ Status KuduClient::Data::DeleteTable(KuduClient* client,
 
 Status KuduClient::Data::AlterTable(KuduClient* client,
                                     const AlterTableRequestPB& req,
+                                    AlterTableResponsePB* resp,
                                     const MonoTime& deadline,
                                     bool has_add_drop_partition) {
   vector<uint32_t> required_feature_flags;
   if (has_add_drop_partition) {
     required_feature_flags.push_back(MasterFeatures::ADD_DROP_RANGE_PARTITIONS);
   }
-  AlterTableResponsePB resp;
   return SyncLeaderMasterRpc<AlterTableRequestPB, AlterTableResponsePB>(
       deadline,
       client,
       req,
-      &resp,
+      resp,
       "AlterTable",
       &MasterServiceProxy::AlterTable,
       std::move(required_feature_flags));
 }
 
-Status KuduClient::Data::IsAlterTableInProgress(KuduClient* client,
-                                                const string& table_name,
-                                                const MonoTime& deadline,
-                                                bool *alter_in_progress) {
+Status KuduClient::Data::IsAlterTableInProgress(
+    KuduClient* client,
+    TableIdentifierPB table,
+    const MonoTime& deadline,
+    bool* alter_in_progress) {
   IsAlterTableDoneRequestPB req;
   IsAlterTableDoneResponsePB resp;
+  *req.mutable_table() = std::move(table);
 
-  req.mutable_table()->set_table_name(table_name);
   RETURN_NOT_OK((
       SyncLeaderMasterRpc<IsAlterTableDoneRequestPB, IsAlterTableDoneResponsePB>(
           deadline,
@@ -495,15 +544,15 @@ Status KuduClient::Data::IsAlterTableInProgress(KuduClient* client,
   return Status::OK();
 }
 
-Status KuduClient::Data::WaitForAlterTableToFinish(KuduClient* client,
-                                                   const string& alter_name,
-                                                   const MonoTime& deadline) {
+Status KuduClient::Data::WaitForAlterTableToFinish(
+    KuduClient* client,
+    TableIdentifierPB table,
+    const MonoTime& deadline) {
   return RetryFunc(deadline,
                    "Waiting on Alter Table to be completed",
                    "Timed out waiting for AlterTable",
                    boost::bind(&KuduClient::Data::IsAlterTableInProgress,
-                               this,
-                               client, alter_name, _1, _2));
+                               this, client, std::move(table), _1, _2));
 }
 
 Status KuduClient::Data::InitLocalHostNames() {
@@ -591,8 +640,12 @@ Status KuduClient::Data::GetTableSchema(KuduClient* client,
 
 void KuduClient::Data::ConnectedToClusterCb(
     const Status& status,
-    const Sockaddr& leader_addr,
-    const master::ConnectToMasterResponsePB& connect_response) {
+    const pair<Sockaddr, string>& leader_addr_and_name,
+    const master::ConnectToMasterResponsePB& connect_response,
+    CredentialsPolicy cred_policy) {
+
+  const auto& leader_addr = leader_addr_and_name.first;
+  const auto& leader_hostname = leader_addr_and_name.second;
 
   // Ensure that all of the CAs reported by the master are trusted
   // in our local TLS configuration.
@@ -619,17 +672,23 @@ void KuduClient::Data::ConnectedToClusterCb(
   // Adopt the authentication token from the response, if it's been set.
   if (connect_response.has_authn_token()) {
     messenger_->set_authn_token(connect_response.authn_token());
+    VLOG(2) << "Received and adopted authn token";
   }
 
   vector<StatusCallback> cbs;
   {
     std::lock_guard<simple_spinlock> l(leader_master_lock_);
-    cbs.swap(leader_master_callbacks_);
-    leader_master_rpc_.reset();
+    if (cred_policy == CredentialsPolicy::PRIMARY_CREDENTIALS) {
+      leader_master_rpc_primary_creds_.reset();
+      cbs.swap(leader_master_callbacks_primary_creds_);
+    } else {
+      leader_master_rpc_any_creds_.reset();
+      cbs.swap(leader_master_callbacks_any_creds_);
+    }
 
     if (status.ok()) {
-      leader_master_hostport_ = HostPort(leader_addr);
-      master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr));
+      leader_master_hostport_ = HostPort(leader_hostname, leader_addr.port());
+      master_proxy_.reset(new MasterServiceProxy(messenger_, leader_addr, leader_hostname));
     }
   }
 
@@ -639,23 +698,28 @@ void KuduClient::Data::ConnectedToClusterCb(
 }
 
 Status KuduClient::Data::ConnectToCluster(KuduClient* client,
-                                          const MonoTime& deadline) {
+                                          const MonoTime& deadline,
+                                          CredentialsPolicy creds_policy) {
   Synchronizer sync;
-  ConnectToClusterAsync(client, deadline, sync.AsStatusCallback());
+  ConnectToClusterAsync(client, deadline, sync.AsStatusCallback(), creds_policy);
   return sync.Wait();
 }
 
 void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
                                              const MonoTime& deadline,
-                                             const StatusCallback& cb) {
+                                             const StatusCallback& cb,
+                                             CredentialsPolicy creds_policy) {
   DCHECK(deadline.Initialized());
 
-  vector<Sockaddr> master_sockaddrs;
+  vector<pair<Sockaddr, string>> master_addrs_with_names;
   for (const string& master_server_addr : master_server_addrs_) {
     vector<Sockaddr> addrs;
-    Status s;
-    // TODO: Do address resolution asynchronously as well.
-    s = ParseAddressList(master_server_addr, master::Master::kDefaultPort, &addrs);
+    HostPort hp;
+    Status s = hp.ParseString(master_server_addr, master::Master::kDefaultPort);
+    if (s.ok()) {
+      // TODO(todd): Do address resolution asynchronously as well.
+      s = hp.ResolveAddresses(&addrs);
+    }
     if (!s.ok()) {
       cb.Run(s);
       return;
@@ -670,32 +734,71 @@ void KuduClient::Data::ConnectToClusterAsync(KuduClient* client,
           << "Specified master server address '" << master_server_addr << "' "
           << "resolved to multiple IPs. Using " << addrs[0].ToString();
     }
-    master_sockaddrs.push_back(addrs[0]);
+    master_addrs_with_names.emplace_back(addrs[0], hp.host());
   }
 
-  // This ensures that no more than one ConnectToClusterRpc is in
-  // flight at a time -- there isn't much sense in requesting this information
-  // in parallel, since the requests should end up with the same result.
-  // Instead, we simply piggy-back onto the existing request by adding our own
-  // callback to leader_master_callbacks_.
+  // This ensures that no more than one ConnectToClusterRpc of each credentials
+  // policy is in flight at any time -- there isn't much sense in requesting
+  // this information in parallel, since the requests should end up with the
+  // same result. Instead, simply piggy-back onto the existing request by adding
+  // our the callback to leader_master_callbacks_{any_creds,primary_creds}_.
   std::unique_lock<simple_spinlock> l(leader_master_lock_);
-  leader_master_callbacks_.push_back(cb);
-  if (!leader_master_rpc_) {
-    // No one is sending a request yet - we need to be the one to do it.
-    leader_master_rpc_.reset(new internal::ConnectToClusterRpc(
-        std::bind(&KuduClient::Data::ConnectedToClusterCb, this,
-                  std::placeholders::_1,
-                  std::placeholders::_2,
-                  std::placeholders::_3),
-        std::move(master_sockaddrs),
+
+  // Optimize sending out a new request in the presence of already existing
+  // requests to the leader master. Depending on the credentials policy for the
+  // request, we select different strategies:
+  //   * If the new request is of ANY_CREDENTIALS policy, piggy-back it on any
+  //     leader master request which is progress.
+  //   * If the new request is of PRIMARY_CREDENTIALS, it can by piggy-backed
+  //     only on the request of the same type.
+  //
+  // If this is a request to re-acquire authn token, we allow it to run in
+  // parallel with other requests of ANY_CREDENTIALS_TYPE policy, if any.
+  // Otherwise it's hard to guarantee that the token re-acquisition request
+  // will be sent: there might be other concurrent requests to leader master,
+  // they might have different timeout settings and they are retried
+  // independently of each other.
+  DCHECK(creds_policy == CredentialsPolicy::ANY_CREDENTIALS ||
+         creds_policy == CredentialsPolicy::PRIMARY_CREDENTIALS);
+
+  // Decide on which call to piggy-back the callback: if a call with primary
+  // credentials is available, piggy-back on that. Otherwise, piggy-back on
+  // any-credentials-policy request.
+  if (leader_master_rpc_primary_creds_) {
+    // Piggy-back on an existing connection with primary credentials.
+    leader_master_callbacks_primary_creds_.push_back(cb);
+  } else if (leader_master_rpc_any_creds_ &&
+             creds_policy == CredentialsPolicy::ANY_CREDENTIALS) {
+    // Piggy-back on an existing connection with any credentials.
+    leader_master_callbacks_any_creds_.push_back(cb);
+  } else {
+    // It's time to create a new request which would satisfy the credentials
+    // policy.
+    scoped_refptr<internal::ConnectToClusterRpc> rpc(
+        new internal::ConnectToClusterRpc(
+            std::bind(&KuduClient::Data::ConnectedToClusterCb, this,
+            std::placeholders::_1,
+            std::placeholders::_2,
+            std::placeholders::_3,
+            creds_policy),
+        std::move(master_addrs_with_names),
         deadline,
         client->default_rpc_timeout(),
-        messenger_));
+        messenger_,
+        creds_policy));
+
+    if (creds_policy == CredentialsPolicy::PRIMARY_CREDENTIALS) {
+      DCHECK(!leader_master_rpc_primary_creds_);
+      leader_master_rpc_primary_creds_ = rpc;
+      leader_master_callbacks_primary_creds_.push_back(cb);
+    } else {
+      DCHECK(!leader_master_rpc_any_creds_);
+      leader_master_rpc_any_creds_ = rpc;
+      leader_master_callbacks_any_creds_.push_back(cb);
+    }
     l.unlock();
-    leader_master_rpc_->SendRpc();
+    rpc->SendRpc();
   }
-
-
 }
 
 HostPort KuduClient::Data::leader_master_hostport() const {

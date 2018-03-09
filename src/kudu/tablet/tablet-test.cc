@@ -15,21 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cstdint>
 #include <ctime>
+#include <map>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/cfile/cfile_util.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
-#include "kudu/common/row.h"
-#include "kudu/common/scan_spec.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/block_manager.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
+#include "kudu/tablet/delta_key.h"
+#include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/deltafile.h"
 #include "kudu/tablet/local_tablet_writer.h"
-#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet-test-base.h"
-#include "kudu/util/slice.h"
+#include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_metrics.h" // IWYU pragma: keep
+#include "kudu/util/faststring.h"
+#include "kudu/util/jsonwriter.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 
 DEFINE_int32(testflush_num_inserts, 1000,
@@ -40,6 +69,9 @@ DEFINE_int32(testcompaction_num_rows, 1000,
              "Number of rows per rowset in TestCompaction");
 
 using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -66,9 +98,20 @@ TYPED_TEST(TestTablet, TestFlush) {
   uint64_t max_rows = this->ClampRowCount(FLAGS_testflush_num_inserts);
   this->InsertTestRows(0, max_rows, 0);
 
+  // Pre-flush, there should be no data on disk, and no diskrowsets, so the
+  // on-disk size of the tablet should be size of the tablet metadata.
+  ASSERT_EQ(0, this->tablet()->OnDiskDataSize());
+  ASSERT_GT(this->tablet()->OnDiskSize(), 0);
+  ASSERT_EQ(this->tablet()->metadata()->on_disk_size(), this->tablet()->OnDiskSize());
+
   // Flush it.
   ASSERT_OK(this->tablet()->Flush());
   TabletMetadata* tablet_meta = this->tablet()->metadata();
+
+  // Post-flush, there should be data on-disk. On-disk size should exceed
+  // on-disk data size due to per-diskrowset metadata and tablet metadata.
+  ASSERT_GT(this->tablet()->OnDiskDataSize(), 0);
+  ASSERT_GT(this->tablet()->OnDiskSize(), this->tablet()->OnDiskDataSize());
 
   // Make sure the files were created as expected.
   RowSetMetadata* rowset_meta = tablet_meta->GetRowSetForTests(0);
@@ -83,7 +126,7 @@ TYPED_TEST(TestTablet, TestFlush) {
   ASSERT_EQ(1, undo_blocks.size());
 
   // Read the undo delta, we should get one undo mutation (delete) for each row.
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   ASSERT_OK(this->fs_manager()->OpenBlock(undo_blocks[0], &block));
 
   shared_ptr<DeltaFileReader> dfr;
@@ -542,7 +585,7 @@ TYPED_TEST(TestTablet, TestRowIteratorOrdered) {
         new RunDuringDuplicatingRowSetPhase<decltype(RunScans)>(RunScans));
     this->tablet()->SetFlushCompactCommonHooksForTests(hooks_shared);
     ASSERT_OK(this->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
-    NO_FATALS();
+    NO_PENDING_FATALS();
   }
 
   {
@@ -677,10 +720,15 @@ TYPED_TEST(TestTablet, TestInsertsPersist) {
 
 TYPED_TEST(TestTablet, TestUpsert) {
   vector<string> rows;
-  this->UpsertTestRows(0, 1, 1000);
+  const auto& upserts_as_updates = this->tablet()->metrics()->upserts_as_updates;
 
-  // UPSERT a row that is in MRS.
+  // Upsert a new row.
+  this->UpsertTestRows(0, 1, 1000);
+  EXPECT_EQ(0, upserts_as_updates->value());
+
+  // Upsert a row that is in the MRS.
   this->UpsertTestRows(0, 1, 1001);
+  EXPECT_EQ(1, upserts_as_updates->value());
 
   ASSERT_OK(this->IterateToStringList(&rows));
   EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1001, false) }, rows);
@@ -690,8 +738,9 @@ TYPED_TEST(TestTablet, TestUpsert) {
   ASSERT_OK(this->IterateToStringList(&rows));
   EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1001, false) }, rows);
 
-  // UPSERT a row that is in DRS.
+  // Upsert a row that is in the DRS.
   this->UpsertTestRows(0, 1, 1002);
+  EXPECT_EQ(2, upserts_as_updates->value());
   ASSERT_OK(this->IterateToStringList(&rows));
   EXPECT_EQ(vector<string>{ this->setup_.FormatDebugRow(0, 1002, false) }, rows);
 }

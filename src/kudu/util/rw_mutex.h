@@ -18,6 +18,8 @@
 #pragma once
 
 #include <pthread.h>
+#include <sys/types.h>
+
 #include <unordered_set>
 
 #include "kudu/gutil/macros.h"
@@ -63,9 +65,11 @@ class RWMutex {
   bool TryWriteLock();
 
 #ifndef NDEBUG
+  void AssertAcquired() const;
   void AssertAcquiredForReading() const;
   void AssertAcquiredForWriting() const;
 #else
+  void AssertAcquired() const {}
   void AssertAcquiredForReading() const {}
   void AssertAcquiredForWriting() const {}
 #endif

@@ -18,23 +18,35 @@
 #include "kudu/cfile/binary_prefix_block.h"
 
 #include <algorithm>
+#include <cstring>
+#include <cstdint>
+#include <ostream>
 #include <string>
 
+#include <glog/logging.h>
+
 #include "kudu/cfile/cfile_util.h"
-#include "kudu/cfile/cfile_writer.h"
 #include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/coding.h"
 #include "kudu/util/coding-inl.h"
 #include "kudu/util/group_varint-inl.h"
 #include "kudu/util/hexdump.h"
+#include "kudu/util/logging.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/slice.h"
 
 namespace kudu {
 namespace cfile {
 
 using kudu::coding::AppendGroupVarInt32;
+using std::string;
 using strings::Substitute;
 
 ////////////////////////////////////////////////////////////
@@ -208,7 +220,7 @@ Status BinaryPrefixBlockBuilder::GetLastKey(void *key) const {
 ////////////////////////////////////////////////////////////
 
 BinaryPrefixBlockDecoder::BinaryPrefixBlockDecoder(Slice slice)
-    : data_(std::move(slice)),
+    : data_(slice),
       parsed_(false),
       num_elems_(0),
       ordinal_pos_base_(0),
@@ -288,6 +300,13 @@ void BinaryPrefixBlockDecoder::SeekToPositionInBlock(uint pos) {
 
   DCHECK_LE(pos, num_elems_);
 
+  // Seeking past the last element is valid -- it just sets us to the
+  // same state as if we have read all of the elements.
+  if (pos == num_elems_) {
+    cur_idx_ = pos;
+    return;
+  }
+
   int target_restart = pos/restart_interval_;
   SeekToRestartPoint(target_restart);
 
@@ -302,7 +321,7 @@ void BinaryPrefixBlockDecoder::SeekToPositionInBlock(uint pos) {
 // point. Note that the restart points in the file do not include
 // the '0' restart point, since that is simply the beginning of
 // the data and hence a waste of space. So, 'idx' may range from
-// 0 (first record) through num_restarts_ (last recorded restart point)
+// 0 (first record) through num_restarts_ (exclusive).
 const uint8_t * BinaryPrefixBlockDecoder::GetRestartPoint(uint32_t idx) const {
   DCHECK_LE(idx, num_restarts_);
 

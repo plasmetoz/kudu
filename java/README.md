@@ -16,17 +16,19 @@ Asynchronous Native Java Client for Kudu
 System Requirements
 ------------------------------------------------------------
 
-- Java 7
+- Java 7 or Java 8
 - Maven 3
-- protobuf 2.6.1 (it needs to be the exact version)
 - MIT Kerberos (krb5)
+
+WARNING: Support for Java 7 is deprecated as of Kudu 1.5.0 and may be removed in
+the next major release.
 
 Building the Client
 ------------------------------------------------------------
 
 $ mvn package -DskipTests
 
-The client jar will can then be found at kudu-client/target.
+The client jar can then be found at kudu-client/target.
 
 Running the Tests
 ------------------------------------------------------------
@@ -51,19 +53,8 @@ may be run with:
 
 $ mvn verify
 
-Building the Kudu-Spark integration for Spark 2.x with Scala 2.11
-------------------------------------------------------------
-
-The Spark integration builds for Spark 1.x and Scala 2.10 by default.
-Additionally, there is a build profile available for Spark 2.x with
-Scala 2.11: from the kudu-spark directory, run
-
-$ mvn clean package -P spark2_2.11
-
-The two artifactIds are
-
-1. kudu-spark_2.10 for Spark 1.x with Scala 2.10
-2. kudu-spark2_2.11 for Spark 2.x with Scala 2.11
+NOTE: Running the tests for the kudu-spark and kudu-spark-tools
+module requires Java 8.
 
 State of Eclipse integration
 ------------------------------------------------------------
@@ -136,3 +127,48 @@ likely a bug in maven-protoc-plugin.
 
 There's a simple workaround: delete the errant folder within
 Eclipse and refresh the kudu-client project.
+
+Building with Gradle
+--------------------
+
+As an experiment a Gradle build definition also exists.
+In order to run the Gradle build you must install [Gradle|https://gradle.org/].
+If you would rather not install Gradle locally, you can use the
+[Gradle Wrapper|https://docs.gradle.org/current/userguide/gradle_wrapper.html]
+by replacing all references to gradle with gradlew.
+
+## Running a full build
+
+This will build all modules and run all "checks".
+
+$ gradle buildAll
+
+## Building the Client
+$ gradle :kudu-client:assemble
+
+The client jar can then be found at kudu-client/build/libs.
+
+## Running the Tests
+$ gradle test
+
+Integration tests, including tests which cover Hadoop integration,
+may be run with:
+
+$ gradle integrationTest
+
+*Note:* Integration tests may depend on built Kudu binaries.
+
+## Installing to local maven repo
+
+$ gradle install
+
+## Clearing cached build state
+
+$ gradle clean
+
+## Discovering other tasks
+
+$ gradle tasks
+
+
+

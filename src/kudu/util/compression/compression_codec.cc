@@ -17,6 +17,8 @@
 
 #include "kudu/util/compression/compression_codec.h"
 
+#include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
@@ -26,9 +28,10 @@
 #include <snappy.h>
 #include <zlib.h>
 
-
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/singleton.h"
 #include "kudu/gutil/stringprintf.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/string_case.h"
 
@@ -263,16 +266,16 @@ Status GetCompressionCodec(CompressionType compression,
 }
 
 CompressionType GetCompressionCodecType(const std::string& name) {
-  string uname;
+  std::string uname;
   ToUpperCase(name, &uname);
 
-  if (uname.compare("SNAPPY") == 0)
+  if (uname == "SNAPPY")
     return SNAPPY;
-  if (uname.compare("LZ4") == 0)
+  if (uname == "LZ4")
     return LZ4;
-  if (uname.compare("ZLIB") == 0)
+  if (uname == "ZLIB")
     return ZLIB;
-  if (uname.compare("NONE") == 0)
+  if (uname == "NONE")
     return NO_COMPRESSION;
 
   LOG(WARNING) << "Unable to recognize the compression codec '" << name

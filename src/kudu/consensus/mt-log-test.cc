@@ -15,20 +15,49 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/consensus/log-test-base.h"
-
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <thread>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/log-test-base.h"
+#include "kudu/consensus/log.h"
 #include "kudu/consensus/log_index.h"
+#include "kudu/consensus/log_reader.h"
+#include "kudu/consensus/log_util.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/consensus/ref_counted_replicate.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/countdown_latch.h"
+#include "kudu/util/fault_injection.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
+#include "kudu/util/status_callback.h"
+#include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
 DEFINE_int32(num_writer_threads, 4, "Number of threads writing to the log");
@@ -37,12 +66,18 @@ DEFINE_int32(num_batches_per_thread, 2000, "Number of batches per thread");
 DEFINE_int32(num_ops_per_batch_avg, 5, "Target average number of ops per batch");
 DEFINE_bool(verify_log, true, "Whether to verify the log by reading it after the writes complete");
 
+DECLARE_int32(log_thread_idle_threshold_ms);
+DECLARE_int32(log_inject_thread_lifecycle_latency_ms);
+
 namespace kudu {
 namespace log {
 
 using std::shared_ptr;
 using std::vector;
+using consensus::OpId;
 using consensus::ReplicateRefPtr;
+using consensus::ReplicateMsg;
+using consensus::WRITE_OP;
 using consensus::make_scoped_refptr_replicate;
 
 namespace {
@@ -124,6 +159,7 @@ class MultiThreadedLogTest : public LogTestBase {
         AssignIndexes(&batch_replicates);
         ASSERT_OK(log_->AsyncAppendReplicates(batch_replicates, cb->AsStatusCallback()));
       }
+      MAYBE_INJECT_RANDOM_LATENCY(FLAGS_log_inject_thread_lifecycle_latency_ms);
     }
     latch.Wait();
     for (const Status& status : errors) {
@@ -147,11 +183,9 @@ class MultiThreadedLogTest : public LogTestBase {
     for (int i = 0; i < FLAGS_num_reader_threads; i++) {
       reader_threads.emplace_back([&]() {
           std::map<int64_t, int64_t> map;
-          OpId opid;
           while (!stop_reader) {
-            log_->GetLatestEntryOpId(&opid);
             log_->GetReplaySizeMap(&map);
-            IgnoreResult(log_->GetGCableDataSize(RetentionIndexes(FLAGS_num_batches_per_thread)));
+            log_->GetGCableDataSize(RetentionIndexes(FLAGS_num_batches_per_thread));
           }
         });
     }
@@ -167,6 +201,23 @@ class MultiThreadedLogTest : public LogTestBase {
       t.join();
     }
   }
+
+  void VerifyLog() {
+    shared_ptr<LogReader> reader;
+    ASSERT_OK(LogReader::Open(fs_manager_.get(), nullptr, kTestTablet, nullptr, &reader));
+    SegmentSequence segments;
+    ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
+
+    for (const SegmentSequence::value_type& entry : segments) {
+      ASSERT_OK(entry->ReadEntries(&entries_));
+    }
+    vector<uint32_t> ids;
+    EntriesToIdList(&ids);
+    DVLOG(1) << "Wrote total of " << current_index_ - kStartIndex << " ops";
+    ASSERT_EQ(current_index_ - kStartIndex, ids.size());
+    ASSERT_TRUE(std::is_sorted(ids.begin(), ids.end()));
+  }
+
  private:
   ThreadSafeRandom random_;
   simple_spinlock lock_;
@@ -181,7 +232,6 @@ TEST_F(MultiThreadedLogTest, TestAppends) {
   }
 
   ASSERT_OK(BuildLog());
-  int start_current_id = current_index_;
   LOG_TIMING(INFO, strings::Substitute("inserting $0 batches($1 threads, $2 per-thread)",
                                        FLAGS_num_writer_threads * FLAGS_num_batches_per_thread,
                                        FLAGS_num_writer_threads,
@@ -190,20 +240,22 @@ TEST_F(MultiThreadedLogTest, TestAppends) {
   }
   ASSERT_OK(log_->Close());
   if (FLAGS_verify_log) {
-    shared_ptr<LogReader> reader;
-    ASSERT_OK(LogReader::Open(fs_manager_.get(), nullptr, kTestTablet, nullptr, &reader));
-    SegmentSequence segments;
-    ASSERT_OK(reader->GetSegmentsSnapshot(&segments));
-
-    for (const SegmentSequence::value_type& entry : segments) {
-      ASSERT_OK(entry->ReadEntries(&entries_));
-    }
-    vector<uint32_t> ids;
-    EntriesToIdList(&ids);
-    DVLOG(1) << "Wrote total of " << current_index_ - start_current_id << " ops";
-    ASSERT_EQ(current_index_ - start_current_id, ids.size());
-    ASSERT_TRUE(std::is_sorted(ids.begin(), ids.end()));
+    ASSERT_NO_FATAL_FAILURE(VerifyLog());
   }
+}
+
+// The lifecycle of the appender task starting and stopping is a bit complicated
+// (see Log::AppendThread::GoIdle for details). This injects some latency in key
+// points of that lifecycle to ensure that the different potential interleavings
+// are triggered. It also injects latency into the writes done by the tests, so
+// that sometimes writes are spaced out enough to allow the thread to go idle.
+TEST_F(MultiThreadedLogTest, TestAppendThreadStartStopRaces) {
+  FLAGS_log_thread_idle_threshold_ms = 1;
+  FLAGS_log_inject_thread_lifecycle_latency_ms = 2;
+  ASSERT_OK(BuildLog());
+  LogWriterThread(1);
+  ASSERT_OK(log_->Close());
+  ASSERT_NO_FATAL_FAILURE(VerifyLog());
 }
 
 } // namespace log

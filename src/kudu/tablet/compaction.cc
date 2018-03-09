@@ -17,38 +17,64 @@
 
 #include "kudu/tablet/compaction.h"
 
+#include <algorithm>
+#include <cstdint>
 #include <deque>
-#include <glog/logging.h>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <vector>
 
-#include "kudu/common/wire_protocol.h"
+#include <glog/logging.h>
+
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/common/generic_iterators.h"
+#include "kudu/common/iterator.h"
+#include "kudu/common/row.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowid.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/gutil/casts.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/server/hybrid_clock.h"
 #include "kudu/tablet/cfile_set.h"
 #include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/delta_tracker.h"
 #include "kudu/tablet/diskrowset.h"
+#include "kudu/tablet/memrowset.h"
+#include "kudu/tablet/mutation.h"
+#include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/tablet.pb.h"
-#include "kudu/tablet/transactions/write_transaction.h"
 #include "kudu/util/debug/trace_event.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/memory/arena.h"
 
-using kudu::server::HybridClock;
+using kudu::clock::HybridClock;
+using std::deque;
 using std::shared_ptr;
+using std::string;
 using std::unique_ptr;
 using std::unordered_set;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 namespace tablet {
 
 namespace {
+
+// The maximum number of rows we will output at a time during
+// compaction.
+const int kCompactionOutputBlockNumRows = 100;
 
 // Advances to the last mutation in a mutation list.
 void AdvanceToLastInList(const Mutation** m) {
@@ -66,7 +92,7 @@ class MemRowSetCompactionInput : public CompactionInput {
                            const MvccSnapshot& snap,
                            const Schema* projection)
     : iter_(memrowset.NewIterator(projection, snap)),
-      arena_(32*1024, 128*1024),
+      arena_(32*1024),
       has_more_blocks_(false) {
   }
 
@@ -173,7 +199,7 @@ class DiskRowSetCompactionInput : public CompactionInput {
       : base_iter_(std::move(base_iter)),
         redo_delta_iter_(std::move(redo_delta_iter)),
         undo_delta_iter_(std::move(undo_delta_iter)),
-        arena_(32 * 1024, 128 * 1024),
+        arena_(32 * 1024),
         block_(base_iter_->schema(), kRowsPerBlock, &arena_),
         redo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)),
         undo_mutation_block_(kRowsPerBlock, static_cast<Mutation *>(nullptr)),
@@ -451,17 +477,23 @@ class MergeCompactionInput : public CompactionInput {
         if (smallest_idx < 0) {
           smallest_idx = i;
           smallest = state->next();
+          DVLOG(4) << "Set (initial) smallest from state: " << i << " smallest: "
+                   << CompactionInputRowToString(*smallest);
           continue;
         }
         int row_comp = schema_->Compare(state->next()->row, smallest->row);
         if (row_comp < 0) {
           smallest_idx = i;
           smallest = state->next();
+          DVLOG(4) << "Set (by comp) smallest from state: " << i << " smallest: "
+                   << CompactionInputRowToString(*smallest);
           continue;
         }
         // If we found two rows with the same key, we want to make the newer one point to the older
         // one, which must be a ghost.
         if (PREDICT_FALSE(row_comp == 0)) {
+          DVLOG(4) << "Duplicate row.\nLeft: " << CompactionInputRowToString(*state->next())
+                   << "\nRight: " << CompactionInputRowToString(*smallest);
           int mutation_comp = CompareDuplicatedRows(*state->next(), *smallest);
           CHECK_NE(mutation_comp, 0);
           if (mutation_comp > 0) {
@@ -472,11 +504,15 @@ class MergeCompactionInput : public CompactionInput {
             states_[smallest_idx]->pop_front();
             smallest_idx = i;
             smallest = state->next();
+            DVLOG(4) << "Set smallest to right duplicate: "
+                     << CompactionInputRowToString(*smallest);
             continue;
           }
           // .. otherwise copy and pop the other one.
           RETURN_NOT_OK(SetPreviousGhost(smallest, state->next(), true /* clone */,
                                          smallest->row.row_block()->arena()));
+          DVLOG(4) << "Updated left duplicate smallest: "
+                   << CompactionInputRowToString(*smallest);
           states_[i]->pop_front();
           continue;
         }
@@ -484,6 +520,7 @@ class MergeCompactionInput : public CompactionInput {
       DCHECK_GE(smallest_idx, 0);
 
       states_[smallest_idx]->pop_front();
+      DVLOG(4) << "Pushing smallest to block: " << CompactionInputRowToString(*smallest);
       block->push_back(*smallest);
     }
 
@@ -878,7 +915,7 @@ void RowSetsInCompaction::DumpToLog() const {
   // Dump the selected rowsets to the log, and collect corresponding iterators.
   for (const shared_ptr<RowSet> &rs : rowsets_) {
     LOG(INFO) << rs->ToString() << "(current size on disk: ~"
-              << rs->EstimateOnDiskSize() << " bytes)";
+              << rs->OnDiskSize() << " bytes)";
   }
 }
 
@@ -1057,7 +1094,7 @@ Status FlushCompactionInput(CompactionInput* input,
 
   DCHECK(out->schema().has_column_ids());
 
-  RowBlock block(out->schema(), 100, nullptr);
+  RowBlock block(out->schema(), kCompactionOutputBlockNumRows, nullptr);
 
   while (input->HasMoreBlocks()) {
     RETURN_NOT_OK(input->PrepareBlock(&rows));
@@ -1131,6 +1168,7 @@ Status FlushCompactionInput(CompactionInput* input,
     if (n > 0) {
       block.Resize(n);
       RETURN_NOT_OK(out->AppendBlock(block));
+      block.Resize(block.row_capacity());
     }
 
     RETURN_NOT_OK(input->FinishBlock());
@@ -1150,10 +1188,10 @@ Status ReupdateMissedDeltas(const string &tablet_name,
   VLOG(1) << "Reupdating missed deltas between snapshot " <<
     snap_to_exclude.ToString() << " and " << snap_to_include.ToString();
 
-  // Collect the delta trackers that we'll push the updates into.
-  deque<DeltaTracker *> delta_trackers;
+  // Collect the disk rowsets that we'll push the updates into.
+  deque<DiskRowSet *> diskrowsets;
   for (const shared_ptr<RowSet> &rs : output_rowsets) {
-    delta_trackers.push_back(down_cast<DiskRowSet *>(rs.get())->delta_tracker());
+    diskrowsets.push_back(down_cast<DiskRowSet *>(rs.get()));
   }
 
   // The set of updated delta trackers.
@@ -1173,7 +1211,7 @@ Status ReupdateMissedDeltas(const string &tablet_name,
   const Schema key_schema(input->schema().CreateKeyProjection());
 
   // Arena and projector to store/project row keys for missed delta updates
-  Arena arena(1024, 1024*1024);
+  Arena arena(1024);
   RowProjector key_projector(schema, &key_schema);
   RETURN_NOT_OK(key_projector.Init());
   faststring buf;
@@ -1200,6 +1238,7 @@ Status ReupdateMissedDeltas(const string &tablet_name,
           // But was this row GCed at flush time?
           if (decoder.is_delete() &&
               history_gc_opts.IsAncientHistory(mut->timestamp())) {
+            DVLOG(3) << "Marking for garbage collection row: " << schema->DebugRow(row.row);
             is_garbage_collected = true;
           }
           continue;
@@ -1246,25 +1285,30 @@ Status ReupdateMissedDeltas(const string &tablet_name,
         DVLOG(3) << "Flushing missed delta for row " << output_row_offset
                  << " @" << mut->timestamp() << ": " << mut->changelist().ToString(*schema);
 
-        DeltaTracker *cur_tracker = delta_trackers.front();
+        rowid_t num_rows;
+        DiskRowSet* cur_drs = diskrowsets.front();
+        RETURN_NOT_OK(cur_drs->CountRows(&num_rows));
 
         // The index on the input side isn't necessarily the index on the output side:
         // we may have output several small DiskRowSets, so we need to find the index
         // relative to the current one.
         int64_t idx_in_delta_tracker = output_row_offset - delta_tracker_base_row;
-        while (idx_in_delta_tracker >= cur_tracker->num_rows()) {
+        while (idx_in_delta_tracker >= num_rows) {
           // If the current index is higher than the total number of rows in the current
           // DeltaTracker, that means we're now processing the next one in the list.
           // Pop the current front tracker, and make the indexes relative to the next
           // in the list.
-          delta_tracker_base_row += cur_tracker->num_rows();
-          idx_in_delta_tracker -= cur_tracker->num_rows();
+          delta_tracker_base_row += num_rows;
+          idx_in_delta_tracker -= num_rows;
           DCHECK_GE(idx_in_delta_tracker, 0);
-          delta_trackers.pop_front();
-          cur_tracker = delta_trackers.front();
+          diskrowsets.pop_front();
+          cur_drs = diskrowsets.front();
+          RETURN_NOT_OK(cur_drs->CountRows(&num_rows));
         }
 
+        DeltaTracker* cur_tracker = cur_drs->delta_tracker();
         gscoped_ptr<OperationResultPB> result(new OperationResultPB);
+        DCHECK_LT(idx_in_delta_tracker, num_rows);
         Status s = cur_tracker->Update(mut->timestamp(),
                                        idx_in_delta_tracker,
                                        mut->changelist(),

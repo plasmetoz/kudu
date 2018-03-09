@@ -19,30 +19,43 @@
 
 #include <algorithm>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <type_traits>
 #include <vector>
 
-#include <boost/bind.hpp>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/cfile/block_cache.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/move.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
-#include "kudu/master/master_cert_authority.h"
-#include "kudu/master/master_service.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
-#include "kudu/master/master-path-handlers.h"
+#include "kudu/master/master_cert_authority.h"
+#include "kudu/master/master_path_handlers.h"
+#include "kudu/master/master_service.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/service_if.h"
-#include "kudu/rpc/service_pool.h"
 #include "kudu/security/token_signer.h"
-#include "kudu/security/token_signing_key.h"
 #include "kudu/server/rpc_server.h"
+#include "kudu/server/webserver.h"
 #include "kudu/tserver/tablet_copy_service.h"
 #include "kudu/tserver/tablet_service.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/maintenance_manager.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/status.h"
@@ -61,19 +74,18 @@ TAG_FLAG(tsk_rotation_seconds, experimental);
 
 DEFINE_int64(authn_token_validity_seconds, 60 * 60 * 24 * 7,
              "Period of time for which an issued authentication token is valid. "
-             "It's not possible to renew a token, hence the token validity "
-             "interval defines the longest possible lifetime of an external "
-             "job which uses a token for authentication.");
+             "Clients will automatically attempt to reacquire a token after the "
+             "validity period expires.");
 TAG_FLAG(authn_token_validity_seconds, experimental);
 
 using std::min;
 using std::shared_ptr;
+using std::string;
 using std::vector;
 
 using kudu::consensus::RaftPeerPB;
 using kudu::rpc::ServiceIf;
 using kudu::security::TokenSigner;
-using kudu::security::TokenSigningPrivateKey;
 using kudu::tserver::ConsensusServiceImpl;
 using kudu::tserver::TabletCopyServiceImpl;
 using strings::Substitute;
@@ -82,14 +94,14 @@ namespace kudu {
 namespace master {
 
 Master::Master(const MasterOptions& opts)
-  : ServerBase("Master", opts, "kudu.master"),
+  : KuduServer("Master", opts, "kudu.master"),
     state_(kStopped),
     ts_manager_(new TSManager()),
     catalog_manager_(new CatalogManager(this)),
     path_handlers_(new MasterPathHandlers(this)),
     opts_(opts),
     registration_initialized_(false),
-    maintenance_manager_(new MaintenanceManager(MaintenanceManager::DEFAULT_OPTIONS)) {
+    maintenance_manager_(new MaintenanceManager(MaintenanceManager::kDefaultOptions)) {
 }
 
 Master::~Master() {
@@ -110,7 +122,7 @@ Status Master::Init() {
 
   RETURN_NOT_OK(ThreadPoolBuilder("init").set_max_threads(1).Build(&init_pool_));
 
-  RETURN_NOT_OK(ServerBase::Init());
+  RETURN_NOT_OK(KuduServer::Init());
 
   if (web_server_) {
     RETURN_NOT_OK(path_handlers_->Register(web_server_.get()));
@@ -148,10 +160,10 @@ Status Master::StartAsync() {
   gscoped_ptr<ServiceIf> tablet_copy_service(new TabletCopyServiceImpl(
       this, catalog_manager_.get()));
 
-  RETURN_NOT_OK(ServerBase::RegisterService(std::move(impl)));
-  RETURN_NOT_OK(ServerBase::RegisterService(std::move(consensus_service)));
-  RETURN_NOT_OK(ServerBase::RegisterService(std::move(tablet_copy_service)));
-  RETURN_NOT_OK(ServerBase::Start());
+  RETURN_NOT_OK(RegisterService(std::move(impl)));
+  RETURN_NOT_OK(RegisterService(std::move(consensus_service)));
+  RETURN_NOT_OK(RegisterService(std::move(tablet_copy_service)));
+  RETURN_NOT_OK(KuduServer::Start());
 
   // Now that we've bound, construct our ServerRegistrationPB.
   RETURN_NOT_OK(InitMasterRegistration());
@@ -168,7 +180,7 @@ Status Master::StartAsync() {
 void Master::InitCatalogManagerTask() {
   Status s = InitCatalogManager();
   if (!s.ok()) {
-    LOG(ERROR) << ToString() << ": Unable to init master catalog manager: " << s.ToString();
+    LOG(ERROR) << "Unable to init master catalog manager: " << s.ToString();
   }
   init_status_.Set(s);
 }
@@ -211,9 +223,16 @@ void Master::Shutdown() {
   if (state_ == kRunning) {
     string name = ToString();
     LOG(INFO) << name << " shutting down...";
+
+    // 1. Stop accepting new RPCs.
+    UnregisterAllServices();
+
+    // 2. Shut down the master's subsystems.
     maintenance_manager_->Shutdown();
-    ServerBase::Shutdown();
     catalog_manager_->Shutdown();
+
+    // 3. Shut down generic subsystems.
+    KuduServer::Shutdown();
     LOG(INFO) << name << " shutdown complete.";
   }
   state_ = kStopped;
@@ -232,17 +251,17 @@ Status Master::InitMasterRegistration() {
 
   ServerRegistrationPB reg;
   vector<Sockaddr> rpc_addrs;
-  RETURN_NOT_OK_PREPEND(rpc_server()->GetBoundAddresses(&rpc_addrs),
+  RETURN_NOT_OK_PREPEND(rpc_server()->GetAdvertisedAddresses(&rpc_addrs),
                         "Couldn't get RPC addresses");
   RETURN_NOT_OK(AddHostPortPBs(rpc_addrs, reg.mutable_rpc_addresses()));
 
   if (web_server()) {
     vector<Sockaddr> http_addrs;
-    web_server()->GetBoundAddresses(&http_addrs);
+    RETURN_NOT_OK(web_server()->GetAdvertisedAddresses(&http_addrs));
     RETURN_NOT_OK(AddHostPortPBs(http_addrs, reg.mutable_http_addresses()));
     reg.set_https_enabled(web_server()->IsSecure());
   }
-  reg.set_software_version(VersionInfo::GetShortVersionString());
+  reg.set_software_version(VersionInfo::GetVersionInfo());
 
   registration_.Swap(&reg);
   registration_initialized_.store(true);
@@ -260,7 +279,7 @@ Status GetMasterEntryForHost(const shared_ptr<rpc::Messenger>& messenger,
                              ServerEntryPB* e) {
   Sockaddr sockaddr;
   RETURN_NOT_OK(SockaddrFromHostPort(hostport, &sockaddr));
-  MasterServiceProxy proxy(messenger, sockaddr);
+  MasterServiceProxy proxy(messenger, sockaddr, hostport.host());
   GetMasterRegistrationRequestPB req;
   GetMasterRegistrationResponsePB resp;
   rpc::RpcController controller;
@@ -283,23 +302,65 @@ Status Master::ListMasters(std::vector<ServerEntryPB>* masters) const {
     local_entry.mutable_instance_id()->CopyFrom(catalog_manager_->NodeInstance());
     RETURN_NOT_OK(GetMasterRegistration(local_entry.mutable_registration()));
     local_entry.set_role(RaftPeerPB::LEADER);
-    masters->push_back(local_entry);
+    masters->emplace_back(std::move(local_entry));
     return Status::OK();
   }
 
-  for (const HostPort& peer_addr : opts_.master_addresses) {
+  auto consensus = catalog_manager_->master_consensus();
+  if (!consensus) {
+    return Status::IllegalState("consensus not running");
+  }
+  const auto config = consensus->CommittedConfig();
+
+  masters->clear();
+  for (const auto& peer : config.peers()) {
     ServerEntryPB peer_entry;
-    Status s = GetMasterEntryForHost(messenger_, peer_addr, &peer_entry);
+    HostPort hp;
+    Status s = HostPortFromPB(peer.last_known_addr(), &hp).AndThen([&] {
+      return GetMasterEntryForHost(messenger_, hp, &peer_entry);
+    });
     if (!s.ok()) {
       s = s.CloneAndPrepend(
-          Substitute("Unable to get registration information for peer ($0)",
-                     peer_addr.ToString()));
+          Substitute("Unable to get registration information for peer $0 ($1)",
+                     peer.permanent_uuid(),
+                     hp.ToString()));
       LOG(WARNING) << s.ToString();
       StatusToPB(s, peer_entry.mutable_error());
+    } else if (peer_entry.instance_id().permanent_uuid() != peer.permanent_uuid()) {
+      StatusToPB(Status::IllegalState(
+          Substitute("mismatched UUIDs: expected UUID $0 from master at $1, but got UUID $2",
+                     peer.permanent_uuid(),
+                     hp.ToString(),
+                     peer_entry.instance_id().permanent_uuid())),
+                 peer_entry.mutable_error());
     }
-    masters->push_back(peer_entry);
+    masters->emplace_back(std::move(peer_entry));
+  }
+  return Status::OK();
+}
+
+Status Master::GetMasterHostPorts(std::vector<HostPortPB>* hostports) const {
+  auto consensus = catalog_manager_->master_consensus();
+  if (!consensus) {
+    return Status::IllegalState("consensus not running");
   }
 
+  hostports->clear();
+  consensus::RaftConfigPB config = consensus->CommittedConfig();
+  for (auto& peer : *config.mutable_peers()) {
+    if (peer.member_type() == consensus::RaftPeerPB::VOTER) {
+      // In non-distributed master configurations, we don't store our own
+      // last known address in the Raft config. So, we'll fill it in from
+      // the server Registration instead.
+      if (!peer.has_last_known_addr()) {
+        DCHECK_EQ(config.peers_size(), 1);
+        DCHECK(registration_initialized_.load());
+        hostports->emplace_back(registration_.rpc_addresses(0));
+      } else {
+        hostports->emplace_back(std::move(*peer.mutable_last_known_addr()));
+      }
+    }
+  }
   return Status::OK();
 }
 

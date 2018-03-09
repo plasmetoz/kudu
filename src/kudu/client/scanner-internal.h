@@ -17,23 +17,50 @@
 #ifndef KUDU_CLIENT_SCANNER_INTERNAL_H
 #define KUDU_CLIENT_SCANNER_INTERNAL_H
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ostream>
 #include <set>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "kudu/client/client.h"
 #include "kudu/client/resource_metrics.h"
 #include "kudu/client/row_result.h"
+#include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_configuration.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/schema.h"
 #include "kudu/common/partition_pruner.h"
 #include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/tserver/tserver_service.proxy.h"
-#include "kudu/util/auto_release_pool.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
+class MonoTime;
+
+namespace tserver {
+class TabletServerServiceProxy;
+}
+
 namespace client {
+
+namespace internal {
+class RemoteTablet;
+class RemoteTabletServer;
+} // namespace internal
 
 // The result of KuduScanner::Data::AnalyzeResponse.
 //
@@ -46,8 +73,12 @@ struct ScanRpcStatus {
     // The request was malformed (e.g. bad schema, etc).
     INVALID_REQUEST,
 
-    // The server was busy (e.g. RPC queue overflow).
-    SERVER_BUSY,
+    // The server received the request but it was not ready to serve it right
+    // away. It might happen that the server was too busy and did not have
+    // necessary resources or information to serve the request but it
+    // anticipates it should be ready to serve the request really soon, so it's
+    // worth retrying the request at a later time.
+    SERVICE_UNAVAILABLE,
 
     // The deadline for the whole batch was exceeded.
     OVERALL_DEADLINE_EXCEEDED,
@@ -55,6 +86,10 @@ struct ScanRpcStatus {
     // The deadline for an individual RPC was exceeded, but we have more time left to try
     // on other hosts.
     RPC_DEADLINE_EXCEEDED,
+
+    // The authentication token supplied by the client is invalid. Most likely,
+    // the token has expired.
+    RPC_INVALID_AUTHENTICATION_TOKEN,
 
     // Another RPC-system error (e.g. NetworkError because the TS was down).
     RPC_ERROR,
@@ -256,6 +291,7 @@ class KuduScanBatch::Data {
   Status Reset(rpc::RpcController* controller,
                const Schema* projection,
                const KuduSchema* client_projection,
+               uint64_t row_format_flags,
                gscoped_ptr<RowwiseRowBlockPB> resp_data);
 
   int num_rows() const {
@@ -263,13 +299,16 @@ class KuduScanBatch::Data {
   }
 
   KuduRowResult row(int idx) {
+    DCHECK_EQ(row_format_flags_, KuduScanner::NO_FLAGS)
+        << "Cannot decode individual rows. Row format flags were set: "
+        << row_format_flags_;
     DCHECK_GE(idx, 0);
     DCHECK_LT(idx, num_rows());
     int offset = idx * projected_row_size_;
     return KuduRowResult(projection_, &direct_data_[offset]);
   }
 
-  void ExtractRows(vector<KuduScanBatch::RowPtr>* rows);
+  void ExtractRows(std::vector<KuduScanBatch::RowPtr>* rows);
 
   void Clear();
 
@@ -292,6 +331,10 @@ class KuduScanBatch::Data {
   const Schema* projection_;
   // The KuduSchema version of 'projection_'
   const KuduSchema* client_projection_;
+
+  // The row format flags that were passed to the KuduScanner.
+  // See: KuduScanner::SetRowFormatFlags()
+  uint64_t row_format_flags_;
 
   // The number of bytes of direct data for each row.
   size_t projected_row_size_;

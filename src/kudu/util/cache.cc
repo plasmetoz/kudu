@@ -2,29 +2,38 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <cstdlib>
+#include <cstdint>
+#include <cstring>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
 #include <vector>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
+#include "kudu/gutil/atomicops.h"
 #include "kudu/gutil/atomic_refcount.h"
+#include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/bits.h"
 #include "kudu/gutil/hash/city.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/sysinfo.h"
 #include "kudu/util/alignment.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/cache_metrics.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/test_util_prod.h"
 
 #if !defined(__APPLE__)
 #include "kudu/util/nvm_cache.h"
@@ -35,17 +44,16 @@ DEFINE_bool(cache_force_single_shard, false,
             "Override all cache implementations to use just one shard");
 TAG_FLAG(cache_force_single_shard, hidden);
 
-namespace kudu {
+using std::shared_ptr;
+using std::string;
+using std::vector;
 
-class MetricEntity;
+namespace kudu {
 
 Cache::~Cache() {
 }
 
 namespace {
-
-using std::shared_ptr;
-using std::vector;
 
 typedef simple_spinlock MutexType;
 
@@ -392,11 +400,13 @@ class ShardedLRUCache : public Cache {
   shared_ptr<MemTracker> mem_tracker_;
   gscoped_ptr<CacheMetrics> metrics_;
   vector<LRUCache*> shards_;
-  MutexType id_mutex_;
-  uint64_t last_id_;
 
   // Number of bits of hash used to determine the shard.
   const int shard_bits_;
+
+  // Protects 'metrics_'. Used only when metrics are set, to ensure
+  // that they are set only once in test environments.
+  MutexType metrics_lock_;
 
   static inline uint32_t HashSlice(const Slice& s) {
     return util_hash::CityHash64(
@@ -411,8 +421,7 @@ class ShardedLRUCache : public Cache {
 
  public:
   explicit ShardedLRUCache(size_t capacity, const string& id)
-      : last_id_(0),
-        shard_bits_(DetermineShardBits()) {
+      : shard_bits_(DetermineShardBits()) {
     // A cache is often a singleton, so:
     // 1. We reuse its MemTracker if one already exists, and
     // 2. It is directly parented to the root MemTracker.
@@ -452,12 +461,16 @@ class ShardedLRUCache : public Cache {
   virtual Slice Value(Handle* handle) OVERRIDE {
     return reinterpret_cast<LRUHandle*>(handle)->value();
   }
-  virtual uint64_t NewId() OVERRIDE {
-    std::lock_guard<MutexType> l(id_mutex_);
-    return ++(last_id_);
-  }
-
   virtual void SetMetrics(const scoped_refptr<MetricEntity>& entity) OVERRIDE {
+    // TODO(KUDU-2165): reuse of the Cache singleton across multiple MiniCluster servers
+    // causes TSAN errors. So, we'll ensure that metrics only get attached once, from
+    // whichever server starts first. This has the downside that, in test builds, we won't
+    // get accurate cache metrics, but that's probably better than spurious failures.
+    std::lock_guard<simple_spinlock> l(metrics_lock_);
+    if (metrics_) {
+      CHECK(IsGTest()) << "Metrics should only be set once per Cache singleton";
+      return;
+    }
     metrics_.reset(new CacheMetrics(entity));
     for (LRUCache* cache : shards_) {
       cache->SetMetrics(metrics_.get());

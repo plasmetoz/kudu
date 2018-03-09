@@ -17,43 +17,63 @@
 #ifndef KUDU_MASTER_SYS_CATALOG_H_
 #define KUDU_MASTER_SYS_CATALOG_H_
 
+#include <cstdint>
 #include <functional>
 #include <set>
 #include <string>
 #include <vector>
 
+#include <gtest/gtest_prod.h>
+
+#include "kudu/common/schema.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/master/master.pb.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/gutil/callback.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/master/catalog_manager.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
-class Schema;
 class FsManager;
+class MetricRegistry;
+class RowBlockRow;
+
+namespace consensus {
+class ConsensusMetadataManager;
+}
+
+namespace tablet {
+class TabletMetadata;
+}
 
 namespace tserver {
 class WriteRequestPB;
 class WriteResponsePB;
-}
+} // namespace tserver
 
 namespace master {
 
 class Master;
-class TableInfo;
-class TabletInfo;
+class SysCertAuthorityEntryPB;
+class SysTablesEntryPB;
+class SysTabletsEntryPB;
+class SysTskEntryPB;
 struct MasterOptions;
 
 // The SysCatalogTable has two separate visitors because the tables
 // data must be loaded into memory before the tablets data.
 class TableVisitor {
  public:
+  virtual ~TableVisitor() = default;
   virtual Status VisitTable(const std::string& table_id,
                             const SysTablesEntryPB& metadata) = 0;
 };
 
 class TabletVisitor {
  public:
+  virtual ~TabletVisitor() = default;
   virtual Status VisitTablet(const std::string& table_id,
                              const std::string& tablet_id,
                              const SysTabletsEntryPB& metadata) = 0;
@@ -65,6 +85,7 @@ class TabletVisitor {
 // by current or former master leader.
 class TskEntryVisitor {
  public:
+  virtual ~TskEntryVisitor() = default;
   virtual Status Visit(const std::string& entry_id,
                        const SysTskEntryPB& metadata) = 0;
 };
@@ -108,30 +129,29 @@ class SysCatalogTable {
   // the consensus configuration's progress, any long running tasks (e.g., scanning
   // tablets) should be performed asynchronously (by, e.g., submitting
   // them to a to a separate threadpool).
-  SysCatalogTable(Master* master, MetricRegistry* metrics,
-                  ElectedLeaderCallback leader_cb);
+  SysCatalogTable(Master* master,  ElectedLeaderCallback leader_cb);
 
   ~SysCatalogTable();
 
-  // Allow for orderly shutdown of tablet peer, etc.
+  // Allow for orderly shutdown of TabletReplica, etc.
   void Shutdown();
 
-  // Load the Metadata from disk, and initialize the TabletPeer for the sys-table
+  // Load the Metadata from disk, and initialize the TabletReplica for the sys-table
   Status Load(FsManager *fs_manager);
 
-  // Create the new Metadata and initialize the TabletPeer for the sys-table.
+  // Create the new Metadata and initialize the TabletReplica for the sys-table.
   Status CreateNew(FsManager *fs_manager);
 
   // Perform a series of table/tablet actions in one WriteTransaction.
   struct Actions {
-    Actions();
+    Actions() = default;
 
-    TableInfo* table_to_add;
-    TableInfo* table_to_update;
-    TableInfo* table_to_delete;
-    std::vector<TabletInfo*> tablets_to_add;
-    std::vector<TabletInfo*> tablets_to_update;
-    std::vector<TabletInfo*> tablets_to_delete;
+    scoped_refptr<TableInfo> table_to_add;
+    scoped_refptr<TableInfo> table_to_update;
+    scoped_refptr<TableInfo> table_to_delete;
+    std::vector<scoped_refptr<TabletInfo>> tablets_to_add;
+    std::vector<scoped_refptr<TabletInfo>> tablets_to_update;
+    std::vector<scoped_refptr<TabletInfo>> tablets_to_delete;
   };
   Status Write(const Actions& actions);
 
@@ -158,6 +178,13 @@ class SysCatalogTable {
   // (as in 'entry_id' column) from the system table.
   Status RemoveTskEntries(const std::set<std::string>& entry_ids);
 
+  // Return the underlying TabletReplica instance hosting the metadata.
+  // This should be used with caution -- typically the various methods
+  // above should be used rather than directly accessing the replica.
+  const scoped_refptr<tablet::TabletReplica>& tablet_replica() const {
+    return tablet_replica_;
+  }
+
  private:
   FRIEND_TEST(MasterTest, TestMasterMetadataConsistentDespiteFailures);
   DISALLOW_COPY_AND_ASSIGN(SysCatalogTable);
@@ -171,7 +198,7 @@ class SysCatalogTable {
   // NOTE: This is the "server-side" schema, so it must have the column IDs.
   Schema BuildTableSchema();
 
-  // Returns 'Status::OK()' if the WriteTranasction completed
+  // Returns 'Status::OK()' if the WriteTransaction completed
   Status SyncWrite(const tserver::WriteRequestPB *req, tserver::WriteResponsePB *resp);
 
   void SysCatalogStateChanged(const std::string& tablet_id, const std::string& reason);
@@ -183,12 +210,8 @@ class SysCatalogTable {
   Status CreateDistributedConfig(const MasterOptions& options,
                                  consensus::RaftConfigPB* committed_config);
 
-  const scoped_refptr<tablet::TabletPeer>& tablet_peer() const {
-    return tablet_peer_;
-  }
-
   std::string tablet_id() const {
-    return tablet_peer_->tablet_id();
+    return tablet_replica_->tablet_id();
   }
 
   // Conventional "T xxx P xxxx..." prefix for logging.
@@ -212,44 +235,42 @@ class SysCatalogTable {
 
   // Tablet related private methods.
 
-  // Add dirty tablet data to the given row operations.
-  Status AddTabletsToPB(const std::vector<TabletInfo*>& tablets,
-                        RowOperationsPB::Type op_type,
-                        RowOperationsPB* ops) const;
-
   // Initializes the RaftPeerPB for the local peer.
   // Crashes due to an invariant check if the rpc server is not running.
   void InitLocalRaftPeerPB();
 
   // Add an operation to a write adding/updating/deleting a table or tablet.
-  void ReqAddTable(tserver::WriteRequestPB* req, const TableInfo* table);
-  void ReqUpdateTable(tserver::WriteRequestPB* req, const TableInfo* table);
-  void ReqDeleteTable(tserver::WriteRequestPB* req, const TableInfo* table);
+  void ReqAddTable(tserver::WriteRequestPB* req,
+                   const scoped_refptr<TableInfo>& table);
+  void ReqUpdateTable(tserver::WriteRequestPB* req,
+                      const scoped_refptr<TableInfo>& table);
+  void ReqDeleteTable(tserver::WriteRequestPB* req,
+                      const scoped_refptr<TableInfo>& table);
   void ReqAddTablets(tserver::WriteRequestPB* req,
-                     const std::vector<TabletInfo*>& tablets);
+                     const std::vector<scoped_refptr<TabletInfo>>& tablets);
   void ReqUpdateTablets(tserver::WriteRequestPB* req,
-                        const std::vector<TabletInfo*>& tablets);
+                        const std::vector<scoped_refptr<TabletInfo>>& tablets);
   void ReqDeleteTablets(tserver::WriteRequestPB* req,
-                        const std::vector<TabletInfo*>& tablets);
+                        const std::vector<scoped_refptr<TabletInfo>>& tablets);
 
-  static string TskSeqNumberToEntryId(int64_t seq_number);
+  static std::string TskSeqNumberToEntryId(int64_t seq_number);
 
   // Special string injected into SyncWrite() random failures (if enabled).
   //
   // Only useful for tests.
   static const char* const kInjectedFailureStatusMsg;
 
-  // Table schema, without IDs, used to send messages to the TabletPeer
+  // Table schema, without IDs, used to send messages to the TabletReplica
   Schema schema_;
   Schema key_schema_;
 
   MetricRegistry* metric_registry_;
 
-  gscoped_ptr<ThreadPool> apply_pool_;
-
-  scoped_refptr<tablet::TabletPeer> tablet_peer_;
+  scoped_refptr<tablet::TabletReplica> tablet_replica_;
 
   Master* master_;
+
+  const scoped_refptr<consensus::ConsensusMetadataManager> cmeta_manager_;
 
   ElectedLeaderCallback leader_cb_;
 

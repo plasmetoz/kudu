@@ -20,8 +20,9 @@
 #include <memory>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
-#include <boost/bind.hpp>
+#include <boost/bind.hpp> // IWYU pragma: keep
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/numbers.h"
@@ -29,6 +30,8 @@
 #include "kudu/rpc/rpc_introspection.pb.h"
 #include "kudu/rpc/rpcz_store.h"
 #include "kudu/server/webserver.h"
+#include "kudu/util/jsonwriter.h"
+#include "kudu/util/web_callback_registry.h"
 
 using kudu::rpc::DumpRunningRpcsRequestPB;
 using kudu::rpc::DumpRunningRpcsResponsePB;
@@ -37,13 +40,15 @@ using kudu::rpc::DumpRpczStoreResponsePB;
 using kudu::rpc::Messenger;
 using std::ostringstream;
 using std::shared_ptr;
+using std::string;
 
 namespace kudu {
 
 namespace {
 
 void RpczPathHandler(const shared_ptr<Messenger>& messenger,
-                     const Webserver::WebRequest& req, ostringstream* output) {
+                     const Webserver::WebRequest& req,
+                     Webserver::PrerenderedWebResponse* resp) {
   DumpRunningRpcsResponsePB running_rpcs;
   {
     DumpRunningRpcsRequestPB dump_req;
@@ -59,7 +64,7 @@ void RpczPathHandler(const shared_ptr<Messenger>& messenger,
     messenger->rpcz_store()->DumpPB(dump_req, &sampled_rpcs);
   }
 
-  JsonWriter writer(output, JsonWriter::PRETTY);
+  JsonWriter writer(resp->output, JsonWriter::PRETTY);
   writer.StartObject();
   writer.String("running");
   writer.Protobuf(running_rpcs);
@@ -72,9 +77,9 @@ void RpczPathHandler(const shared_ptr<Messenger>& messenger,
 } // anonymous namespace
 
 void AddRpczPathHandlers(const shared_ptr<Messenger>& messenger, Webserver* webserver) {
-  webserver->RegisterPathHandler("/rpcz", "RPCs",
-                                 boost::bind(RpczPathHandler, messenger, _1, _2),
-                                 false, true);
+  webserver->RegisterPrerenderedPathHandler("/rpcz", "RPCs",
+                                            boost::bind(RpczPathHandler, messenger, _1, _2),
+                                            false, true);
 }
 
 } // namespace kudu

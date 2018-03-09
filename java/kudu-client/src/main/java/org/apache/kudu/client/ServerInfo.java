@@ -18,10 +18,13 @@
 package org.apache.kudu.client;
 
 import java.net.InetAddress;
+import java.net.UnknownHostException;
+import java.util.concurrent.ConcurrentHashMap;
 
+import com.google.common.base.Preconditions;
 import com.google.common.net.HostAndPort;
+import org.apache.yetus.audience.InterfaceAudience;
 
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.util.NetUtil;
 
 /**
@@ -33,6 +36,8 @@ public class ServerInfo {
   private final HostAndPort hostPort;
   private final InetAddress resolvedAddr;
   private final boolean local;
+  private static final ConcurrentHashMap<InetAddress, Boolean> isLocalAddressCache =
+      new ConcurrentHashMap<>();
 
   /**
    * Constructor for all the fields. The intent is that there should only be one ServerInfo
@@ -42,10 +47,16 @@ public class ServerInfo {
    * @param resolvedAddr resolved address used to check if the server is local
    */
   public ServerInfo(String uuid, HostAndPort hostPort, InetAddress resolvedAddr) {
+    Preconditions.checkNotNull(uuid);
     this.uuid = uuid;
     this.hostPort = hostPort;
     this.resolvedAddr = resolvedAddr;
-    this.local = NetUtil.isLocalAddress(resolvedAddr);
+    Boolean isLocal = isLocalAddressCache.get(resolvedAddr);
+    if (isLocal == null) {
+      isLocal = NetUtil.isLocalAddress(resolvedAddr);
+      isLocalAddressCache.put(resolvedAddr, isLocal);
+    }
+    this.local = isLocal;
   }
 
   /**
@@ -57,12 +68,15 @@ public class ServerInfo {
   }
 
   /**
-   * Returns this server's hostname. We might get many hostnames from the master for a single
-   * TS, and this is the one we picked to connect to originally.
-   * @return a string that contains this server's hostname
+   * Returns this server's canonical hostname.
+   * @return a string that contains this server's canonical hostname
    */
-  public String getHostname() {
-    return hostPort.getHostText();
+  public String getAndCanonicalizeHostname() {
+    try {
+      return InetAddress.getByName(hostPort.getHost()).getCanonicalHostName().toLowerCase();
+    } catch (UnknownHostException e) {
+      return hostPort.getHost();
+    }
   }
 
   /**

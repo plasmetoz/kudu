@@ -16,23 +16,49 @@
 // under the License.
 
 #include <algorithm>
+#include <cerrno>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <type_traits>
 #include <vector>
 
-#include <boost/bind.hpp>
-#include <boost/function.hpp>
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <glog/stl_logging.h>
+#include <gtest/gtest.h>
 
-#include "kudu/consensus/consensus-test-util.h"
+#include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/log-test-base.h"
+#include "kudu/consensus/log.h"
+#include "kudu/consensus/log.pb.h"
+#include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/log_index.h"
+#include "kudu/consensus/log_reader.h"
+#include "kudu/consensus/log_util.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/mvcc.h"
+#include "kudu/util/async_util.h"
+#include "kudu/util/compression/compression.pb.h"
+#include "kudu/util/env.h"
+#include "kudu/util/metrics.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
 DEFINE_int32(num_batches, 10000,
              "Number of batches to write to/read from the Log in TestWriteManyBatches");
@@ -51,7 +77,12 @@ using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using consensus::CommitMsg;
 using consensus::MakeOpId;
+using consensus::NO_OP;
+using consensus::OpId;
+using consensus::ReplicateMsg;
+using consensus::WRITE_OP;
 using strings::Substitute;
 
 struct TestLogSequenceElem {
@@ -148,8 +179,6 @@ class LogTestOptionalCompression : public LogTest,
   }
 };
 INSTANTIATE_TEST_CASE_P(Codecs, LogTestOptionalCompression, ::testing::Values(NO_COMPRESSION, LZ4));
-
-
 
 // If we write more than one entry in a batch, we should be able to
 // read all of those entries back.
@@ -481,6 +510,7 @@ TEST_F(LogTest, TestWriteAndReadToAndFromInProgressSegment) {
 
 // Tests that segments can be GC'd while the log is running.
 TEST_P(LogTestOptionalCompression, TestGCWithLogRunning) {
+  FLAGS_log_min_segments_to_retain = 2;
   ASSERT_OK(BuildLog());
 
   vector<LogAnchor*> anchors;
@@ -748,7 +778,7 @@ TEST_P(LogTestOptionalCompression, TestWriteManyBatches) {
 // seg003: 0.20 through 0.29
 // seg004: 0.30 through 0.39
 TEST_P(LogTestOptionalCompression, TestLogReader) {
-  LogReader reader(fs_manager_.get(),
+  LogReader reader(env_,
                    scoped_refptr<LogIndex>(),
                    kTestTablet,
                    nullptr);
@@ -1017,6 +1047,7 @@ TEST_P(LogTestOptionalCompression, TestReadReplicatesHighIndex) {
   ASSERT_OK(reader->ReadReplicatesInRange(first_log_index, first_log_index + kSequenceLength - 1,
                                           LogReader::kNoSizeLimit, &replicates));
   ASSERT_EQ(kSequenceLength, replicates.size());
+  ASSERT_GT(op_id.index(), std::numeric_limits<int32_t>::max());
 }
 
 // Test various situations where we expect different segments depending on what the
@@ -1094,6 +1125,72 @@ TEST_F(LogTest, TestDiskSpaceCheck) {
   // disk is past its quota if we write beyond the preallocation limit for a
   // single segment. If we did that, we could ensure that we check once we
   // detect that we are past the preallocation limit.
+}
+
+// Test that the append thread shuts itself down after it's idle.
+TEST_F(LogTest, TestAutoStopIdleAppendThread) {
+  ASSERT_OK(BuildLog());
+  OpId opid = MakeOpId(1, 1);
+
+  // Append something to the queue and ensure that the thread starts itself.
+  // We loop here in case for some reason this thread gets de-scheduled just
+  // after the append long enough for the append thread to shut itself down
+  // again.
+  ASSERT_EVENTUALLY([&]() {
+      AppendNoOpsToLogSync(clock_, log_.get(), &opid, 2);
+      ASSERT_TRUE(log_->append_thread_active_for_tests());
+    });
+  // After some time, the append thread should shut itself down.
+  ASSERT_EVENTUALLY([&]() {
+      ASSERT_FALSE(log_->append_thread_active_for_tests());
+    });
+}
+
+// Test that Log::TotalSize() captures creation, addition, and deletion of log segments.
+TEST_P(LogTestOptionalCompression, TestTotalSize) {
+  // Build a log. There is an active segment, so on-disk size should be positive.
+  ASSERT_OK(BuildLog());
+  int64_t one_segment_size = log_->OnDiskSize();
+  ASSERT_GT(one_segment_size, 0);
+
+  // Append entries and roll over to new segments.
+  vector<LogAnchor*> anchors;
+  ElementDeleter deleter(&anchors);
+  SegmentSequence segments;
+  const int kNumTotalSegments = 3;
+  const int kNumOpsPerSegment = 2;
+
+  OpId op_id = MakeOpId(1, 1);
+  ASSERT_OK(AppendMultiSegmentSequence(kNumTotalSegments, kNumOpsPerSegment,
+                                       &op_id, &anchors));
+  ASSERT_EQ(3, anchors.size());
+
+  // Now that there's multiple segments, the total size should be larger than
+  // the one-segment size.
+  int64_t three_segment_size = log_->OnDiskSize();
+  ASSERT_GT(three_segment_size, one_segment_size);
+
+  // Free an anchor so we can GC the segment it points to.
+  RetentionIndexes retention;
+  ASSERT_OK(log_anchor_registry_->Unregister(anchors[0]));
+  ASSERT_OK(log_anchor_registry_->GetEarliestRegisteredLogIndex(&retention.for_durability));
+  int num_gced_segments;
+  ASSERT_OK(log_->GC(retention, &num_gced_segments));
+  ASSERT_EQ(1, num_gced_segments) << DumpSegmentsToString(segments);
+  ASSERT_OK(log_->reader()->GetSegmentsSnapshot(&segments))
+  ASSERT_EQ(2, segments.size()) << DumpSegmentsToString(segments);
+
+  // Now we've added two segments and GC'd one, so the total size should be
+  // between the one-segment size and the three-segment size.
+  int64_t two_segment_size = log_->OnDiskSize();
+  ASSERT_LT(two_segment_size, three_segment_size);
+  ASSERT_GT(two_segment_size, one_segment_size);
+
+  // Cleanup: close the log and unregister the remaining registered anchors.
+  ASSERT_OK(log_->Close());
+  for (int i = 1; i < kNumTotalSegments; i++) {
+    ASSERT_OK(log_anchor_registry_->Unregister(anchors[i]));
+  }
 }
 
 } // namespace log

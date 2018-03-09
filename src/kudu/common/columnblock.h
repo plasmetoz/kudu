@@ -127,7 +127,7 @@ class ColumnBlock {
 class ColumnBlockCell {
  public:
   ColumnBlockCell(ColumnBlock block, size_t row_idx)
-      : block_(std::move(block)), row_idx_(row_idx) {}
+      : block_(block), row_idx_(row_idx) {}
 
   const TypeInfo* typeinfo() const { return block_.type_info(); }
   size_t size() const { return block_.type_info()->size(); }
@@ -217,7 +217,7 @@ class ScopedColumnBlock : public ColumnBlock {
                   new uint8_t[BitmapSize(n_rows)],
                   new cpp_type[n_rows],
                   n_rows,
-                  new Arena(1024, 1*1024*1024)),
+                  new Arena(1024)),
       null_bitmap_(null_bitmap()),
       data_(reinterpret_cast<cpp_type *>(data())),
       arena_(arena()) {

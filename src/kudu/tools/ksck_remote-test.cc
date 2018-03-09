@@ -15,21 +15,39 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
 #include <memory>
 #include <sstream>
+#include <string>
+#include <vector>
 
+#include <boost/core/ref.hpp>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/mini_cluster.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/master/mini_master.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/tools/data_gen_util.h"
+#include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_remote.h"
+#include "kudu/util/atomic.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/promise.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
 DECLARE_int32(heartbeat_interval_ms);
 
@@ -43,14 +61,11 @@ using client::KuduSession;
 using client::KuduTable;
 using client::KuduTableCreator;
 using client::sp::shared_ptr;
+using cluster::InternalMiniCluster;
+using cluster::InternalMiniClusterOptions;
 using std::string;
 using std::unique_ptr;
 using std::vector;
-using strings::Substitute;
-
-// Import this symbol from ksck.cc so we can introspect the
-// errors being written to stderr.
-extern std::ostream* g_err_stream;
 
 static const char *kTableName = "ksck-test-table";
 
@@ -62,11 +77,6 @@ class RemoteKsckTest : public KuduTest {
     b.AddColumn("key")->Type(KuduColumnSchema::INT32)->NotNull()->PrimaryKey();
     b.AddColumn("int_val")->Type(KuduColumnSchema::INT32)->NotNull();
     CHECK_OK(b.Build(&schema_));
-    g_err_stream = &err_stream_;
-  }
-
-  ~RemoteKsckTest() {
-    g_err_stream = NULL;
   }
 
   virtual void SetUp() OVERRIDE {
@@ -75,7 +85,7 @@ class RemoteKsckTest : public KuduTest {
     // Speed up testing, saves about 700ms per TEST_F.
     FLAGS_heartbeat_interval_ms = 10;
 
-    MiniClusterOptions opts;
+    InternalMiniClusterOptions opts;
 
     // Hard-coded ports for the masters. This is safe, as these tests run under
     // a resource lock (see CMakeLists.txt in this directory).
@@ -84,7 +94,7 @@ class RemoteKsckTest : public KuduTest {
 
     opts.num_masters = opts.master_rpc_ports.size();
     opts.num_tablet_servers = 3;
-    mini_cluster_.reset(new MiniCluster(env_, opts));
+    mini_cluster_.reset(new InternalMiniCluster(env_, opts));
     ASSERT_OK(mini_cluster_->Start());
 
     // Connect to the cluster.
@@ -110,7 +120,7 @@ class RemoteKsckTest : public KuduTest {
     std::shared_ptr<KsckMaster> master;
     ASSERT_OK(RemoteKsckMaster::Build(master_addresses, &master));
     std::shared_ptr<KsckCluster> cluster(new KsckCluster(master));
-    ksck_.reset(new Ksck(cluster));
+    ksck_.reset(new Ksck(cluster, &err_stream_));
   }
 
   virtual void TearDown() OVERRIDE {
@@ -151,7 +161,12 @@ class RemoteKsckTest : public KuduTest {
       if (!status.ok()) {
         promise->Set(status);
       }
-      started_writing->CountDown(1);
+      // Wait for the first 100 writes so that it's very likely all replicas have committed a
+      // message in each tablet; otherwise, safe time might not have been updated on all replicas
+      // and some might refuse snapshot scans because of lag.
+      if (i > 100) {
+        started_writing->CountDown(1);
+      }
     }
     promise->Set(Status::OK());
   }
@@ -185,8 +200,8 @@ class RemoteKsckTest : public KuduTest {
     return Status::OK();
   }
 
-  std::shared_ptr<MiniCluster> mini_cluster_;
-  std::shared_ptr<Ksck> ksck_;
+  unique_ptr<InternalMiniCluster> mini_cluster_;
+  unique_ptr<Ksck> ksck_;
   shared_ptr<client::KuduClient> client_;
 
   // Captures logged messages from ksck.
@@ -231,7 +246,9 @@ TEST_F(RemoteKsckTest, TestChecksum) {
   MonoTime deadline = MonoTime::Now() + MonoDelta::FromSeconds(30);
   Status s;
   while (MonoTime::Now() < deadline) {
+    ASSERT_OK(ksck_->CheckMasterRunning());
     ASSERT_OK(ksck_->FetchTableAndTabletInfo());
+    ASSERT_OK(ksck_->FetchInfoFromTabletServers());
 
     err_stream_.str("");
     s = ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromSeconds(1), 16, false, 0));
@@ -254,7 +271,9 @@ TEST_F(RemoteKsckTest, TestChecksumTimeout) {
   uint64_t num_writes = 10000;
   LOG(INFO) << "Generating row writes...";
   ASSERT_OK(GenerateRowWrites(num_writes));
+  ASSERT_OK(ksck_->CheckMasterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
+  ASSERT_OK(ksck_->FetchInfoFromTabletServers());
   // Use an impossibly low timeout value of zero!
   Status s = ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromNanoseconds(0), 16, false, 0));
   ASSERT_TRUE(s.IsTimedOut()) << "Expected TimedOut Status, got: " << s.ToString();
@@ -273,45 +292,32 @@ TEST_F(RemoteKsckTest, TestChecksumSnapshot) {
   CHECK(started_writing.WaitFor(MonoDelta::FromSeconds(30)));
 
   uint64_t ts = client_->GetLatestObservedTimestamp();
-  MonoTime start(MonoTime::Now());
-  MonoTime deadline = start + MonoDelta::FromSeconds(30);
-  Status s;
-  // TODO: We need to loop here because safe time is not yet implemented.
-  // Remove this loop when that is done. See KUDU-1056.
-  while (true) {
-    ASSERT_OK(ksck_->FetchTableAndTabletInfo());
-    Status s = ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromSeconds(10), 16, true, ts));
-    if (s.ok()) break;
-    if (MonoTime::Now() > deadline) break;
-    SleepFor(MonoDelta::FromMilliseconds(10));
-  }
-  if (!s.ok()) {
-    LOG(WARNING) << Substitute("Timed out after $0 waiting for ksck to become consistent on TS $1. "
-                               "Status: $2",
-                               (MonoTime::Now() - start).ToString(),
-                               ts, s.ToString());
-    EXPECT_OK(s); // To avoid ASAN complaints due to thread reading the CountDownLatch.
-  }
+  ASSERT_OK(ksck_->CheckMasterRunning());
+  ASSERT_OK(ksck_->FetchTableAndTabletInfo());
+  ASSERT_OK(ksck_->FetchInfoFromTabletServers());
+  ASSERT_OK(ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromSeconds(10), 16, true, ts)));
   continue_writing.Store(false);
   ASSERT_OK(promise.Get());
   writer_thread->Join();
 }
 
 // Test that followers & leader wait until safe time to respond to a snapshot
-// scan at current timestamp. TODO: Safe time not yet implemented. See KUDU-1056.
-TEST_F(RemoteKsckTest, DISABLED_TestChecksumSnapshotCurrentTimestamp) {
+// scan at current timestamp.
+TEST_F(RemoteKsckTest, TestChecksumSnapshotCurrentTimestamp) {
   CountDownLatch started_writing(1);
   AtomicBool continue_writing(true);
   Promise<Status> promise;
   scoped_refptr<Thread> writer_thread;
 
-  Thread::Create("RemoteKsckTest", "TestChecksumSnapshot",
+  Thread::Create("RemoteKsckTest", "TestChecksumSnapshotCurrentTimestamp",
                  &RemoteKsckTest::GenerateRowWritesLoop, this,
                  &started_writing, boost::cref(continue_writing), &promise,
                  &writer_thread);
   CHECK(started_writing.WaitFor(MonoDelta::FromSeconds(30)));
 
+  ASSERT_OK(ksck_->CheckMasterRunning());
   ASSERT_OK(ksck_->FetchTableAndTabletInfo());
+  ASSERT_OK(ksck_->FetchInfoFromTabletServers());
   ASSERT_OK(ksck_->ChecksumData(ChecksumOptions(MonoDelta::FromSeconds(10), 16, true,
                                                 ChecksumOptions::kCurrentTimestamp)));
   continue_writing.Store(false);

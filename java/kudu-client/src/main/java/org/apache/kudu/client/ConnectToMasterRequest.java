@@ -24,8 +24,8 @@ import java.util.Collection;
 import java.util.Collections;
 
 import com.google.protobuf.Message;
+import org.apache.yetus.audience.InterfaceAudience;
 
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.master.Master.ConnectToMasterResponsePB;
 import org.apache.kudu.master.Master.MasterFeatures;
 import org.apache.kudu.util.Pair;
@@ -51,8 +51,9 @@ public class ConnectToMasterRequest extends KuduRpc<ConnectToMasterResponsePB> {
    */
   private String method = CONNECT_TO_MASTER;
 
-  public ConnectToMasterRequest() {
-    super(null); // no KuduTable
+  public ConnectToMasterRequest(KuduTable masterTable) {
+    super(masterTable);
+    // TODO(todd): get rid of 'masterTable' hack
   }
 
   @Override

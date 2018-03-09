@@ -21,10 +21,13 @@
 #include <memory>
 #include <string>
 #include <utility>
+#include <unordered_map>
+#include <vector>
 
 #include <gflags/gflags.h>
 
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/tools/ksck.h"
 #include "kudu/tools/ksck_remote.h"
@@ -124,7 +127,8 @@ unique_ptr<Mode> BuildClusterMode() {
       "'checksum' flag to check that tablet data is consistent (also see the "
       "'tables' and 'tablets' flags). Use the 'checksum_snapshot' along with "
       "'checksum' if the table or tablets are actively receiving inserts or "
-      "updates.";
+      "updates. Use the 'verbose' flag to output detailed information on "
+      "cluster status even if no inconsistency is found in metadata.";
   unique_ptr<Action> ksck =
       ActionBuilder("ksck", &RunKsck)
       .Description(desc)
@@ -134,9 +138,12 @@ unique_ptr<Mode> BuildClusterMode() {
       .AddOptionalParameter("checksum_scan")
       .AddOptionalParameter("checksum_scan_concurrency")
       .AddOptionalParameter("checksum_snapshot")
+      .AddOptionalParameter("checksum_timeout_sec")
       .AddOptionalParameter("color")
+      .AddOptionalParameter("consensus")
       .AddOptionalParameter("tables")
       .AddOptionalParameter("tablets")
+      .AddOptionalParameter("verbose")
       .Build();
 
   return ModeBuilder("cluster")

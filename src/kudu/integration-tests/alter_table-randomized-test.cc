@@ -16,30 +16,46 @@
 // under the License.
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/value.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_verifier.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
-#include "kudu/util/net/sockaddr.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
-#include "kudu/util/random_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 namespace kudu {
 
 using client::KuduClient;
-using client::KuduClientBuilder;
 using client::KuduColumnSchema;
+using client::KuduColumnStorageAttributes;
 using client::KuduError;
-using client::KuduInsert;
 using client::KuduScanner;
 using client::KuduSchema;
 using client::KuduSchemaBuilder;
@@ -50,6 +66,8 @@ using client::KuduTableCreator;
 using client::KuduValue;
 using client::KuduWriteOperation;
 using client::sp::shared_ptr;
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
 using std::make_pair;
 using std::map;
 using std::pair;
@@ -61,6 +79,18 @@ using strings::SubstituteAndAppend;
 const char* kTableName = "test-table";
 const int kMaxColumns = 30;
 const uint32_t kMaxRangePartitions = 32;
+const vector<KuduColumnStorageAttributes::CompressionType> kCompressionTypes =
+    { KuduColumnStorageAttributes::NO_COMPRESSION,
+      KuduColumnStorageAttributes::SNAPPY,
+      KuduColumnStorageAttributes::LZ4,
+      KuduColumnStorageAttributes::ZLIB };
+const vector <KuduColumnStorageAttributes::EncodingType> kInt32Encodings =
+    { KuduColumnStorageAttributes::PLAIN_ENCODING,
+      KuduColumnStorageAttributes::RLE,
+      KuduColumnStorageAttributes::BIT_SHUFFLE };
+// A block size of 0 applies the server-side default.
+const vector<int32_t> kBlockSizes = {0, 2 * 1024 * 1024,
+                                     4 * 1024 * 1024, 8 * 1024 * 1024};
 
 class AlterTableRandomized : public KuduTest {
  public:
@@ -71,8 +101,8 @@ class AlterTableRandomized : public KuduTest {
     opts.num_tablet_servers = 3;
     // This test produces tables with lots of columns. With container preallocation,
     // we end up using quite a bit of disk space. So, we disable it.
-    opts.extra_tserver_flags.push_back("--log_container_preallocate_bytes=0");
-    cluster_.reset(new ExternalMiniCluster(opts));
+    opts.extra_tserver_flags.emplace_back("--log_container_preallocate_bytes=0");
+    cluster_.reset(new ExternalMiniCluster(std::move(opts)));
     ASSERT_OK(cluster_->Start());
 
     ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
@@ -111,6 +141,10 @@ struct RowState {
   // We ensure that we never insert or update to this value except in the case of
   // NULLable columns.
   static const int32_t kNullValue = 0xdeadbeef;
+  // We use this special value to denote default values.
+  // We ensure that we never insert or update to this value except when the
+  // column should be assigned its current default value.
+  static const int32_t kDefaultValue = 0xbabecafe;
   vector<pair<string, int32_t>> cols;
 
   string ToString() const {
@@ -135,8 +169,9 @@ struct RowState {
 struct TableState {
   TableState()
       : rand_(SeedRandom()) {
-    col_names_.push_back("key");
+    col_names_.emplace_back("key");
     col_nullable_.push_back(false);
+    col_defaults_.push_back(0);
     AddRangePartition();
   }
 
@@ -181,16 +216,18 @@ struct TableState {
     int32_t key = GetRandomNewRowKey();
 
     int32_t seed = rand_.Next();
-    if (seed == RowState::kNullValue) {
+    if (seed == RowState::kNullValue || seed == RowState::kDefaultValue) {
       seed++;
     }
 
     row->clear();
-    row->push_back(make_pair("key", key));
+    row->push_back(make_pair(col_names_[0], key));
     for (int i = 1; i < col_names_.size(); i++) {
       int32_t val;
       if (col_nullable_[i] && seed % 2 == 1) {
         val = RowState::kNullValue;
+      } else if (seed % 3 == 0) {
+        val = RowState::kDefaultValue;
       } else {
         val = seed;
       }
@@ -199,18 +236,23 @@ struct TableState {
   }
 
   bool Insert(const vector<pair<string, int32_t>>& data) {
-    DCHECK_EQ("key", data[0].first);
+    DCHECK_EQ(col_names_[0], data[0].first);
     int32_t key = data[0].second;
     if (ContainsKey(rows_, key)) return false;
 
     auto r = new RowState;
     r->cols = data;
+    for (int i = 1; i < r->cols.size(); i++) {
+      if (r->cols[i].second == RowState::kDefaultValue) {
+        r->cols[i].second = col_defaults_[i];
+      }
+    }
     rows_[key].reset(r);
     return true;
   }
 
   bool Update(const vector<pair<string, int32_t>>& data) {
-    DCHECK_EQ("key", data[0].first);
+    DCHECK_EQ(col_names_[0], data[0].first);
     int32_t key = data[0].second;
     if (!ContainsKey(rows_, key)) return false;
 
@@ -226,6 +268,7 @@ struct TableState {
   void AddColumnWithDefault(const string& name, int32_t def, bool nullable) {
     col_names_.push_back(name);
     col_nullable_.push_back(nullable);
+    col_defaults_.push_back(def);
     for (auto& e : rows_) {
       e.second->cols.push_back(make_pair(name, def));
     }
@@ -236,15 +279,26 @@ struct TableState {
     int index = col_it - col_names_.begin();
     col_names_.erase(col_it);
     col_nullable_.erase(col_nullable_.begin() + index);
+    col_defaults_.erase(col_defaults_.begin() + index);
     for (auto& e : rows_) {
       e.second->cols.erase(e.second->cols.begin() + index);
     }
   }
 
-  void RenameColumn(const string& existing_name, string new_name) {
+  void RenameColumn(const string& existing_name, const string& new_name) {
     auto iter = std::find(col_names_.begin(), col_names_.end(), existing_name);
     CHECK(iter != col_names_.end());
-    *iter = std::move(new_name);
+    int index = iter - col_names_.begin();
+    for (auto& e : rows_) {
+      e.second->cols[index].first = new_name;
+    }
+    *iter = new_name;
+  }
+
+  void ChangeDefault(const string& name, int32_t new_def) {
+    auto col_it = std::find(col_names_.begin(), col_names_.end(), name);
+    CHECK(col_it != col_names_.end());
+    col_defaults_[col_it - col_names_.begin()] = new_def;
   }
 
   pair<int32_t, int32_t> AddRangePartition() {
@@ -289,6 +343,10 @@ struct TableState {
   // For each column, whether it is NULLable.
   // Has the same length as col_names_.
   vector<bool> col_nullable_;
+
+  // For each column, its current write default.
+  // Has the same length as col_names_.
+  vector<int32_t> col_defaults_;
 
   map<int32_t, unique_ptr<RowState>> rows_;
 
@@ -340,21 +398,24 @@ struct MirrorTable {
     if (ts_.rows_.empty()) return;
     int32_t row_key = ts_.GetRandomExistingRowKey();
     vector<pair<string, int32_t>> del;
-    del.push_back(make_pair("key", row_key));
+    del.push_back(make_pair(ts_.col_names_[0], row_key));
     CHECK_OK(DoRealOp(del, DELETE));
 
     ts_.Delete(row_key);
   }
 
+  ATTRIBUTE_NO_SANITIZE_INTEGER
   void UpdateRandomRow(uint32_t rand) {
     if (ts_.rows_.empty()) return;
     int32_t row_key = ts_.GetRandomExistingRowKey();
 
     vector<pair<string, int32_t>> update;
-    update.push_back(make_pair("key", row_key));
+    update.push_back(make_pair(ts_.col_names_[0], row_key));
     for (int i = 1; i < num_columns(); i++) {
+      // This is expected to overflow.
       int32_t val = rand * i;
       if (val == RowState::kNullValue) val++;
+      if (val == RowState::kDefaultValue) val++;
       if (ts_.col_nullable_[i] && val % 2 == 1) {
         val = RowState::kNullValue;
       }
@@ -387,7 +448,7 @@ struct MirrorTable {
 
     int step_count = 1 + ts_.rand_.Uniform(10);
     for (int step = 0; step < step_count; step++) {
-      int r = ts_.rand_.Uniform(4);
+      int r = ts_.rand_.Uniform(9);
       if (r < 1 && num_columns() < kMaxColumns) {
         AddAColumn(table_alterer.get());
       } else if (r < 2 && num_columns() > 1) {
@@ -395,6 +456,16 @@ struct MirrorTable {
       } else if (num_range_partitions() == 0 ||
                  (r < 3 && num_range_partitions() < kMaxRangePartitions)) {
         AddARangePartition(schema, table_alterer.get());
+      } else if (r < 4 && num_columns() > 1) {
+        RenameAColumn(table_alterer.get());
+      } else if (r < 5 && num_columns() > 1) {
+        RenamePrimaryKeyColumn(table_alterer.get());
+      } else if (r < 6 && num_columns() > 1) {
+        RenameAColumn(table_alterer.get());
+      } else if (r < 7 && num_columns() > 1) {
+        ChangeADefault(table_alterer.get());
+      } else if (r < 8 && num_columns() > 1) {
+        ChangeAStorageAttribute(table_alterer.get());
       } else {
         DropARangePartition(schema, table_alterer.get());
       }
@@ -437,10 +508,49 @@ struct MirrorTable {
     string new_name = ts_.GetRandomNewColumnName();
     LOG(INFO) << "Renaming column " << original_name << " to " << new_name;
     table_alterer->AlterColumn(original_name)->RenameTo(new_name);
-    ts_.RenameColumn(original_name, std::move(new_name));
+    ts_.RenameColumn(original_name, new_name);
   }
 
-  void AddARangePartition(KuduSchema& schema, KuduTableAlterer* table_alterer) {
+  void RenamePrimaryKeyColumn(KuduTableAlterer* table_alterer) {
+    string new_name = ts_.GetRandomNewColumnName();
+    LOG(INFO) << "Renaming PrimaryKey column " << ts_.col_names_[0] << " to " << new_name;
+    table_alterer->AlterColumn(ts_.col_names_[0])->RenameTo(new_name);
+    ts_.RenameColumn(ts_.col_names_[0], new_name);
+  }
+
+  void ChangeADefault(KuduTableAlterer* table_alterer) {
+    string name = ts_.GetRandomExistingColumnName();
+    int32_t new_def = ts_.rand_.Next();
+    if (new_def == RowState::kNullValue || new_def == RowState::kDefaultValue) {
+      new_def++;
+    }
+    LOG(INFO) << "Changing default of column " << name << " to " << new_def;
+    table_alterer->AlterColumn(name)->Default(KuduValue::FromInt(new_def));
+    ts_.ChangeDefault(name, new_def);
+  }
+
+  void ChangeAStorageAttribute(KuduTableAlterer* table_alterer) {
+    string name = ts_.GetRandomExistingColumnName();
+    int type = ts_.rand_.Uniform(3);
+    if (type == 0) {
+      int i = ts_.rand_.Uniform(kCompressionTypes.size());
+      LOG(INFO) << "Changing compression of column " << name <<
+                " to " << kCompressionTypes[i];
+      table_alterer->AlterColumn(name)->Compression(kCompressionTypes[i]);
+    } else if (type == 1) {
+      int i = ts_.rand_.Uniform(kInt32Encodings.size());
+      LOG(INFO) << "Changing encoding of column " << name <<
+                " to " << kInt32Encodings[i];
+      table_alterer->AlterColumn(name)->Encoding(kInt32Encodings[i]);
+    } else {
+      int i = ts_.rand_.Uniform(kBlockSizes.size());
+      LOG(INFO) << "Changing block size of column " << name <<
+                " to " << kBlockSizes[i];
+      table_alterer->AlterColumn(name)->BlockSize(kBlockSizes[i]);
+    }
+  }
+
+  void AddARangePartition(const KuduSchema& schema, KuduTableAlterer* table_alterer) {
     auto bounds = ts_.AddRangePartition();
     LOG(INFO) << "Adding range partition: [" << bounds.first << ", " << bounds.second << ")"
               << " resulting partitions: ("
@@ -464,9 +574,9 @@ struct MirrorTable {
     }
 
     unique_ptr<KuduPartialRow> lower_bound(schema.NewRow());
-    CHECK_OK(lower_bound->SetInt32("key", lower_bound_value));
+    CHECK_OK(lower_bound->SetInt32(schema.Column(0).name(), lower_bound_value));
     unique_ptr<KuduPartialRow> upper_bound(schema.NewRow());
-    CHECK_OK(upper_bound->SetInt32("key", upper_bound_value));
+    CHECK_OK(upper_bound->SetInt32(schema.Column(0).name(), upper_bound_value));
 
     table_alterer->AddRangePartition(lower_bound.release(), upper_bound.release(),
                                      lower_bound_type, upper_bound_type);
@@ -481,9 +591,9 @@ struct MirrorTable {
                                            ", ", "], (") << ")";
 
     unique_ptr<KuduPartialRow> lower_bound(schema.NewRow());
-    CHECK_OK(lower_bound->SetInt32("key", bounds.first));
+    CHECK_OK(lower_bound->SetInt32(schema.Column(0).name(), bounds.first));
     unique_ptr<KuduPartialRow> upper_bound(schema.NewRow());
-    CHECK_OK(upper_bound->SetInt32("key", bounds.second));
+    CHECK_OK(upper_bound->SetInt32(schema.Column(0).name(), bounds.second));
 
     table_alterer->DropRangePartition(lower_bound.release(), upper_bound.release());
   }
@@ -512,7 +622,7 @@ struct MirrorTable {
       ASSERT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
       ASSERT_OK(scanner.SetFaultTolerant());
       scanner.SetTimeoutMillis(60000);
-      NO_FATALS(ScanToStrings(&scanner, &rows));
+      ASSERT_OK(ScanToStrings(&scanner, &rows));
     }
 
     // Then get our mock table.
@@ -541,9 +651,16 @@ struct MirrorTable {
       case UPDATE: op.reset(table->NewUpdate()); break;
       case DELETE: op.reset(table->NewDelete()); break;
     }
-    for (const auto& d : data) {
+    for (int i = 0; i < data.size(); i++) {
+      const auto& d = data[i];
       if (d.second == RowState::kNullValue) {
         CHECK_OK(op->mutable_row()->SetNull(d.first));
+      } else if (d.second == RowState::kDefaultValue) {
+        if (ts_.col_defaults_[i] == RowState::kNullValue) {
+          CHECK_OK(op->mutable_row()->SetNull(d.first));
+        } else {
+          CHECK_OK(op->mutable_row()->SetInt32(d.first, ts_.col_defaults_[i]));
+        }
       } else {
         CHECK_OK(op->mutable_row()->SetInt32(d.first, d.second));
       }

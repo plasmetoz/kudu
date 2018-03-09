@@ -17,43 +17,54 @@
 #ifndef KUDU_MASTER_CATALOG_MANAGER_H
 #define KUDU_MASTER_CATALOG_MANAGER_H
 
+#include <cstdint>
+#include <functional>
+#include <iosfwd>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <set>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
-#include <boost/optional/optional_fwd.hpp>
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
 
-#include "kudu/common/partition.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/ts_manager.h"
-#include "kudu/server/monitored_task.h"
-#include "kudu/tserver/tablet_peer_lookup.h"
+#include "kudu/tserver/tablet_replica_lookup.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/cow_object.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/oid_generator.h"
-#include "kudu/util/promise.h"
 #include "kudu/util/random.h"
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
+class CreateTableStressTest_TestConcurrentCreateTableAndReloadMetadata_Test;
+class MonitoredTask;
+class NodeInstancePB;
+class PartitionPB;
+class PartitionSchema;
 class Schema;
 class ThreadPool;
+struct ColumnId;
 
 // Working around FRIEND_TEST() ugliness.
 namespace client {
 class ServiceUnavailableRetryClientTest_CreateTable_Test;
 } // namespace client
-
-class CreateTableStressTest_TestConcurrentCreateTableAndReloadMetadata_Test;
 
 namespace rpc {
 class RpcContext;
@@ -62,17 +73,25 @@ class RpcContext;
 namespace security {
 class Cert;
 class PrivateKey;
-class TokenSigner;
-class TokenSigningPrivateKey;
+class TokenSigningPublicKeyPB;
 } // namespace security
+
+namespace consensus {
+class RaftConsensus;
+class StartTabletCopyRequestPB;
+}
+
+namespace tablet {
+class TabletReplica;
+}
 
 namespace master {
 
 class CatalogManagerBgTasks;
 class Master;
 class SysCatalogTable;
-class TableInfo;
 class TSDescriptor;
+class TableInfo;
 
 struct DeferredAssignmentActions;
 
@@ -117,9 +136,17 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo> {
  public:
   typedef PersistentTabletInfo cow_state;
 
+  enum {
+    // Schema version when the tablet has yet to report.
+    //
+    // This value must be less than all possible schema versions. -1 is
+    // appropriate; schema versions range from 0 to UINT32_MAX.
+    NOT_YET_REPORTED = -1L
+  };
+
   TabletInfo(const scoped_refptr<TableInfo>& table, std::string tablet_id);
 
-  const std::string& tablet_id() const { return tablet_id_; }
+  const std::string& id() const { return tablet_id_; }
   const scoped_refptr<TableInfo>& table() const { return table_; }
 
   // Access the persistent metadata. Typically you should use
@@ -131,9 +158,14 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo> {
   void set_last_create_tablet_time(const MonoTime& ts);
   MonoTime last_create_tablet_time() const;
 
-  // Accessors for the last reported schema version
-  bool set_reported_schema_version(uint32_t version);
-  uint32_t reported_schema_version() const;
+  // Sets the reported schema version to 'version' provided it's not already
+  // equal to or greater than it.
+  //
+  // Also reflects the version change to the table's schema version map.
+  void set_reported_schema_version(int64_t version);
+
+  // Simple accessor for reported_schema_version_.
+  int64_t reported_schema_version() const;
 
   // No synchronization needed.
   std::string ToString() const;
@@ -155,7 +187,9 @@ class TabletInfo : public RefCountedThreadSafe<TabletInfo> {
   MonoTime last_create_tablet_time_;
 
   // Reported schema version (in-memory only).
-  uint32_t reported_schema_version_;
+  //
+  // Set to NOT_YET_REPORTED when the tablet hasn't yet reported.
+  int64_t reported_schema_version_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletInfo);
 };
@@ -194,7 +228,7 @@ struct PersistentTableInfo {
 class TableInfo : public RefCountedThreadSafe<TableInfo> {
  public:
   typedef PersistentTableInfo cow_state;
-  typedef std::map<std::string, TabletInfo*> TabletInfoMap;
+  typedef std::map<std::string, scoped_refptr<TabletInfo>> TabletInfoMap;
 
   explicit TableInfo(std::string table_id);
 
@@ -203,25 +237,19 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   // Return the table's ID. Does not require synchronization.
   const std::string& id() const { return table_id_; }
 
-  // Add a tablet to this table.
-  void AddTablet(TabletInfo *tablet);
-  // Add multiple tablets to this table.
-  void AddTablets(const std::vector<TabletInfo*>& tablets);
-
   // Atomically add and remove multiple tablets from this table.
-  void AddRemoveTablets(const vector<scoped_refptr<TabletInfo>>& tablets_to_add,
-                        const vector<scoped_refptr<TabletInfo>>& tablets_to_drop);
-
-  // Return true if tablet with 'partition_key_start' has been
-  // removed from 'tablet_map_' below.
-  bool RemoveTablet(const std::string& partition_key_start);
+  //
+  // Tablet locks in READ mode or greater must be held for all tablets to be
+  // added or dropped.
+  void AddRemoveTablets(const std::vector<scoped_refptr<TabletInfo>>& tablets_to_add,
+                        const std::vector<scoped_refptr<TabletInfo>>& tablets_to_drop);
 
   // This only returns tablets which are in RUNNING state.
   void GetTabletsInRange(const GetTableLocationsRequestPB* req,
-                         std::vector<scoped_refptr<TabletInfo> > *ret) const;
+                         std::vector<scoped_refptr<TabletInfo>>* ret) const;
 
   // Adds all tablets to the vector in partition key sorted order.
-  void GetAllTablets(std::vector<scoped_refptr<TabletInfo> > *ret) const;
+  void GetAllTablets(std::vector<scoped_refptr<TabletInfo>>* ret) const;
 
   // Access the persistent metadata. Typically you should use
   // TableMetadataLock to gain access to this data.
@@ -245,7 +273,11 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
   // Returns a snapshot copy of the table info's tablet map.
   TabletInfoMap tablet_map() const {
     shared_lock<rw_spinlock> l(lock_);
-    return tablet_map_;
+    TabletInfoMap ret;
+    for (const auto& e : tablet_map_) {
+      ret.emplace(e.first, make_scoped_refptr(e.second));
+    }
+    return ret;
   }
 
   // Returns the number of tablets.
@@ -256,23 +288,41 @@ class TableInfo : public RefCountedThreadSafe<TableInfo> {
 
  private:
   friend class RefCountedThreadSafe<TableInfo>;
+  friend class TabletInfo;
   ~TableInfo();
 
-  void AddTabletUnlocked(TabletInfo* tablet);
+  // Increments or decrements the value for the key 'version' in
+  // 'schema_version_counts'.
+  //
+  // Must be called with 'lock_' held for writing.
+  void IncrementSchemaVersionCountUnlocked(int64_t version);
+  void DecrementSchemaVersionCountUnlocked(int64_t version);
 
   const std::string table_id_;
 
   // Sorted index of tablet start partition-keys to TabletInfo.
-  // The TabletInfo objects are owned by the CatalogManager.
-  TabletInfoMap tablet_map_;
+  //
+  // Every TabletInfo has a strong backpointer to its TableInfo, so these
+  // pointers must be raw.
+  typedef std::map<std::string, TabletInfo*> RawTabletInfoMap;
+  RawTabletInfoMap tablet_map_;
 
-  // Protects tablet_map_ and pending_tasks_
+  // Protects tablet_map_, pending_tasks_, and schema_version_counts_.
   mutable rw_spinlock lock_;
 
   CowObject<PersistentTableInfo> metadata_;
 
   // List of pending tasks (e.g. create/alter tablet requests)
   std::unordered_set<MonitoredTask*> pending_tasks_;
+
+  // Map of schema version to the number of tablets that reported that version.
+  //
+  // All tablets are represented here regardless of whether they've reported.
+  // Tablets yet to report will count towards the special NOT_YET_REPORTED key.
+  //
+  // The contents of this map are equivalent to iterating over every table in
+  // tablet_map_ and summing up the tablets' reported schema versions.
+  std::map<int64_t, int64_t> schema_version_counts_;
 
   DISALLOW_COPY_AND_ASSIGN(TableInfo);
 };
@@ -282,16 +332,54 @@ template<class MetadataClass>
 class MetadataLock : public CowLock<typename MetadataClass::cow_state> {
  public:
   typedef CowLock<typename MetadataClass::cow_state> super;
-  MetadataLock(MetadataClass* info, typename super::LockMode mode)
-    : super(DCHECK_NOTNULL(info)->mutable_metadata(), mode) {
+  MetadataLock()
+      : super() {
   }
-  MetadataLock(const MetadataClass* info, typename super::LockMode mode)
-    : super(&(DCHECK_NOTNULL(info))->metadata(), mode) {
+  MetadataLock(MetadataClass* info, LockMode mode)
+      : super(DCHECK_NOTNULL(info)->mutable_metadata(), mode) {
+  }
+  MetadataLock(const MetadataClass* info, LockMode mode)
+      : super(&(DCHECK_NOTNULL(info))->metadata(), mode) {
   }
 };
 
-typedef MetadataLock<TabletInfo> TabletMetadataLock;
+// Helper to manage locking on the persistent metadata of multiple TabletInfo
+// or TableInfo objects.
+template<class MetadataClass>
+class MetadataGroupLock : public CowGroupLock<std::string,
+                                              typename MetadataClass::cow_state> {
+ public:
+  typedef CowGroupLock<std::string, typename MetadataClass::cow_state> super;
+  explicit MetadataGroupLock(LockMode mode)
+      : super(mode) {
+  }
+
+  void AddInfo(const MetadataClass& info) {
+    this->AddObject(info.id(), &info.metadata());
+  }
+
+  void AddMutableInfo(MetadataClass* info) {
+    this->AddMutableObject(info->id(), info->mutable_metadata());
+  }
+
+  void AddInfos(const std::vector<scoped_refptr<MetadataClass>>& infos) {
+    for (const auto& i : infos) {
+      AddInfo(*i);
+    }
+  }
+
+  void AddMutableInfos(const std::vector<scoped_refptr<MetadataClass>>& infos) {
+    for (const auto& i : infos) {
+      AddMutableInfo(i.get());
+    }
+  }
+};
+
+// Convenience aliases for the above lock guards.
 typedef MetadataLock<TableInfo> TableMetadataLock;
+typedef MetadataLock<TabletInfo> TabletMetadataLock;
+typedef MetadataGroupLock<TableInfo> TableMetadataGroupLock;
+typedef MetadataGroupLock<TabletInfo> TabletMetadataGroupLock;
 
 // The component of the master which tracks the state and location
 // of tables/tablets in the cluster.
@@ -300,7 +388,7 @@ typedef MetadataLock<TableInfo> TableMetadataLock;
 // the state of each tablet on a given tablet-server.
 //
 // Thread-safe.
-class CatalogManager : public tserver::TabletPeerLookupIf {
+class CatalogManager : public tserver::TabletReplicaLookupIf {
  public:
 
   // Scoped "shared lock" to serialize master leader elections.
@@ -326,11 +414,18 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   //
   class ScopedLeaderSharedLock {
    public:
-    // Creates a new shared lock, acquiring the catalog manager's leader_lock_
-    // for reading in the process. The lock is released when this object is
-    // destroyed.
+    // Creates a new shared lock, trying to acquire the catalog manager's
+    // leader_lock_ for reading in the process. If acquired, the lock is
+    // released when this object is destroyed.
     //
-    // 'catalog' must outlive this object.
+    // In most common use cases, where write lock semantics is assumed, call
+    // CheckIsInitializedAndIsLeaderOrRespond() to verify that the leader_lock_
+    // has been acquired (as shown in the class-wide comment above). In rare
+    // cases, where both read and write semantics are applicable, use the
+    // combination of CheckIsInitializedOrRespond() and owns_lock() methods
+    // to verify that the leader_lock_ is acquired.
+    //
+    // The object pointed by the 'catalog' parameter must outlive this object.
     explicit ScopedLeaderSharedLock(CatalogManager* catalog);
 
     // General status of the catalog manager. If not OK (e.g. the catalog
@@ -354,6 +449,16 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
       return leader_status_;
     }
 
+    // Whether the underlying leader lock of the system catalog is acquired.
+    bool owns_lock() const {
+      return leader_shared_lock_.owns_lock();
+    }
+
+    // Check whether the consensus configuration term has changed from the term
+    // captured at object construction (initial_term_).
+    // Requires: leader_status() returns OK().
+    bool has_term_changed() const;
+
     // Check that the catalog manager is initialized. It may or may not be the
     // leader of its Raft configuration.
     //
@@ -376,6 +481,7 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
     shared_lock<RWMutex> leader_shared_lock_;
     Status catalog_status_;
     Status leader_status_;
+    int64_t initial_term_;
 
     DISALLOW_COPY_AND_ASSIGN(ScopedLeaderSharedLock);
   };
@@ -387,10 +493,12 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
     explicit ScopedLeaderDisablerForTests(CatalogManager* catalog)
         : catalog_(catalog),
         old_leader_ready_term_(catalog->leader_ready_term_) {
+      std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
       catalog_->leader_ready_term_ = -1;
     }
 
     ~ScopedLeaderDisablerForTests() {
+      std::lock_guard<simple_spinlock> l(catalog_->state_lock_);
       catalog_->leader_ready_term_ = old_leader_ready_term_;
     }
 
@@ -458,13 +566,14 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   Status GetTableLocations(const GetTableLocationsRequestPB* req,
                            GetTableLocationsResponsePB* resp);
 
-  // Look up the locations of the given tablet. The locations
-  // vector is overwritten (not appended to).
-  // If the tablet is not found, returns Status::NotFound.
+  // Look up the locations of the given tablet. Adds only information on
+  // replicas which satisfy the 'filter'. The locations vector is overwritten
+  // (not appended to). If the tablet is not found, returns Status::NotFound.
   // If the tablet is not running, returns Status::ServiceUnavailable.
   // Otherwise, returns Status::OK and puts the result in 'locs_pb'.
   // This only returns tablets which are in RUNNING state.
   Status GetTabletLocations(const std::string& tablet_id,
+                            master::ReplicaTypeFilter filter,
                             TabletLocationsPB* locs_pb);
 
   // Handle a tablet report from the given tablet server.
@@ -472,11 +581,15 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // The RPC context is provided for logging/tracing purposes,
   // but this function does not itself respond to the RPC.
   Status ProcessTabletReport(TSDescriptor* ts_desc,
-                             const TabletReportPB& report,
-                             TabletReportUpdatesPB *report_update,
+                             const TabletReportPB& full_report,
+                             TabletReportUpdatesPB* full_report_update,
                              rpc::RpcContext* rpc);
 
   SysCatalogTable* sys_catalog() { return sys_catalog_.get(); }
+
+  // Returns the Master tablet's RaftConsensus instance if it is initialized, or
+  // else a nullptr.
+  std::shared_ptr<consensus::RaftConsensus> master_consensus() const;
 
   // Dump all of the current state about tables and tablets to the
   // given output stream. This is verbose, meant for debugging.
@@ -504,12 +617,15 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // deleted the specified tablet.
   void NotifyTabletDeleteSuccess(const std::string& permanent_uuid, const std::string& tablet_id);
 
-  // Used by ConsensusService to retrieve the TabletPeer for a system
+  // Used by ConsensusService to retrieve the TabletReplica for a system
   // table specified by 'tablet_id'.
   //
-  // See also: TabletPeerLookupIf, ConsensusServiceImpl.
-  virtual Status GetTabletPeer(const std::string& tablet_id,
-                               scoped_refptr<tablet::TabletPeer>* tablet_peer) const override;
+  // See also: TabletReplicaLookupIf, ConsensusServiceImpl.
+  virtual Status GetTabletReplica(const std::string& tablet_id,
+                                  scoped_refptr<tablet::TabletReplica>* replica) const override;
+
+  virtual void GetTabletReplicas(
+      std::vector<scoped_refptr<tablet::TabletReplica>>* replicas) const override;
 
   virtual const NodeInstancePB& NodeInstance() const override;
 
@@ -541,8 +657,8 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   typedef std::unordered_map<std::string, scoped_refptr<TabletInfo>> TabletInfoMap;
 
   // Called by SysCatalog::SysCatalogStateChanged when this node
-  // becomes the leader of a consensus configuration. Executes VisitTablesAndTabletsTask
-  // via 'worker_pool_'.
+  // becomes the leader of a consensus configuration. Executes
+  // PrepareForLeadershipTask() via 'worker_pool_'.
   Status ElectedAsLeaderCb();
 
   // Loops and sleeps until one of the following conditions occurs:
@@ -557,9 +673,25 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // reading that data, to ensure consistency across failovers.
   Status WaitUntilCaughtUpAsLeader(const MonoDelta& timeout);
 
-  // Performs several checks before calling VisitTablesAndTablets to actually
-  // reload table/tablet metadata into memory.
-  void VisitTablesAndTabletsTask();
+  // Performs several checks before calling VisitTablesAndTablets() to actually
+  // reload table/tablet metadata into memory and do other work to update the
+  // internal state of this object upon becoming the leader.
+  void PrepareForLeadershipTask();
+
+  // Perform necessary work to prepare for running in the follower role.
+  // Currently, it's about having a means to authenticate clients by authn tokens.
+  Status PrepareFollower(MonoTime* last_tspk_run);
+
+  // Prepare CA-related information for the follower catalog manager. Currently,
+  // this includes reading the CA information from the system table, creating
+  // TLS server certificate request, signing it with the CA key, and installing
+  // the certificate TLS server certificates.
+  Status PrepareFollowerCaInfo();
+
+  // Read currently active TSK keys from the system table and import their
+  // public parts into the token verifier, so it's possible to verify signatures
+  // of authn tokens.
+  Status PrepareFollowerTokenVerifier();
 
   // Clears out the existing metadata ('table_names_map_', 'table_ids_map_',
   // and 'tablet_map_'), loads tables metadata into memory and if successful
@@ -576,64 +708,79 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // This method is thread-safe.
   Status InitSysCatalogAsync(bool is_first_run);
 
-  // Load the internal Kudu certficate authority information from the system
+  // Initialize the IPKI certificate authority: load the CA information record
+  // from the system table. If the CA information record is not present in the
+  // table, generate and store a new one.
+  Status InitCertAuthority();
+
+  // Initialize the IPKI certificate authority with the specified private key
+  // and certificate.
+  Status InitCertAuthorityWith(std::unique_ptr<security::PrivateKey> key,
+                               std::unique_ptr<security::Cert> cert);
+
+  // Load the IPKI certficate authority information from the system
   // table: the private key and the certificate. If the CA info entry is not
   // found in the table, return Status::NotFound.
   Status LoadCertAuthorityInfo(std::unique_ptr<security::PrivateKey>* key,
                                std::unique_ptr<security::Cert>* cert);
 
-  // Initialize master's certificate authority with the specified private key
-  // and certificate.
-  Status InitCertAuthority(std::unique_ptr<security::PrivateKey> key,
-                           std::unique_ptr<security::Cert> cert);
-
-  // Store CA certificate information into the system table.
+  // Store the IPKI certificate authority information into the system table.
   Status StoreCertAuthorityInfo(const security::PrivateKey& key,
                                 const security::Cert& cert);
+
+  // 1. Initialize the TokenSigner (the component which signs authn tokens):
+  //      a. Load TSK records from the system table.
+  //      b. Import the newly loaded TSK records into the TokenSigner.
+  // 2. Check whether it's time to generate a new token signing key.
+  //    If yes, then:
+  //      a. Generate a new TSK.
+  //      b. Store the new TSK one into the system catalog table.
+  // 3. Purge expired TSKs from the system table.
+  Status InitTokenSigner();
 
   // Helper for creating the initial TableInfo state
   // Leaves the table "write locked" with the new info in the
   // "dirty" state field.
-  TableInfo* CreateTableInfo(const CreateTableRequestPB& req,
-                             const Schema& schema,
-                             const PartitionSchema& partition_schema);
+  scoped_refptr<TableInfo> CreateTableInfo(const CreateTableRequestPB& req,
+                                           const Schema& schema,
+                                           const PartitionSchema& partition_schema);
 
   // Helper for creating the initial TabletInfo state.
   // Leaves the tablet "write locked" with the new info in the
   // "dirty" state field.
-  scoped_refptr<TabletInfo> CreateTabletInfo(TableInfo* table,
+  scoped_refptr<TabletInfo> CreateTabletInfo(const scoped_refptr<TableInfo>& table,
                                              const PartitionPB& partition);
 
-  // Builds the TabletLocationsPB for a tablet based on the provided TabletInfo.
-  // Populates locs_pb and returns true on success.
-  // Returns Status::ServiceUnavailable if tablet is not running.
+  // Builds the TabletLocationsPB for a tablet based on the provided TabletInfo
+  // and the replica type fiter specified. Populates locs_pb and returns
+  // Status::OK on success. Returns Status::ServiceUnavailable if tablet is
+  // not running.
   Status BuildLocationsForTablet(const scoped_refptr<TabletInfo>& tablet,
+                                 master::ReplicaTypeFilter filter,
                                  TabletLocationsPB* locs_pb);
 
-  Status FindTable(const TableIdentifierPB& table_identifier,
-                   scoped_refptr<TableInfo>* table_info);
-
-  // Handle one of the tablets in a tablet reported.
-  // Requires that the lock is already held.
-  Status HandleReportedTablet(TSDescriptor* ts_desc,
-                              const ReportedTabletPB& report,
-                              ReportedTabletUpdatesPB *report_updates);
-
-  Status HandleRaftConfigChanged(const ReportedTabletPB& report,
-                                 const scoped_refptr<TabletInfo>& tablet,
-                                 TabletMetadataLock* tablet_lock,
-                                 TableMetadataLock* table_lock);
+  // Looks up the table and locks it with the provided lock mode. If the table
+  // does not exist, the lock is not acquired and the table is not modified.
+  Status FindAndLockTable(const TableIdentifierPB& table_identifier,
+                          LockMode lock_mode,
+                          scoped_refptr<TableInfo>* table_info,
+                          TableMetadataLock* table_lock) WARN_UNUSED_RESULT;
 
   // Extract the set of tablets that must be processed because not running yet.
   void ExtractTabletsToProcess(std::vector<scoped_refptr<TabletInfo>>* tablets_to_process);
 
-  // Check if it's time to generate new Token Signing Key for TokenSigner.
-  // If so, generate one and persist it into the system table.
-  Status CheckGenerateNewTskUnlocked();
+  // Check if it's time to generate a new Token Signing Key for TokenSigner.
+  // If so, generate one and persist it into the system table. After that,
+  // push it into the TokenSigner's key queue.
+  Status TryGenerateNewTskUnlocked();
 
   // Load non-expired TSK entries from the system table.
   // Once done, initialize TokenSigner with the loaded entries.
   Status LoadTskEntries(std::set<std::string>* expired_entry_ids);
+
+  // Load non-expired TSK entries from the system table, extract the public
+  // part from those, and return them with the 'key' output parameter.
+  Status LoadTspkEntries(std::vector<security::TokenSigningPublicKeyPB>* keys);
 
   // Delete TSK entries with the specified entry identifiers
   // (identifiers correspond to the 'entry_id' column).
@@ -645,7 +792,7 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
                                ColumnId* next_col_id);
 
   Status ApplyAlterPartitioningSteps(const TableMetadataLock& l,
-                                     TableInfo* table,
+                                     const scoped_refptr<TableInfo>& table,
                                      const Schema& client_schema,
                                      std::vector<AlterTableRequestPB::Step> steps,
                                      std::vector<scoped_refptr<TabletInfo>>* tablets_to_add,
@@ -655,24 +802,14 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // Loops through the "not created" tablets and sends a CreateTablet() request.
   Status ProcessPendingAssignments(const std::vector<scoped_refptr<TabletInfo> >& tablets);
 
-  // Given 'two_choices', which should be a vector of exactly two elements, select which
-  // one is the better choice for a new replica.
-  std::shared_ptr<TSDescriptor> PickBetterReplicaLocation(const TSDescriptorVector& two_choices);
-
-  // Select a tablet server from 'ts_descs' on which to place a new replica.
-  // Any tablet servers in 'excluded' are not considered.
-  // REQUIRES: 'ts_descs' must include at least one non-excluded server.
-  std::shared_ptr<TSDescriptor> SelectReplica(
-      const TSDescriptorVector& ts_descs,
-      const std::set<std::shared_ptr<TSDescriptor>>& excluded);
-
   // Select N Replicas from online tablet servers (as specified by
   // 'ts_descs') for the specified tablet and populate the consensus configuration
   // object. If 'ts_descs' does not specify enough online tablet
   // servers to select the N replicas, return Status::InvalidArgument.
   //
   // This method is called by "ProcessPendingAssignments()".
-  Status SelectReplicasForTablet(const TSDescriptorVector& ts_descs, TabletInfo* tablet);
+  Status SelectReplicasForTablet(const TSDescriptorVector& ts_descs,
+                                 const scoped_refptr<TabletInfo>& tablet);
 
   // Select N Replicas from the online tablet servers
   // and populate the consensus configuration object.
@@ -682,21 +819,25 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
                       int nreplicas,
                       consensus::RaftConfigPB *config);
 
-  void HandleAssignPreparingTablet(TabletInfo* tablet,
+  // Handles 'tablet' currently in the PREPARING state.
+  //
+  // Transitions it to the CREATING state and prepares CreateTablet RPCs.
+  void HandleAssignPreparingTablet(const scoped_refptr<TabletInfo>& tablet,
                                    DeferredAssignmentActions* deferred);
 
-  // Assign tablets and send CreateTablet RPCs to tablet servers.
-  // The out param 'new_tablets' should have any newly-created TabletInfo
-  // objects appended to it.
-  void HandleAssignCreatingTablet(TabletInfo* tablet,
+  // Handles 'tablet' currently in the CREATING state.
+  //
+  // If a CreateTablet RPC timed out, marks 'tablet' as REPLACED and replaces
+  // it with a new CREATING tablet, which is written to in 'new_tablet'.
+  void HandleAssignCreatingTablet(const scoped_refptr<TabletInfo>& tablet,
                                   DeferredAssignmentActions* deferred,
-                                  std::vector<scoped_refptr<TabletInfo> >* new_tablets);
+                                  scoped_refptr<TabletInfo>* new_tablet);
 
-  Status HandleTabletSchemaVersionReport(TabletInfo *tablet,
-                                         uint32_t version);
+  void HandleTabletSchemaVersionReport(const scoped_refptr<TabletInfo>& tablet,
+                                       uint32_t version);
 
   // Send the "create tablet request" to all peers of a particular tablet.
-  //.
+  //
   // The creation is async, and at the moment there is no error checking on the
   // caller side. We rely on the assignment timeout. If we don't see the tablet
   // after the timeout, we regenerate a new one and proceed with a new
@@ -714,10 +855,6 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   // Send the "alter table request" to all tablets of the specified table.
   void SendAlterTableRequest(const scoped_refptr<TableInfo>& table);
 
-  // Start the background task to send the AlterTable() RPC to the leader for this
-  // tablet.
-  void SendAlterTabletRequest(const scoped_refptr<TabletInfo>& tablet);
-
   // Send the "delete tablet request" to all replicas of all tablets of the
   // specified table.
   void SendDeleteTableRequest(const scoped_refptr<TableInfo>& table,
@@ -729,20 +866,6 @@ class CatalogManager : public tserver::TabletPeerLookupIf {
   void SendDeleteTabletRequest(const scoped_refptr<TabletInfo>& tablet,
                                const TabletMetadataLock& tablet_lock,
                                const std::string& deletion_msg);
-
-  // Send the "delete tablet request" to a particular replica (i.e. TS and
-  // tablet combination). The specified 'reason' will be logged on the TS.
-  void SendDeleteReplicaRequest(const std::string& tablet_id,
-                                tablet::TabletDataState delete_type,
-                                const boost::optional<int64_t>& cas_config_opid_index_less_or_equal,
-                                const scoped_refptr<TableInfo>& table,
-                                const std::string& ts_uuid,
-                                const std::string& reason);
-
-  // Start a task to change the config to add an additional voter because the
-  // specified tablet is under-replicated.
-  void SendAddServerRequest(const scoped_refptr<TabletInfo>& tablet,
-                            const consensus::ConsensusStatePB& cstate);
 
   std::string GenerateId() { return oid_generator_.Next(); }
 

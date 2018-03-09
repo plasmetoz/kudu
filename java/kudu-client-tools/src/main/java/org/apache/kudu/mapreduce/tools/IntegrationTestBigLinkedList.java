@@ -1,24 +1,42 @@
-/**
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License. See accompanying LICENSE file.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 package org.apache.kudu.mapreduce.tools;
+
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_CLIENT;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_KEY_ONE;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_KEY_TWO;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_PREV_ONE;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_PREV_TWO;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_ROW_ID;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.COLUMN_UPDATE_COUNT;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.Counts;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.DEFAULT_HEADS_TABLE_NAME;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.DEFAULT_TABLE_NAME;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.HEADS_TABLE_NAME_KEY;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.TABLE_NAME_KEY;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.Xoroshiro128PlusRandom;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.getCreateTableOptions;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.getHeadsTableSchema;
+import static org.apache.kudu.mapreduce.tools.BigLinkedListCommon.getTableSchema;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.math.BigInteger;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Iterator;
@@ -26,7 +44,6 @@ import java.util.List;
 import java.util.UUID;
 
 import com.google.common.base.Joiner;
-import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import org.apache.commons.cli.CommandLine;
 import org.apache.commons.cli.GnuParser;
@@ -60,14 +77,12 @@ import org.apache.hadoop.mapreduce.lib.output.SequenceFileOutputFormat;
 import org.apache.hadoop.mapreduce.lib.output.TextOutputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
-import org.apache.kudu.Type;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.AbstractKuduScannerBuilder;
 import org.apache.kudu.client.Bytes;
 import org.apache.kudu.client.CreateTableOptions;
@@ -229,31 +244,6 @@ import org.apache.kudu.util.Pair;
 public class IntegrationTestBigLinkedList extends Configured implements Tool {
   private static final byte[] NO_KEY = new byte[1];
 
-  protected static final String TABLE_NAME_KEY = "IntegrationTestBigLinkedList.table";
-
-  protected static final String DEFAULT_TABLE_NAME = "IntegrationTestBigLinkedList";
-
-  protected static final String HEADS_TABLE_NAME_KEY = "IntegrationTestBigLinkedList.heads_table";
-
-  protected static final String DEFAULT_HEADS_TABLE_NAME = "IntegrationTestBigLinkedListHeads";
-
-  /** Row key, two times 8 bytes. */
-  private static final String COLUMN_KEY_ONE = "key1";
-  private static final String COLUMN_KEY_TWO = "key2";
-
-  /** Link to the id of the prev node in the linked list, two times 8 bytes. */
-  private static final String COLUMN_PREV_ONE = "prev1";
-  private static final String COLUMN_PREV_TWO = "prev2";
-
-  /** identifier of the mapred task that generated this row. */
-  private static final String COLUMN_CLIENT = "client";
-
-  /** the id of the row within the same client. */
-  private static final String COLUMN_ROW_ID = "row_id";
-
-  /** The number of times this row was updated. */
-  private static final String COLUMN_UPDATE_COUNT = "update_count";
-
   /** How many rows to write per map task. This has to be a multiple of 25M. */
   private static final String GENERATOR_NUM_ROWS_PER_MAP_KEY
       = "IntegrationTestBigLinkedList.generator.num_rows";
@@ -280,89 +270,6 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
     String client;
     long rowId;
     int updateCount;
-  }
-
-  static Schema getTableSchema() {
-    List<ColumnSchema> columns = new ArrayList<ColumnSchema>(7);
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_KEY_ONE, Type.INT64)
-        .key(true)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_KEY_TWO, Type.INT64)
-        .key(true)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_PREV_ONE, Type.INT64)
-        .nullable(true)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_PREV_TWO, Type.INT64)
-        .nullable(true)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_ROW_ID, Type.INT64)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_CLIENT, Type.STRING)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_UPDATE_COUNT, Type.INT32)
-        .build());
-    return new Schema(columns);
-  }
-
-  static Schema getHeadsTableSchema() {
-    List<ColumnSchema> columns = new ArrayList<ColumnSchema>(2);
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_KEY_ONE, Type.INT64)
-        .key(true)
-        .build());
-    columns.add(new ColumnSchema.ColumnSchemaBuilder(COLUMN_KEY_TWO, Type.INT64)
-        .key(true)
-        .build());
-    return new Schema(columns);
-  }
-
-  /**
-   * Implementation of the Xoroshiro128+ PRNG.
-   * Copied under the public domain from SquidLib.
-   */
-  private static class Xoroshiro128PlusRandom {
-    private long state0;
-    private long state1;
-
-    public Xoroshiro128PlusRandom() {
-      this((long) (Math.random() * Long.MAX_VALUE));
-    }
-
-    public Xoroshiro128PlusRandom(long seed) {
-      long state = seed + 0x9E3779B97F4A7C15L;
-      long z = state;
-      z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
-      z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
-      state0 = z ^ (z >>> 31);
-      state += state0 + 0x9E3779B97F4A7C15L;
-      z = state;
-      z = (z ^ (z >>> 30)) * 0xBF58476D1CE4E5B9L;
-      z = (z ^ (z >>> 27)) * 0x94D049BB133111EBL;
-      state1 = z ^ (z >>> 31);
-    }
-
-    public long nextLong() {
-      final long s0 = state0;
-      long s1 = state1;
-      final long result = s0 + s1;
-
-      s1 ^= s0;
-      state0 = Long.rotateLeft(s0, 55) ^ s1 ^ (s1 << 14); // a, b
-      state1 = Long.rotateLeft(s1, 36); // c
-
-      return result;
-    }
-
-    public void nextBytes(final byte[] bytes) {
-      int i = bytes.length;
-      int n = 0;
-      while (i != 0) {
-        n = Math.min(i, 8);
-        for (long bits = nextLong(); n-- != 0; bits >>>= 8) {
-          bytes[--i] = (byte) bits;
-        }
-      }
-    }
   }
 
   /**
@@ -579,9 +486,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
 
       private static <T> void circularLeftShift(T[] first) {
         T ez = first[0];
-        for (int i = 0; i < first.length - 1; i++) {
-          first[i] = first[i + 1];
-        }
+        System.arraycopy(first, 1, first, 0, first.length - 1);
         first[first.length - 1] = ez;
       }
 
@@ -666,34 +571,13 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
     }
 
     private void createSchema(String tableName, Schema schema, int numTablets) throws Exception {
-      Preconditions.checkNotNull(client);
-      if (numTablets < 1) {
-        numTablets = 1;
-      }
-
       if (client.tableExists(tableName)) {
         return;
       }
 
-      CreateTableOptions builder =
-          new CreateTableOptions().setNumReplicas(parser.getNumReplicas())
-                                  .setRangePartitionColumns(ImmutableList.of("key1", "key2"));
-      if (numTablets > 1) {
-        BigInteger min = BigInteger.valueOf(Long.MIN_VALUE);
-        BigInteger max = BigInteger.valueOf(Long.MAX_VALUE);
-        BigInteger step = max.multiply(BigInteger.valueOf(2))
-            .divide(BigInteger.valueOf(numTablets));
-        LOG.info("min: {}, max: {}, step: {}", min, max, step);
-        PartialRow splitRow = schema.newPartialRow();
-        splitRow.addLong("key2", Long.MIN_VALUE);
-        for (int i = 1; i < numTablets; i++) {
-          long key = min.add(step.multiply(BigInteger.valueOf(i))).longValue();
-          LOG.info("key " + key);
-          splitRow.addLong("key1", key);
-          builder.addSplitRow(splitRow);
-        }
-      }
-
+      CreateTableOptions builder = getCreateTableOptions(schema,
+                                                         parser.getNumReplicas(),
+                                                         numTablets, 1);
       client.createTable(tableName, schema, builder);
     }
 
@@ -784,7 +668,7 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
 
       @Override
       protected void map(NullWritable key, RowResult value, Mapper.Context context)
-          throws IOException ,InterruptedException {
+          throws IOException, InterruptedException {
         Bytes.setLong(rowKey, value.getLong(0));
         Bytes.setLong(rowKey, value.getLong(1), 8);
 
@@ -801,10 +685,6 @@ public class IntegrationTestBigLinkedList extends Configured implements Tool {
           context.write(ref, row);
         }
       }
-    }
-
-    public enum Counts {
-      UNREFERENCED, UNDEFINED, REFERENCED, EXTRAREFERENCES
     }
 
     public static class VerifyReducer extends Reducer<BytesWritable,BytesWritable,Text,Text> {

@@ -15,16 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <string>
+#include <unordered_set>
+#include <vector>
+
 #include <gtest/gtest.h>
 #include <gflags/gflags.h>
-#include <unordered_set>
+#include <gflags/gflags_declare.h>
 
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/logging_test_util.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 DECLARE_bool(never_fsync);
@@ -120,6 +126,7 @@ TEST_F(FlagTagsTest, TestUnlockFlags) {
 TEST_F(FlagTagsTest, TestSensitiveFlags) {
   // Setting a sensitive flag should return a redacted value.
   {
+    kudu::g_should_redact = kudu::RedactContext::LOG;
     ASSERT_STR_CONTAINS(CommandlineFlagsIntoString(EscapeMode::NONE), strings::Substitute(
                         "--test_sensitive_flag=$0", kRedactionMessage));
   }

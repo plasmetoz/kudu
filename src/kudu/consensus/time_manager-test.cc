@@ -15,16 +15,24 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <memory>
 #include <thread>
+#include <vector>
+
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/time_manager.h"
-#include "kudu/server/clock.h"
-#include "kudu/server/hybrid_clock.h"
-#include "kudu/server/logical_clock.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/util/countdown_latch.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/thread.h"
 
 namespace kudu {
 namespace consensus {
@@ -33,7 +41,7 @@ using std::unique_ptr;
 
 class TimeManagerTest : public KuduTest {
  public:
-  TimeManagerTest() : clock_(new server::HybridClock()) {}
+  TimeManagerTest() : clock_(new clock::HybridClock()) {}
 
   void SetUp() override {
     CHECK_OK(clock_->Init());
@@ -63,10 +71,10 @@ class TimeManagerTest : public KuduTest {
     return latch;
   }
 
-  scoped_refptr<server::HybridClock> clock_;
+  scoped_refptr<clock::HybridClock> clock_;
   scoped_refptr<TimeManager> time_manager_;
-  vector<unique_ptr<CountDownLatch>> latches_;
-  vector<std::thread> threads_;
+  std::vector<unique_ptr<CountDownLatch>> latches_;
+  std::vector<std::thread> threads_;
 };
 
 // Tests TimeManager's functionality in non-leader mode and the transition to leader mode.
@@ -81,9 +89,9 @@ TEST_F(TimeManagerTest, TestTimeManagerNonLeaderMode) {
   ASSERT_EQ(time_manager_->GetSafeTime(), init);
 
   // Check that 'before' is safe, as is 'init'. 'after' shouldn't be safe.
-  ASSERT_TRUE(time_manager_->IsTimestampSafeUnlocked(before));
-  ASSERT_TRUE(time_manager_->IsTimestampSafeUnlocked(init));
-  ASSERT_FALSE(time_manager_->IsTimestampSafeUnlocked(after));
+  ASSERT_TRUE(time_manager_->IsTimestampSafe(before));
+  ASSERT_TRUE(time_manager_->IsTimestampSafe(init));
+  ASSERT_FALSE(time_manager_->IsTimestampSafe(after));
 
   // Shouldn't be able to assign timestamps.
   ReplicateMsg message;
@@ -169,7 +177,7 @@ TEST_F(TimeManagerTest, TestTimeManagerLeaderMode) {
 
   // 'Now' should be safe.
   Timestamp now = clock_->Now();
-  ASSERT_TRUE(time_manager_->IsTimestampSafeUnlocked(now));
+  ASSERT_TRUE(time_manager_->IsTimestampSafe(now));
   ASSERT_GT(time_manager_->GetSafeTime(), now);
 
   // When changing to non-leader mode a timestamp after the last safe time shouldn't be

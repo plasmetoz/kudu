@@ -17,31 +17,24 @@
 #ifndef KUDU_RPC_SERVICE_IF_H
 #define KUDU_RPC_SERVICE_IF_H
 
-#include <unordered_map>
+#include <cstdint>
+#include <functional>
+#include <memory>
 #include <string>
+#include <unordered_map>
 
-#include "kudu/gutil/macros.h"
+#include <google/protobuf/message.h>
+
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/metrics.h"
-#include "kudu/util/net/sockaddr.h"
-#include "kudu/rpc/result_tracker.h"
-
-namespace google {
-namespace protobuf {
-class Message;
-}
-}
 
 namespace kudu {
-
-class Histogram;
-
 namespace rpc {
 
 class InboundCall;
 class RemoteMethod;
+class ResultTracker;
 class RpcContext;
-class ServiceIf;
 
 // Generated services define an instance of this class for each
 // method that they implement. The generic server code implemented
@@ -121,12 +114,16 @@ class GeneratedServiceIf : public ServiceIf {
 
   RpcMethodInfo* LookupMethod(const RemoteMethod& method) override;
 
+  // Returns the mapping from method names to method infos.
+  typedef std::unordered_map<std::string, scoped_refptr<RpcMethodInfo>> MethodInfoMap;
+  const MethodInfoMap& methods_by_name() const { return methods_by_name_; }
+
  protected:
   // For each method, stores the relevant information about how to handle the
   // call. Methods are inserted by the constructor of the generated subclass.
   // After construction, this map is accessed by multiple threads and therefore
   // must not be modified.
-  std::unordered_map<std::string, scoped_refptr<RpcMethodInfo>> methods_by_name_;
+  MethodInfoMap methods_by_name_;
 
   // The result tracker for this service's methods.
   scoped_refptr<ResultTracker> result_tracker_;

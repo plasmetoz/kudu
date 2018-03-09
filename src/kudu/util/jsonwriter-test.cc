@@ -15,19 +15,53 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <ostream>
+#include <stdint.h>
+#include <string>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/jsonwriter.h"
 #include "kudu/util/jsonwriter_test.pb.h"
-#include "kudu/util/logging.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/test_util.h"
 
+namespace google { namespace protobuf { class Message; } }
+
+using google::protobuf::Message;
 using jsonwriter_test::TestAllTypes;
 
 namespace kudu {
 
-class TestJsonWriter : public KuduTest {};
+class TestJsonWriter : public KuduTest {
+ protected:
+  void DoBenchmark(const Message& pb);
+
+  TestAllTypes MakeAllTypesPB() {
+    TestAllTypes pb;
+    pb.set_optional_int32(1);
+    pb.set_optional_int64(2);
+    pb.set_optional_uint32(3);
+    pb.set_optional_uint64(4);
+    pb.set_optional_sint32(5);
+    pb.set_optional_sint64(6);
+    pb.set_optional_fixed32(7);
+    pb.set_optional_fixed64(8);
+    pb.set_optional_sfixed32(9);
+    pb.set_optional_sfixed64(10);
+    pb.set_optional_float(11);
+    pb.set_optional_double(12);
+    pb.set_optional_bool(true);
+    pb.set_optional_string("hello world");
+    pb.set_optional_redacted_string("secret!");
+    pb.set_optional_nested_enum(TestAllTypes::FOO);
+    return pb;
+  }
+
+};
 
 TEST_F(TestJsonWriter, TestPBEmpty) {
   TestAllTypes pb;
@@ -36,23 +70,8 @@ TEST_F(TestJsonWriter, TestPBEmpty) {
 
 TEST_F(TestJsonWriter, TestPBAllFieldTypes) {
   ASSERT_NE("", gflags::SetCommandLineOption("redact", "log"));
-  TestAllTypes pb;
-  pb.set_optional_int32(1);
-  pb.set_optional_int64(2);
-  pb.set_optional_uint32(3);
-  pb.set_optional_uint64(4);
-  pb.set_optional_sint32(5);
-  pb.set_optional_sint64(6);
-  pb.set_optional_fixed32(7);
-  pb.set_optional_fixed64(8);
-  pb.set_optional_sfixed32(9);
-  pb.set_optional_sfixed64(10);
-  pb.set_optional_float(11);
-  pb.set_optional_double(12);
-  pb.set_optional_bool(true);
-  pb.set_optional_string("hello world");
-  pb.set_optional_redacted_string("secret!");
-  pb.set_optional_nested_enum(TestAllTypes::FOO);
+  TestAllTypes pb = MakeAllTypesPB();
+
   ASSERT_EQ("{\n"
             "    \"optional_int32\": 1,\n"
             "    \"optional_int64\": 2,\n"
@@ -154,6 +173,44 @@ TEST_F(TestJsonWriter, TestPBNestedMessage) {
             "\"repeated_nested_message\":"
             "[{\"int_field\":12345}]}",
             JsonWriter::ToJson(pb, JsonWriter::COMPACT));
+}
+
+void TestJsonWriter::DoBenchmark(const Message& pb) {
+  int64_t total_len = 0;
+  Stopwatch sw;
+  sw.start();
+  while (sw.elapsed().wall_seconds() < 5) {
+    std::ostringstream str;
+    JsonWriter jw(&str, JsonWriter::COMPACT);
+    jw.StartArray();
+    for (int i = 0; i < 10000; i++) {
+      jw.Protobuf(pb);
+    }
+    jw.EndArray();
+    total_len += str.str().size();
+  }
+  sw.stop();
+  double mbps = total_len / 1024.0 / 1024.0 / sw.elapsed().user_cpu_seconds();
+  LOG(INFO) << "Throughput: " << mbps << "MB/sec";
+}
+
+TEST_F(TestJsonWriter, BenchmarkAllTypes) {
+  DoBenchmark(MakeAllTypesPB());
+}
+
+TEST_F(TestJsonWriter, BenchmarkNestedMessage) {
+  TestAllTypes pb;
+  pb.add_repeated_nested_message()->set_int_field(12345);
+  pb.mutable_optional_nested_message()->set_int_field(54321);
+  DoBenchmark(pb);
+}
+
+TEST_F(TestJsonWriter, BenchmarkRepeatedInt64) {
+  TestAllTypes pb;
+  for (int i = 0; i < 10000; i++) {
+    pb.add_repeated_int64(i);
+  }
+  DoBenchmark(pb);
 }
 
 } // namespace kudu

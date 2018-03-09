@@ -20,21 +20,31 @@
 #ifndef KUDU_TOOLS_KSCK_H
 #define KUDU_TOOLS_KSCK_H
 
-#include <gtest/gtest_prod.h>
+#include <cstdint>
+#include <map>
 #include <memory>
+#include <iosfwd>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
 #include "kudu/common/schema.h"
-#include "kudu/tablet/tablet.pb.h"
-#include "kudu/util/countdown_latch.h"
-#include "kudu/util/locks.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet.pb.h"  // IWYU pragma: keep
+#include "kudu/tools/color.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
-class MonoDelta;
 namespace tools {
 
 class KsckTable;
@@ -62,30 +72,86 @@ struct ChecksumOptions {
   // The snapshot timestamp to use for snapshot checksum scans.
   uint64_t snapshot_timestamp;
 
-  // A timestamp indicicating that the current time should be used for a checksum snapshot.
+  // A timestamp indicating that the current time should be used for a checksum snapshot.
   static const uint64_t kCurrentTimestamp;
 };
 
 // Representation of a tablet replica on a tablet server.
 class KsckTabletReplica {
  public:
-  KsckTabletReplica(std::string ts_uuid, bool is_leader)
-      : is_leader_(is_leader),
-        ts_uuid_(std::move(ts_uuid)) {
-  }
-
-  const bool& is_leader() const {
-    return is_leader_;
+  KsckTabletReplica(std::string ts_uuid, bool is_leader, bool is_voter)
+      : ts_uuid_(std::move(ts_uuid)),
+        is_leader_(is_leader),
+        is_voter_(is_voter) {
   }
 
   const std::string& ts_uuid() const {
     return ts_uuid_;
   }
 
+  bool is_leader() const {
+    return is_leader_;
+  }
+
+  bool is_voter() const {
+    return is_voter_;
+  }
+
  private:
-  const bool is_leader_;
   const std::string ts_uuid_;
+  const bool is_leader_;
+  const bool is_voter_;
+
   DISALLOW_COPY_AND_ASSIGN(KsckTabletReplica);
+};
+
+// Possible types of consensus configs.
+enum class KsckConsensusConfigType {
+  // A config reported by the master.
+  MASTER,
+  // A config that has been committed.
+  COMMITTED,
+  // A config that has not yet been committed.
+  PENDING,
+};
+
+// Representation of a consensus state.
+struct KsckConsensusState {
+  KsckConsensusState(KsckConsensusConfigType type,
+                     boost::optional<int64_t> term,
+                     boost::optional<int64_t> opid_index,
+                     boost::optional<std::string> leader_uuid,
+                     const std::vector<std::string>& voters,
+                     const std::vector<std::string>& non_voters)
+    : type(type),
+      term(std::move(term)),
+      opid_index(std::move(opid_index)),
+      leader_uuid(std::move(leader_uuid)),
+      voter_uuids(voters.cbegin(), voters.cend()),
+      non_voter_uuids(non_voters.cbegin(), non_voters.cend()) {
+  }
+
+  // Two KsckConsensusState structs match if they have the same
+  // leader_uuid, the same set of peers, and one of the following holds:
+  // - at least one of them is of type MASTER
+  // - they are configs of the same type and they have the same term
+  bool Matches(const KsckConsensusState &other) const {
+    bool same_leader_and_peers =
+        leader_uuid == other.leader_uuid &&
+        voter_uuids == other.voter_uuids &&
+        non_voter_uuids == other.non_voter_uuids;
+    if (type == KsckConsensusConfigType::MASTER || other.type == KsckConsensusConfigType::MASTER) {
+      return same_leader_and_peers;
+    }
+    return type == other.type && term == other.term && same_leader_and_peers;
+  }
+
+  KsckConsensusConfigType type;
+  boost::optional<int64_t> term;
+  boost::optional<int64_t> opid_index;
+  boost::optional<std::string> leader_uuid;
+  std::set<std::string> voter_uuids;
+  std::set<std::string> non_voter_uuids;
 };
 
 // Representation of a tablet belonging to a table. The tablet is composed of replicas.
@@ -101,12 +167,12 @@ class KsckTablet {
     return id_;
   }
 
-  const std::vector<std::shared_ptr<KsckTabletReplica> >& replicas() const {
+  const std::vector<std::shared_ptr<KsckTabletReplica>>& replicas() const {
     return replicas_;
   }
 
-  void set_replicas(std::vector<std::shared_ptr<KsckTabletReplica> >& replicas) {
-    replicas_.assign(replicas.begin(), replicas.end());
+  void set_replicas(std::vector<std::shared_ptr<KsckTabletReplica>> replicas) {
+    replicas_.swap(replicas);
   }
 
   KsckTable* table() {
@@ -142,7 +208,7 @@ class KsckTable {
     tablets_ = std::move(tablets);
   }
 
-  std::vector<std::shared_ptr<KsckTablet> >& tablets() {
+  std::vector<std::shared_ptr<KsckTablet>>& tablets() {
     return tablets_;
   }
 
@@ -178,13 +244,20 @@ class ChecksumProgressCallbacks {
 class KsckTabletServer {
  public:
   // Map from tablet id to tablet replicas.
-  typedef std::unordered_map<std::string, tablet::TabletStatusPB > TabletStatusMap;
+  typedef std::unordered_map<std::string, tablet::TabletStatusPB> TabletStatusMap;
+
+  // Map from (tserver id, tablet id) to tablet consensus information.
+  typedef std::map
+      <std::pair<std::string, std::string>, consensus::ConsensusStatePB> TabletConsensusStateMap;
 
   explicit KsckTabletServer(std::string uuid) : uuid_(std::move(uuid)) {}
   virtual ~KsckTabletServer() { }
 
   // Connects to the configured tablet server and populates the fields of this class.
   virtual Status FetchInfo() = 0;
+
+  // Connects to the configured tablet server and populates the consensus map.
+  virtual Status FetchConsensusState() = 0;
 
   // Executes a checksum scan on the associated tablet, and runs the callback
   // with the result. The callback must be threadsafe and non-blocking.
@@ -215,6 +288,12 @@ class KsckTabletServer {
     return tablet_status_map_;
   }
 
+  // Gets the mapping of tablet id to tablet consensus info for this tablet server.
+  const TabletConsensusStateMap& tablet_consensus_state_map() const {
+    CHECK_EQ(state_, kFetched);
+    return tablet_consensus_state_map_;
+  }
+
   tablet::TabletStatePB ReplicaState(const std::string& tablet_id) const;
 
   uint64_t current_timestamp() const {
@@ -224,6 +303,10 @@ class KsckTabletServer {
 
  protected:
   friend class KsckTest;
+  FRIEND_TEST(KsckTest, TestConsensusConflictExtraPeer);
+  FRIEND_TEST(KsckTest, TestConsensusConflictDifferentLeader);
+  FRIEND_TEST(KsckTest, TestConsensusConflictMissingPeer);
+  FRIEND_TEST(KsckTest, TestMasterNotReportingTabletServerWithConsensusConflict);
   FRIEND_TEST(KsckTest, TestMismatchedAssignments);
 
   enum State {
@@ -233,11 +316,11 @@ class KsckTabletServer {
   };
   State state_ = kUninitialized;
   TabletStatusMap tablet_status_map_;
+  TabletConsensusStateMap tablet_consensus_state_map_;
   uint64_t timestamp_;
-
- private:
   const std::string uuid_;
 
+ private:
   DISALLOW_COPY_AND_ASSIGN(KsckTabletServer);
 };
 
@@ -245,7 +328,7 @@ class KsckTabletServer {
 class KsckMaster {
  public:
   // Map of KsckTabletServer objects keyed by tablet server permanent_uuid.
-  typedef std::unordered_map<std::string, std::shared_ptr<KsckTabletServer> > TSMap;
+  typedef std::unordered_map<std::string, std::shared_ptr<KsckTabletServer>> TSMap;
 
   KsckMaster() { }
   virtual ~KsckMaster() { }
@@ -260,8 +343,7 @@ class KsckMaster {
 
   // Gets the list of tables from the Master and stores it in the passed vector.
   // tables is only modified if this method returns OK.
-  virtual Status RetrieveTablesList(
-      std::vector<std::shared_ptr<KsckTable> >* tables) = 0;
+  virtual Status RetrieveTablesList(std::vector<std::shared_ptr<KsckTable>>* tables) = 0;
 
   // Gets the list of tablets for the specified table and stores the list in it.
   // The table's tablet list is only modified if this method returns OK.
@@ -290,11 +372,13 @@ class KsckCluster {
     return tablet_servers_;
   }
 
-  const std::vector<std::shared_ptr<KsckTable> >& tables() {
+  const std::vector<std::shared_ptr<KsckTable>>& tables() {
     return tables_;
   }
 
  private:
+  friend class KsckTest;
+
   // Gets the list of tablet servers from the Master.
   Status RetrieveTabletServers();
 
@@ -306,16 +390,17 @@ class KsckCluster {
 
   const std::shared_ptr<KsckMaster> master_;
   KsckMaster::TSMap tablet_servers_;
-  std::vector<std::shared_ptr<KsckTable> > tables_;
+  std::vector<std::shared_ptr<KsckTable>> tables_;
   DISALLOW_COPY_AND_ASSIGN(KsckCluster);
 };
 
 // Externally facing class to run checks against the provided cluster.
 class Ksck {
  public:
-  explicit Ksck(std::shared_ptr<KsckCluster> cluster)
-      : cluster_(std::move(cluster)) {}
-  ~Ksck() {}
+  explicit Ksck(std::shared_ptr<KsckCluster> cluster,
+                std::ostream* out = nullptr);
+
+  ~Ksck() = default;
 
   // Set whether ksck should verify that each of the tablet's raft configurations
   // has the same number of replicas that is specified by the tablet metadata.
@@ -333,12 +418,12 @@ class Ksck {
   // If tablets is not empty, checks only the specified tablet IDs.
   // If both are specified, takes the intersection.
   // If both are empty (unset), all tables and tablets are checked.
-  void set_table_filters(vector<string> table_names) {
+  void set_table_filters(std::vector<std::string> table_names) {
     table_filters_ = std::move(table_names);
   }
 
   // See above.
-  void set_tablet_id_filters(vector<string> tablet_ids) {
+  void set_tablet_id_filters(std::vector<std::string> tablet_ids) {
     tablet_id_filters_ = std::move(tablet_ids);
   }
 
@@ -356,10 +441,11 @@ class Ksck {
   // Must first call FetchTableAndTabletInfo().
   Status ConnectToTabletServer(const std::shared_ptr<KsckTabletServer>& ts);
 
-  // Verifies that all the tables have contiguous tablets and that each tablet has enough replicas
-  // and a leader.
-  // Must first call FetchTableAndTabletInfo() and, if doing checks againt tablet
-  // servers (the default), must first call FetchInfoFromTabletServers().
+  // Verifies that all the tablets in all tables matching the filters have
+  // enough replicas, and that each tablet's view of the tablet's consensus
+  // matches every other tablet's and the master's.
+  // Must first call FetchTableAndTabletInfo() and, if doing checks against
+  // tablet servers (the default), must first call FetchInfoFromTabletServers().
   Status CheckTablesConsistency();
 
   // Verifies data checksums on all tablets by doing a scan of the database on each replica.
@@ -370,21 +456,69 @@ class Ksck {
   enum class CheckResult {
     OK,
     UNDER_REPLICATED,
-    UNAVAILABLE
+    UNAVAILABLE,
+    // There was a discrepancy among the tablets' consensus configs and the master's.
+    CONSENSUS_MISMATCH,
   };
 
-  bool VerifyTable(const std::shared_ptr<KsckTable>& table);
+  // Summarizes the result of VerifyTable().
+  struct TableSummary {
+    std::string name;
+    int healthy_tablets = 0;
+    int underreplicated_tablets = 0;
+    int consensus_mismatch_tablets = 0;
+    int unavailable_tablets = 0;
+
+    int TotalTablets() const {
+      return healthy_tablets + underreplicated_tablets +
+          consensus_mismatch_tablets + unavailable_tablets;
+    }
+
+    // Summarize the table's status with a tablet CheckResult.
+    // A table's status is determined by the health of the least healthy tablet.
+    CheckResult TableStatus() const {
+      if (unavailable_tablets > 0) {
+        return CheckResult::UNAVAILABLE;
+      }
+      if (consensus_mismatch_tablets > 0) {
+        return CheckResult::CONSENSUS_MISMATCH;
+      }
+      if (underreplicated_tablets > 0) {
+        return CheckResult::UNDER_REPLICATED;
+      }
+      return CheckResult::OK;
+    }
+  };
+
+  bool VerifyTable(const std::shared_ptr<KsckTable>& table, TableSummary* ts);
   bool VerifyTableWithTimeout(const std::shared_ptr<KsckTable>& table,
                               const MonoDelta& timeout,
                               const MonoDelta& retry_interval);
   CheckResult VerifyTablet(const std::shared_ptr<KsckTablet>& tablet,
                            int table_num_replicas);
 
+  // Print an informational message to this instance's output stream.
+  std::ostream& Out() {
+    return *out_;
+  }
+
+  // Print an error message to this instance's output stream.
+  std::ostream& Error() {
+    return (*out_) << Color(AnsiCode::RED, "ERROR: ");
+  }
+
+  // Print a warning message to this instance's output stream.
+  std::ostream& Warn() {
+    return (*out_) << Color(AnsiCode::YELLOW, "WARNING: ");
+  }
+
   const std::shared_ptr<KsckCluster> cluster_;
 
   bool check_replica_count_ = true;
-  vector<string> table_filters_;
-  vector<string> tablet_id_filters_;
+  std::vector<std::string> table_filters_;
+  std::vector<std::string> tablet_id_filters_;
+
+  std::ostream* const out_;
 
   DISALLOW_COPY_AND_ASSIGN(Ksck);
 };

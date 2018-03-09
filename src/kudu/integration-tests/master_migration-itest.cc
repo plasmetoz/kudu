@@ -15,21 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "kudu/client/client.h"
+#include <gtest/gtest.h>
+
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/strip.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
 #include "kudu/master/sys_catalog.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/util/env.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/status.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using kudu::client::KuduClient;
@@ -41,7 +50,11 @@ using kudu::client::KuduSchemaBuilder;
 using kudu::client::KuduTable;
 using kudu::client::KuduTableCreator;
 using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
+using kudu::cluster::ScopedResumeExternalDaemon;
 using kudu::master::SysCatalogTable;
+using std::pair;
 using std::string;
 using std::vector;
 using std::unique_ptr;
@@ -68,7 +81,7 @@ class MasterMigrationTest : public KuduTest {
     if (cluster_) {
       cluster_->Shutdown();
     }
-    cluster_.reset(new ExternalMiniCluster(ExternalMiniClusterOptions()));
+    cluster_.reset(new ExternalMiniCluster());
     ASSERT_OK(cluster_->Start());
   }
 
@@ -110,13 +123,15 @@ TEST_F(MasterMigrationTest, TestEndToEndMigration) {
   // Format a filesystem tree for each of the new masters and get the uuids.
   for (int i = 1; i < kMasterRpcPorts.size(); i++) {
     string data_root = cluster_->GetDataPath(Substitute("master-$0", i));
+    string wal_dir = cluster_->GetWalPath(Substitute("master-$0", i));
     ASSERT_OK(env_->CreateDir(DirName(data_root)));
+    ASSERT_OK(env_->CreateDir(wal_dir));
     {
       vector<string> args = {
           kBinPath,
           "fs",
           "format",
-          "--fs_wal_dir=" + data_root,
+          "--fs_wal_dir=" + wal_dir,
           "--fs_data_dirs=" + data_root
       };
       ASSERT_OK(Subprocess::Call(args));
@@ -127,7 +142,7 @@ TEST_F(MasterMigrationTest, TestEndToEndMigration) {
           "fs",
           "dump",
           "uuid",
-          "--fs_wal_dir=" + data_root,
+          "--fs_wal_dir=" + wal_dir,
           "--fs_data_dirs=" + data_root
       };
       string uuid;
@@ -145,7 +160,7 @@ TEST_F(MasterMigrationTest, TestEndToEndMigration) {
         "local_replica",
         "cmeta",
         "rewrite_raft_config",
-        "--fs_wal_dir=" + data_root,
+        "--fs_wal_dir=" + cluster_->GetWalPath("master-0"),
         "--fs_data_dirs=" + data_root,
         SysCatalogTable::kSysCatalogTabletId
     };
@@ -168,11 +183,12 @@ TEST_F(MasterMigrationTest, TestEndToEndMigration) {
   // filesystems.
   for (int i = 1; i < kMasterRpcPorts.size(); i++) {
     string data_root = cluster_->GetDataPath(Substitute("master-$0", i));
+    string wal_dir = cluster_->GetWalPath(Substitute("master-$0", i));
     vector<string> args = {
         kBinPath,
         "local_replica",
         "copy_from_remote",
-        "--fs_wal_dir=" + data_root,
+        "--fs_wal_dir=" + wal_dir,
         "--fs_data_dirs=" + data_root,
         SysCatalogTable::kSysCatalogTabletId,
         cluster_->master()->bound_rpc_hostport().ToString()
@@ -183,11 +199,12 @@ TEST_F(MasterMigrationTest, TestEndToEndMigration) {
   // Bring down the old cluster configuration and bring up the new one.
   cluster_->Shutdown();
   ExternalMiniClusterOptions opts;
+  // Required since we use 127.0.0.1 in the config above.
+  opts.bind_mode = cluster::MiniCluster::LOOPBACK;
   opts.master_rpc_ports = kMasterRpcPorts;
   opts.num_masters = kMasterRpcPorts.size();
-  ExternalMiniCluster migrated_cluster(opts);
+  ExternalMiniCluster migrated_cluster(std::move(opts));
   ASSERT_OK(migrated_cluster.Start());
-
 
   // Perform an operation that requires an elected leader.
   shared_ptr<KuduClient> client;
@@ -205,7 +222,7 @@ TEST_F(MasterMigrationTest, TestEndToEndMigration) {
   // Only in slow mode.
   if (AllowSlowTests()) {
     for (int i = 0; i < migrated_cluster.num_masters(); i++) {
-      migrated_cluster.master(i)->Pause();
+      ASSERT_OK(migrated_cluster.master(i)->Pause());
       ScopedResumeExternalDaemon resume_daemon(migrated_cluster.master(i));
       ASSERT_OK(client->OpenTable(kTableName, &table));
       ASSERT_EQ(0, CountTableRows(table.get()));

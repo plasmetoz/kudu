@@ -22,8 +22,8 @@ import static org.junit.Assert.assertTrue;
 import java.util.Random;
 
 import com.google.common.collect.Lists;
+import org.junit.After;
 import org.junit.BeforeClass;
-import org.junit.Test;
 
 import org.apache.kudu.Schema;
 
@@ -35,11 +35,11 @@ public class ITScannerMultiTablet extends BaseKuduTest {
 
   private static final String TABLE_NAME =
       ITScannerMultiTablet.class.getName()+"-"+System.currentTimeMillis();
-  private static final int ROW_COUNT = 20000;
-  private static final int TABLET_COUNT = 3;
+  protected static final int ROW_COUNT = 20000;
+  protected static final int TABLET_COUNT = 3;
 
   private static Schema schema = getBasicSchema();
-  private static KuduTable table;
+  protected static KuduTable table;
 
   private static Random random = new Random(1234);
 
@@ -74,57 +74,123 @@ public class ITScannerMultiTablet extends BaseKuduTest {
     assertEquals(0, session.countPendingErrors());
   }
 
-  /**
-   * Test for KUDU-1343 with a multi-batch multi-tablet scan.
-   */
-  @Test(timeout = 100000)
-  public void testKudu1343() throws Exception {
-    KuduScanner scanner = syncClient.newScannerBuilder(table)
-        .batchSizeBytes(1) // Just a hint, won't actually be that small
-        .build();
-
-    int rowCount = 0;
-    int loopCount = 0;
-    while(scanner.hasMoreRows()) {
-      loopCount++;
-      RowResultIterator rri = scanner.nextRows();
-      while (rri.hasNext()) {
-        rri.next();
-        rowCount++;
-      }
-    }
-
-    assertTrue(loopCount > TABLET_COUNT);
-    assertEquals(ROW_COUNT, rowCount);
+  @After
+  public void tearDown() throws Exception {
+    restartTabletServers();
   }
 
   /**
-   * Makes sure we pass all the correct information down to the server by verifying we get rows in
-   * order from 4 tablets. We detect those tablet boundaries when keys suddenly become smaller than
-   * what was previously seen.
+   * Injecting failures (kill or restart TabletServer) while scanning, to verify:
+   * fault tolerant scanner will continue scan and non-fault tolerant scanner will throw
+   * {@link NonRecoverableException}.
+   *
+   * Also makes sure we pass all the correct information down to the server by verifying
+   * we get rows in order from 3 tablets. We detect those tablet boundaries when keys suddenly
+   * become smaller than what was previously seen.
+   *
+   * @param restart if true restarts TabletServer, otherwise kills TabletServer
+   * @param isFaultTolerant if true uses fault tolerant scanner, otherwise
+   *                        uses non fault-tolerant one
+   * @param finishFirstScan if true injects failure before finishing first tablet scan,
+   *                        otherwise in the middle of tablet scanning
+   * @throws Exception
    */
-  @Test(timeout = 100000)
-  public void testSortResultsByPrimaryKey() throws Exception {
+  void serverFaultInjection(boolean restart, boolean isFaultTolerant,
+      boolean finishFirstScan) throws Exception {
     KuduScanner scanner = syncClient.newScannerBuilder(table)
-        .sortResultsByPrimaryKey()
-        .setProjectedColumnIndexes(Lists.newArrayList(0))
+        .setFaultTolerant(isFaultTolerant)
+        .batchSizeBytes(1)
+        .setProjectedColumnIndexes(Lists.newArrayList(0)).build();
+
+    try {
+      int rowCount = 0;
+      int previousRow = -1;
+      int tableBoundariesCount = 0;
+      if (scanner.hasMoreRows()) {
+        RowResultIterator rri = scanner.nextRows();
+        while (rri.hasNext()) {
+          int key = rri.next().getInt(0);
+          if (key < previousRow) {
+            tableBoundariesCount++;
+          }
+          previousRow = key;
+          rowCount++;
+        }
+      }
+
+      if (!finishFirstScan) {
+        if (restart) {
+          restartTabletServer(scanner.currentTablet());
+        } else {
+          killTabletLeader(scanner.currentTablet());
+        }
+      }
+
+      boolean failureInjected = false;
+      while (scanner.hasMoreRows()) {
+        RowResultIterator rri = scanner.nextRows();
+        while (rri.hasNext()) {
+          int key = rri.next().getInt(0);
+          if (key < previousRow) {
+            tableBoundariesCount++;
+            if (finishFirstScan && !failureInjected) {
+              if (restart) {
+                restartTabletServer(scanner.currentTablet());
+              } else {
+                killTabletLeader(scanner.currentTablet());
+              }
+              failureInjected = true;
+            }
+          }
+          previousRow = key;
+          rowCount++;
+        }
+      }
+
+      assertEquals(ROW_COUNT, rowCount);
+      assertEquals(TABLET_COUNT, tableBoundariesCount);
+    } finally {
+      scanner.close();
+    }
+  }
+
+  /**
+   * Injecting failures (i.e. drop client connection) while scanning, to verify:
+   * both non-fault tolerant scanner and fault tolerant scanner will continue scan as expected.
+   *
+   * @param isFaultTolerant if true use fault-tolerant scanner, otherwise use non-fault-tolerant one
+   * @throws Exception
+   */
+  void clientFaultInjection(boolean isFaultTolerant) throws KuduException {
+    KuduScanner scanner = syncClient.newScannerBuilder(table)
+        .setFaultTolerant(isFaultTolerant)
+        .batchSizeBytes(1)
         .build();
 
-    int rowCount = 0;
-    int previousRow = -1;
-    int tableBoundariesCount = 0;
-    while(scanner.hasMoreRows()) {
-      RowResultIterator rri = scanner.nextRows();
-      while (rri.hasNext()) {
-        int key = rri.next().getInt(0);
-        if (key < previousRow) {
-          tableBoundariesCount++;
-        }
-        previousRow = key;
-        rowCount++;
+    try {
+      int rowCount = 0;
+      int loopCount = 0;
+      if (scanner.hasMoreRows()) {
+        loopCount++;
+        RowResultIterator rri = scanner.nextRows();
+        rowCount += rri.getNumRows();
       }
+
+      // Forcefully disconnects the current connection and fails all outstanding RPCs
+      // in the middle of scanning.
+      client.newRpcProxy(scanner.currentTablet().getReplicaSelectedServerInfo(
+          scanner.getReplicaSelection())).getConnection().disconnect();
+
+      while (scanner.hasMoreRows()) {
+        loopCount++;
+        RowResultIterator rri = scanner.nextRows();
+        rowCount += rri.getNumRows();
+      }
+
+      assertTrue(loopCount > TABLET_COUNT);
+      assertEquals(ROW_COUNT, rowCount);
+    } finally {
+      scanner.close();
     }
-    assertEquals(ROW_COUNT, rowCount);
-    assertEquals(TABLET_COUNT, tableBoundariesCount);
   }
 }

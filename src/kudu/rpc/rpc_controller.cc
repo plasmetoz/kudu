@@ -17,19 +17,29 @@
 
 #include "kudu/rpc/rpc_controller.h"
 
-#include <algorithm>
-#include <glog/logging.h>
 #include <memory>
 #include <mutex>
+#include <ostream>
+#include <utility>
 
-#include "kudu/rpc/rpc_header.pb.h"
+#include <glog/logging.h>
+
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/outbound_call.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_sidecar.h"
+#include "kudu/rpc/transfer.h"
 
 using std::unique_ptr;
+namespace kudu {
 
-namespace kudu { namespace rpc {
+class Slice;
 
-RpcController::RpcController() {
+namespace rpc {
+
+RpcController::RpcController()
+    : credentials_policy_(CredentialsPolicy::ANY_CREDENTIALS), messenger_(nullptr) {
   DVLOG(4) << "RpcController " << this << " constructed";
 }
 
@@ -48,6 +58,7 @@ void RpcController::Swap(RpcController* other) {
 
   std::swap(outbound_sidecars_, other->outbound_sidecars_);
   std::swap(timeout_, other->timeout_);
+  std::swap(credentials_policy_, other->credentials_policy_);
   std::swap(call_, other->call_);
 }
 
@@ -58,11 +69,21 @@ void RpcController::Reset() {
   }
   call_.reset();
   required_server_features_.clear();
+  credentials_policy_ = CredentialsPolicy::ANY_CREDENTIALS;
+  messenger_ = nullptr;
 }
 
 bool RpcController::finished() const {
   if (call_) {
     return call_->IsFinished();
+  }
+  return false;
+}
+
+bool RpcController::negotiation_failed() const {
+  if (call_) {
+    DCHECK(finished());
+    return call_->IsNegotiationError();
   }
   return false;
 }
@@ -130,6 +151,12 @@ Status RpcController::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {
 void RpcController::SetRequestParam(const google::protobuf::Message& req) {
   DCHECK(call_ != nullptr);
   call_->SetRequestPayload(req, std::move(outbound_sidecars_));
+}
+
+void RpcController::Cancel() {
+  DCHECK(call_);
+  DCHECK(messenger_);
+  messenger_->QueueCancellation(call_);
 }
 
 } // namespace rpc

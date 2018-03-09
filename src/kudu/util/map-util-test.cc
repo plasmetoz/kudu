@@ -19,9 +19,12 @@
 // part of util.
 #include "kudu/gutil/map-util.h"
 
-#include <gtest/gtest.h>
 #include <map>
 #include <memory>
+#include <string>
+#include <utility>
+
+#include <gtest/gtest.h>
 
 using std::map;
 using std::string;
@@ -91,13 +94,23 @@ TEST(EraseKeyReturnValuePtrTest, TestRawAndSmartSmartPointers) {
   map<string, shared_ptr<string>> my_map2;
   shared_ptr<string> value2 = EraseKeyReturnValuePtr(&my_map2, "key");
   ASSERT_TRUE(value2.get() == nullptr);
-  my_map2.emplace("key", shared_ptr<string>(new string("hello_world")));
+  my_map2.emplace("key", std::make_shared<string>("hello_world"));
   value2 = EraseKeyReturnValuePtr(&my_map2, "key");
   ASSERT_EQ(*value2, "hello_world");
   map<string, string*> my_map_raw;
   my_map_raw.emplace("key", new string("hello_world"));
   value.reset(EraseKeyReturnValuePtr(&my_map_raw, "key"));
   ASSERT_EQ(*value, "hello_world");
+}
+
+TEST(EmplaceTest, TestEmplace) {
+  // Map with move-only value type.
+  map<string, unique_ptr<string>> my_map;
+  unique_ptr<string> val(new string("foo"));
+  ASSERT_TRUE(EmplaceIfNotPresent(&my_map, "k", std::move(val)));
+  ASSERT_TRUE(ContainsKey(my_map, "k"));
+  ASSERT_FALSE(EmplaceIfNotPresent(&my_map, "k", nullptr))
+      << "Should return false for already-present";
 }
 
 } // namespace kudu

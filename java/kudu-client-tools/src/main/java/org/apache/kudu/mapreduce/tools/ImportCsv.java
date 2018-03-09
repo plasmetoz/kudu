@@ -1,17 +1,19 @@
-/**
- *
- * Licensed under the Apache License, Version 2.0 (the "License");
- * you may not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *   http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing, software
- * distributed under the License is distributed on an "AS IS" BASIS,
- * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
- * See the License for the specific language governing permissions and
- * limitations under the License. See accompanying LICENSE file.
- */
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
 
 package org.apache.kudu.mapreduce.tools;
 
@@ -25,9 +27,9 @@ import org.apache.hadoop.mapreduce.lib.input.FileInputFormat;
 import org.apache.hadoop.mapreduce.lib.input.TextInputFormat;
 import org.apache.hadoop.util.Tool;
 import org.apache.hadoop.util.ToolRunner;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.mapreduce.CommandLineParser;
 import org.apache.kudu.mapreduce.KuduTableMapReduceUtil;
 
@@ -50,10 +52,10 @@ public class ImportCsv extends Configured implements Tool {
   /**
    * Sets up the actual job.
    *
-   * @param conf The current configuration.
-   * @param args The command line parameters.
-   * @return The newly created job.
-   * @throws java.io.IOException When setting up the job fails.
+   * @param conf the current configuration
+   * @param args the command line parameters
+   * @return the newly created job
+   * @throws java.io.IOException when setting up the job fails
    */
   @SuppressWarnings("deprecation")
   public static Job createSubmittableJob(Configuration conf, String[] args)
@@ -79,7 +81,7 @@ public class ImportCsv extends Configured implements Tool {
   }
 
   /*
-   * @param errorMsg Error message. Can be null.
+   * @param errorMsg error message. Can be null
    */
   private static void usage(final String errorMsg) {
     if (errorMsg != null && errorMsg.length() > 0) {

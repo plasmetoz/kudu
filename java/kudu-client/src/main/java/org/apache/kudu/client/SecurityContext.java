@@ -24,7 +24,6 @@ import java.security.cert.X509Certificate;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicReference;
-
 import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import javax.net.ssl.SSLContext;
@@ -34,6 +33,7 @@ import javax.net.ssl.TrustManagerFactory;
 import javax.net.ssl.X509TrustManager;
 import javax.security.auth.Subject;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
@@ -52,6 +52,7 @@ import org.apache.kudu.security.Token.TokenPB;
  */
 class SecurityContext {
   @GuardedBy("this")
+  @Nullable
   private SignedTokenPB authnToken;
 
   private final DelegatedTrustManager trustManager = new DelegatedTrustManager();
@@ -75,9 +76,15 @@ class SecurityContext {
   /**
    * The currently trusted CA certs, in DER format.
    */
-  private List<ByteString> trustedCertDers = Collections.emptyList();
+  @VisibleForTesting
+  List<ByteString> trustedCertDers = Collections.emptyList();
 
-  public SecurityContext(Subject subject) {
+  /**
+   * Construct SecurityContext object with the specified JAAS subject.
+   *
+   * @param subject JAAS Subject that the client's credentials are stored in
+   */
+  SecurityContext(Subject subject) {
     try {
       this.subject = subject;
 
@@ -86,16 +93,17 @@ class SecurityContext {
 
       this.sslContextTrustAny = SSLContext.getInstance("TLS");
       sslContextTrustAny.init(null, new TrustManager[] { new TrustAnyCert() }, null);
-
     } catch (Exception e) {
-      throw Throwables.propagate(e);
+      throw new RuntimeException(e);
     }
   }
 
+  @Nullable
   public Subject getSubject() {
     return subject;
   }
 
+  @Nullable
   public synchronized byte[] exportAuthenticationCredentials() {
     if (authnToken == null || !hasTrustedCerts()) {
       return null;
@@ -149,6 +157,7 @@ class SecurityContext {
   /**
    * @return the current authentication token, or null if we have no valid token
    */
+  @Nullable
   public synchronized SignedTokenPB getAuthenticationToken() {
     return authnToken;
   }
@@ -218,8 +227,8 @@ class SecurityContext {
       }
       return (X509TrustManager) managers[0];
     } catch (Exception e) {
-      Throwables.propagateIfInstanceOf(e, CertificateException.class);
-      throw Throwables.propagate(e);
+      Throwables.throwIfInstanceOf(e, CertificateException.class);
+      throw new RuntimeException(e);
     }
   }
 
@@ -261,7 +270,7 @@ class SecurityContext {
    * can be swapped out atomically.
    */
   private static class DelegatedTrustManager implements X509TrustManager {
-    AtomicReference<X509TrustManager> delegate = new AtomicReference<>();
+    final AtomicReference<X509TrustManager> delegate = new AtomicReference<>();
 
     @Override
     public void checkClientTrusted(X509Certificate[] chain, String authType)
@@ -280,4 +289,5 @@ class SecurityContext {
       return delegate.get().getAcceptedIssuers();
     }
   }
+
 }

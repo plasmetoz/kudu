@@ -16,30 +16,49 @@
 // under the License.
 
 #include <algorithm>
+#include <memory>
+#include <cstdlib>
+#include <cstdint>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
-#include <memory>
 
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
 #include "kudu/common/generic_iterators.h"
 #include "kudu/common/column_materialization_context.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/mathlimits.h"
+#include "kudu/gutil/port.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
-#include "kudu/util/test_util.h"
 
 DEFINE_int32(num_lists, 3, "Number of lists to merge");
 DEFINE_int32(num_rows, 1000, "Number of entries per list");
 DEFINE_int32(num_iters, 1, "Number of times to run merge");
 
+using std::make_shared;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+
 namespace kudu {
 
-using std::shared_ptr;
+struct IteratorStats;
 
 static const Schema kIntSchema({ ColumnSchema("val", UINT32) }, 1);
 
@@ -236,7 +255,7 @@ TEST(TestMaterializingIterator, TestMaterializingPredicatePushdown) {
   spec.AddPredicate(pred1.pred_);
   LOG(INFO) << "Predicate: " << pred1.pred_.ToString();
 
-  vector<uint32> ints;
+  vector<uint32_t> ints;
   for (int i = 0; i < 100; i++) {
     ints.push_back(i);
   }
@@ -246,7 +265,7 @@ TEST(TestMaterializingIterator, TestMaterializingPredicatePushdown) {
   ASSERT_OK(materializing.Init(&spec));
   ASSERT_EQ(0, spec.predicates().size()) << "Iterator should have pushed down predicate";
 
-  Arena arena(1024, 1024);
+  Arena arena(1024);
   RowBlock dst(kIntSchema, 100, &arena);
   ASSERT_OK(materializing.NextBlock(&dst));
   ASSERT_EQ(dst.nrows(), 100);
@@ -267,7 +286,7 @@ TEST(TestPredicateEvaluatingIterator, TestPredicateEvaluation) {
   spec.AddPredicate(pred1.pred_);
   LOG(INFO) << "Predicate: " << pred1.pred_.ToString();
 
-  vector<uint32> ints;
+  vector<uint32_t> ints;
   for (int i = 0; i < 100; i++) {
     ints.push_back(i);
   }
@@ -291,10 +310,10 @@ TEST(TestPredicateEvaluatingIterator, TestPredicateEvaluation) {
 
   ASSERT_EQ(0, spec.predicates().size())
     << "Iterator tree should have accepted predicate";
-  ASSERT_EQ(1, pred_eval->col_idx_predicates_.size())
+  ASSERT_EQ(1, pred_eval->col_predicates_.size())
     << "Predicate should be evaluated by the outer iterator";
 
-  Arena arena(1024, 1024);
+  Arena arena(1024);
   RowBlock dst(kIntSchema, 100, &arena);
   ASSERT_OK(outer_iter->NextBlock(&dst));
   ASSERT_EQ(dst.nrows(), 100);
@@ -312,12 +331,91 @@ TEST(TestPredicateEvaluatingIterator, TestPredicateEvaluation) {
 TEST(TestPredicateEvaluatingIterator, TestDontWrapWhenNoPredicates) {
   ScanSpec spec;
 
-  vector<uint32> ints;
+  vector<uint32_t> ints;
   shared_ptr<VectorIterator> colwise(new VectorIterator(ints));
   shared_ptr<RowwiseIterator> materializing(new MaterializingIterator(colwise));
   shared_ptr<RowwiseIterator> outer_iter(materializing);
   ASSERT_OK(PredicateEvaluatingIterator::InitAndMaybeWrap(&outer_iter, &spec));
   ASSERT_EQ(outer_iter, materializing) << "InitAndMaybeWrap should not have wrapped iter";
+}
+
+// Test row-wise iterator which does nothing.
+class DummyIterator : public RowwiseIterator {
+ public:
+
+  explicit DummyIterator(Schema schema)
+      : schema_(std::move(schema)) {
+  }
+
+  Status Init(ScanSpec* /*spec*/) override {
+    return Status::OK();
+  }
+
+  virtual Status NextBlock(RowBlock* /*dst*/) override {
+    LOG(FATAL) << "unimplemented!";
+    return Status::OK();
+  }
+
+  virtual bool HasNext() const override {
+    LOG(FATAL) << "unimplemented!";
+    return false;
+  }
+
+  virtual string ToString() const override {
+    return "DummyIterator";
+  }
+
+  virtual const Schema& schema() const override {
+    return schema_;
+  }
+
+  virtual void GetIteratorStats(vector<IteratorStats>* stats) const override {
+    stats->resize(schema().num_columns());
+  }
+
+ private:
+  Schema schema_;
+};
+
+TEST(TestPredicateEvaluatingIterator, TestPredicateEvaluationOrder) {
+  Schema schema({ ColumnSchema("a_int64", INT64),
+                  ColumnSchema("b_int64", INT64),
+                  ColumnSchema("c_int32", INT32) }, 3);
+
+  int64_t zero = 0;
+  int64_t two = 2;
+  auto a_equality = ColumnPredicate::Equality(schema.column(0), &zero);
+  auto b_equality = ColumnPredicate::Equality(schema.column(1), &zero);
+  auto c_equality = ColumnPredicate::Equality(schema.column(2), &zero);
+  auto a_range = ColumnPredicate::Range(schema.column(0), &zero, &two);
+
+  { // Test that more selective predicates come before others.
+    ScanSpec spec;
+    spec.AddPredicate(a_range);
+    spec.AddPredicate(b_equality);
+    spec.AddPredicate(c_equality);
+
+    shared_ptr<RowwiseIterator> iter = make_shared<DummyIterator>(schema);
+    ASSERT_OK(PredicateEvaluatingIterator::InitAndMaybeWrap(&iter, &spec));
+
+    PredicateEvaluatingIterator* pred_eval = down_cast<PredicateEvaluatingIterator*>(iter.get());
+    ASSERT_TRUE(pred_eval->col_predicates_ ==
+                vector<ColumnPredicate>({ c_equality, b_equality, a_range }));
+  }
+
+  { // Test that smaller columns come before larger ones, and ties are broken by idx.
+    ScanSpec spec;
+    spec.AddPredicate(b_equality);
+    spec.AddPredicate(a_equality);
+    spec.AddPredicate(c_equality);
+
+    shared_ptr<RowwiseIterator> iter = make_shared<DummyIterator>(schema);
+    ASSERT_OK(PredicateEvaluatingIterator::InitAndMaybeWrap(&iter, &spec));
+
+    PredicateEvaluatingIterator* pred_eval = down_cast<PredicateEvaluatingIterator*>(iter.get());
+    ASSERT_TRUE(pred_eval->col_predicates_ ==
+                vector<ColumnPredicate>({ c_equality, a_equality, b_equality }));
+  }
 }
 
 } // namespace kudu

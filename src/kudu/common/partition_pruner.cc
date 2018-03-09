@@ -18,8 +18,9 @@
 #include "kudu/common/partition_pruner.h"
 
 #include <algorithm>
-#include <boost/optional.hpp>
 #include <cstring>
+#include <cstdint>
+#include <iterator>
 #include <memory>
 #include <numeric>
 #include <string>
@@ -27,16 +28,24 @@
 #include <unordered_map>
 #include <vector>
 
+#include <glog/logging.h>
+
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/encoded_key.h"
 #include "kudu/common/key_encoder.h"
 #include "kudu/common/key_util.h"
 #include "kudu/common/partition.h"
+#include "kudu/common/row.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
 
-using boost::optional;
 using std::distance;
 using std::find;
 using std::get;
@@ -90,8 +99,9 @@ void EncodeRangeKeysFromPrimaryKeyBounds(const Schema& schema,
       *range_key_end = scan_spec.exclusive_upper_bound_key()->encoded_key().ToString();
     }
   } else {
-    // The range columns are a prefix of the primary key columns. Copy
-    // the column values over to a row, and then encode the row as a range key.
+    // The range-partition key columns are a prefix of the primary key columns.
+    // Copy the column values over to a row, and then encode the row as a range
+    // key.
 
     vector<int32_t> col_idxs(num_range_columns);
     iota(col_idxs.begin(), col_idxs.end(), 0);
@@ -114,6 +124,28 @@ void EncodeRangeKeysFromPrimaryKeyBounds(const Schema& schema,
                scan_spec.exclusive_upper_bound_key()->raw_keys()[idx],
                schema.column(idx).type_info()->size());
       }
+
+      // Determine if the upper bound primary key columns which aren't in the
+      // range-partition key are all set to the minimum value. If so, the
+      // range-partition key prefix of the primary key is already effectively an
+      // exclusive bound. If not, then we increment the range-key prefix in
+      // order to transform it from inclusive to exclusive.
+      bool min_suffix = true;
+      for (int32_t idx = num_range_columns; idx < schema.num_key_columns(); idx++) {
+        min_suffix &= schema.column(idx)
+                            .type_info()
+                            ->IsMinValue(scan_spec.exclusive_upper_bound_key()->raw_keys()[idx]);
+      }
+      Arena arena(std::max<size_t>(Arena::kMinimumChunkSize, schema.key_byte_size()));
+      if (!min_suffix) {
+        if (!key_util::IncrementPrimaryKey(&row, num_range_columns, &arena)) {
+          // The range-partition key upper bound can't be incremented, which
+          // means it's an inclusive bound on the maximum possible value, so
+          // skip it.
+          return;
+        }
+      }
+
       key_util::EncodeKey(col_idxs, row, range_key_end);
     }
   }
@@ -137,7 +169,7 @@ void EncodeRangeKeysFromPredicates(const Schema& schema,
 
   // Arenas must be at least the minimum chunk size, and we require at least
   // enough space for the range key columns.
-  Arena arena(max<size_t>(Arena::kMinimumChunkSize, schema.key_byte_size()), 4096);
+  Arena arena(std::max<size_t>(Arena::kMinimumChunkSize, schema.key_byte_size()));
   uint8_t* buf = static_cast<uint8_t*>(CHECK_NOTNULL(arena.AllocateBytes(schema.key_byte_size())));
   ContiguousRow row(&schema, buf);
 

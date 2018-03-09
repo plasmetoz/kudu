@@ -17,19 +17,30 @@
 
 #include "kudu/common/key_util.h"
 
-#include <boost/iterator/counting_iterator.hpp>
 #include <cmath>
+#include <cstring>
 #include <iterator>
 #include <limits>
+#include <ostream>
 #include <string>
 #include <tuple>
 #include <type_traits>
 
+#include <boost/iterator/counting_iterator.hpp>
+#include <boost/iterator/iterator_facade.hpp>
+#include <glog/logging.h>
+
 #include "kudu/common/column_predicate.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/key_encoder.h"
 #include "kudu/common/row.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/mathlimits.h"
+#include "kudu/gutil/port.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
 
 using std::nextafter;
 using std::numeric_limits;
@@ -67,6 +78,7 @@ bool DecrementBoolCell(void* cell_ptr) {
 }
 
 template<DataType type>
+ATTRIBUTE_NO_SANITIZE_INTEGER
 bool IncrementIntCell(void* cell_ptr) {
   typedef DataTypeTraits<type> traits;
   typedef typename traits::cpp_type cpp_type;
@@ -91,6 +103,7 @@ bool IncrementIntCell(void* cell_ptr) {
 }
 
 template<DataType type>
+ATTRIBUTE_NO_SANITIZE_INTEGER
 bool DecrementIntCell(void* cell_ptr) {
   typedef DataTypeTraits<type> traits;
   typedef typename traits::cpp_type cpp_type;
@@ -320,9 +333,12 @@ int PushLowerBoundKeyPredicates(ColIdxIter first,
 } // anonymous namespace
 
 bool IncrementPrimaryKey(ContiguousRow* row, Arena* arena) {
-  int32_t num_pk_cols = row->schema()->num_key_columns();
+  return IncrementPrimaryKey(row, row->schema()->num_key_columns(), arena);
+}
+
+bool IncrementPrimaryKey(ContiguousRow* row, int32_t num_columns, Arena* arena) {
   return IncrementKey(boost::make_counting_iterator(0),
-                      boost::make_counting_iterator(num_pk_cols),
+                      boost::make_counting_iterator(num_columns),
                       row,
                       arena);
 }
@@ -342,6 +358,7 @@ bool IncrementCell(const ColumnSchema& col, void* cell_ptr, Arena* arena) {
     HANDLE_TYPE(INT32);
     HANDLE_TYPE(UNIXTIME_MICROS);
     HANDLE_TYPE(INT64);
+    HANDLE_TYPE(INT128);
     case FLOAT:
       return IncrementFloatingPointCell<FLOAT>(cell_ptr);
     case DOUBLE:
@@ -371,6 +388,7 @@ bool TryDecrementCell(const ColumnSchema &col, void *cell_ptr) {
     HANDLE_TYPE(INT32);
     HANDLE_TYPE(UNIXTIME_MICROS);
     HANDLE_TYPE(INT64);
+    HANDLE_TYPE(INT128);
     case FLOAT:
       return DecrementFloatingPointCell<FLOAT>(cell_ptr);
     case DOUBLE:

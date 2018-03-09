@@ -17,22 +17,23 @@
 
 #include "kudu/tablet/compaction_policy.h"
 
-#include <glog/logging.h>
-
 #include <algorithm>
-#include <utility>
+#include <ostream>
+#include <queue>
 #include <string>
+#include <unordered_set>
+#include <utility>
 #include <vector>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/mathlimits.h"
-#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_info.h"
-#include "kudu/tablet/rowset_tree.h"
 #include "kudu/tablet/svg_dump.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/knapsack_solver.h"
-#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 using std::vector;
@@ -48,6 +49,11 @@ DEFINE_double(compaction_approximation_ratio, 1.05f,
               "value of 1.05 indicates that the policy may use an approximate result "
               "if it is known to be within 5% of the optimal solution.");
 TAG_FLAG(compaction_approximation_ratio, experimental);
+
+DEFINE_double(compaction_minimum_improvement, 0.01f,
+              "The minimum quality for a compaction to run. If a compaction does not "
+              "improve the average height of DiskRowSets by at least this amount, the "
+              "compaction will be considered ineligible.");
 
 namespace kudu {
 namespace tablet {
@@ -180,7 +186,7 @@ class BoundCalculator {
 
   // Compute the lower and upper bounds to the 0-1 knapsack problem with the elements
   // added so far.
-  pair<double, double> ComputeLowerAndUpperBound() const {
+  std::pair<double, double> ComputeLowerAndUpperBound() const {
     int excess_weight = total_weight_ - max_weight_;
     if (excess_weight <= 0) {
       // If we've added less than the budget, our "bounds" are just including
@@ -196,9 +202,19 @@ class BoundCalculator {
     // This is a 2-approximation (i.e. no worse than 1/2 of the best solution).
     // See https://courses.engr.illinois.edu/cs598csc/sp2009/lectures/lecture_4.pdf
     double lower_bound = std::max(total_value_ - top.width(), top.width());
-    double fraction_of_top_to_remove = static_cast<double>(excess_weight) / top.size_mb();
-    DCHECK_GT(fraction_of_top_to_remove, 0);
-    double upper_bound = total_value_ - fraction_of_top_to_remove * top.width();
+
+    // An upper bound for the integer problem is the solution to the fractional problem:
+    // in the fractional problem we can add just a portion of the top element. The
+    // portion to remove is determined by the amount of excess weight:
+    //
+    //   fraction_to_remove = excess_weight / top.size_mb();
+    //   portion_to_remove = fraction_to_remove * top.width()
+    //
+    // To avoid the division, we can just use the fact that density = width/size:
+    double portion_of_top_to_remove = static_cast<double>(excess_weight) * top.density();
+    DCHECK_GT(portion_of_top_to_remove, 0);
+    double upper_bound = total_value_ - portion_of_top_to_remove;
+
     return {lower_bound, upper_bound};
   }
 
@@ -300,7 +316,7 @@ void BudgetedCompactionPolicy::RunExact(
     // Here we also build in the approximation ratio as slop: the upper bound doesn't need
     // to just be better than the current solution, but needs to be better by at least
     // the approximation ratio before we bother looking for it.
-    if (upper_bound < best_solution->value * FLAGS_compaction_approximation_ratio) {
+    if (upper_bound <= best_solution->value * FLAGS_compaction_approximation_ratio) {
       continue;
     }
 
@@ -350,7 +366,7 @@ void BudgetedCompactionPolicy::RunExact(
 // See docs/design-docs/compaction-policy.md for an overview of the compaction
 // policy implemented in this function.
 Status BudgetedCompactionPolicy::PickRowSets(const RowSetTree &tree,
-                                             unordered_set<RowSet*>* picked,
+                                             std::unordered_set<RowSet*>* picked,
                                              double* quality,
                                              std::vector<std::string>* log) {
   vector<RowSetInfo> asc_min_key, asc_max_key;
@@ -413,6 +429,17 @@ Status BudgetedCompactionPolicy::PickRowSets(const RowSetTree &tree,
   vector<double> best_upper_bounds;
   RunApproximation(asc_min_key, asc_max_key, &best_upper_bounds, &best_solution);
 
+  // If the best solution found above is less than some tiny threshold, we don't
+  // need to bother searching for the exact solution, since it could be at most twice
+  // the approximate solution.
+  if (best_solution.value * 2 <= FLAGS_compaction_minimum_improvement ||
+      *std::max_element(best_upper_bounds.begin(), best_upper_bounds.end()) <=
+      FLAGS_compaction_minimum_improvement) {
+    VLOG(1) << "Approximation algorithm short-circuited exact compaction calculation";
+    *quality = 0;
+    return Status::OK();
+  }
+
   // Pass 2 (precise)
   // ------------------------------------------------------------
   // Now that we've found an approximate solution and upper bounds, do another pass.
@@ -436,8 +463,11 @@ Status BudgetedCompactionPolicy::PickRowSets(const RowSetTree &tree,
 
   *quality = best_solution.value;
 
-  if (best_solution.value <= 0) {
-    VLOG(1) << "Best compaction available makes things worse. Not compacting.";
+  if (best_solution.value <= FLAGS_compaction_minimum_improvement) {
+    VLOG(1) << "Best compaction available (" << best_solution.value << " less than "
+            << "minimum quality " << FLAGS_compaction_minimum_improvement
+            << ": not compacting.";
+    *quality = 0;
     return Status::OK();
   }
 

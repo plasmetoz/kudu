@@ -20,15 +20,19 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kudu/common/generic_iterators.h"
-#include "kudu/gutil/stl_util.h"
-#include "kudu/gutil/stringprintf.h"
+#include "kudu/common/iterator.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/rowset_metadata.h"
 
 using std::shared_ptr;
+using std::string;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu { namespace tablet {
@@ -90,10 +94,10 @@ Status DuplicatingRowSet::NewRowIterator(const Schema *projection,
 
   switch (order) {
     case ORDERED:
-      out->reset(new MergeIterator(*projection, iters));
+      out->reset(new MergeIterator(*projection, std::move(iters)));
       break;
     case UNORDERED:
-      out->reset(new UnionIterator(iters));
+      out->reset(new UnionIterator(std::move(iters)));
       break;
     default:
       LOG(FATAL) << "unknown order: " << order;
@@ -156,9 +160,8 @@ Status DuplicatingRowSet::MutateRow(Timestamp timestamp,
       break;
       #endif
     } else if (!s.IsNotFound()) {
-      LOG(FATAL) << "Unable to mirror update to rowset " << new_rowset->ToString()
-                 << " for key: " << probe.schema()->CreateKeyProjection().DebugRow(probe.row_key())
-                 << ": " << s.ToString();
+      RETURN_NOT_OK_PREPEND(s, Substitute("Unable to mirror update to rowset $0 for key: $1",
+          new_rowset->ToString(), probe.schema()->CreateKeyProjection().DebugRow(probe.row_key())));
     }
     // IsNotFound is OK - it might be in a different one.
   }
@@ -207,12 +210,28 @@ Status DuplicatingRowSet::GetBounds(string* min_encoded_key,
   return Status::OK();
 }
 
-uint64_t DuplicatingRowSet::EstimateOnDiskSize() const {
+uint64_t DuplicatingRowSet::OnDiskSize() const {
+  uint64_t size = 0;
+  for (const shared_ptr<RowSet> &rs : new_rowsets_) {
+    size += rs->OnDiskSize();
+  }
+  return size;
+}
+
+uint64_t DuplicatingRowSet::OnDiskBaseDataSize() const {
+  uint64_t size = 0;
+  for (const shared_ptr<RowSet> &rs : new_rowsets_) {
+    size += rs->OnDiskBaseDataSize();
+  }
+  return size;
+}
+
+uint64_t DuplicatingRowSet::OnDiskBaseDataSizeWithRedos() const {
   // The actual value of this doesn't matter, since it won't be selected
   // for compaction.
   uint64_t size = 0;
   for (const shared_ptr<RowSet> &rs : new_rowsets_) {
-    size += rs->EstimateOnDiskSize();
+    size += rs->OnDiskBaseDataSizeWithRedos();
   }
   return size;
 }

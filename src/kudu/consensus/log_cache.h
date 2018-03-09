@@ -17,34 +17,34 @@
 #ifndef KUDU_CONSENSUS_LOG_CACHE_H
 #define KUDU_CONSENSUS_LOG_CACHE_H
 
+#include <cstdint>
+#include <iosfwd>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/consensus/consensus.pb.h"
-#include "kudu/consensus/opid_util.h"
+#include <gtest/gtest_prod.h>
+
 #include "kudu/consensus/ref_counted_replicate.h"
-#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/util/async_util.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
+#include "kudu/util/status_callback.h"
 
 namespace kudu {
 
-class MetricEntity;
 class MemTracker;
 
 namespace log {
 class Log;
-class LogReader;
 } // namespace log
 
 namespace consensus {
 
-class ReplicateMsg;
+class OpId;
 
 // Write-through cache for the log.
 //
@@ -149,6 +149,14 @@ class LogCache {
   FRIEND_TEST(LogCacheTest, TestTruncation);
   friend class LogCacheTest;
 
+  // An entry in the cache.
+  struct CacheEntry {
+    ReplicateRefPtr msg;
+    // The cached value of msg->SpaceUsedLong(). This method is expensive
+    // to compute, so we compute it only once upon insertion.
+    int64_t mem_usage;
+  };
+
   // Try to evict the oldest operations from the queue, stopping either when
   // 'bytes_to_evict' bytes have been evicted, or the op with index
   // 'stop_after_index' has been evicted, whichever comes first.
@@ -156,7 +164,7 @@ class LogCache {
 
   // Update metrics and MemTracker to account for the removal of the
   // given message.
-  void AccountForMessageRemovalUnlocked(const ReplicateRefPtr& msg);
+  void AccountForMessageRemovalUnlocked(const CacheEntry& entry);
 
   void TruncateOpsAfterUnlocked(int64_t index);
 
@@ -184,7 +192,7 @@ class LogCache {
 
   // An ordered map that serves as the buffer for the cached messages.
   // Maps from log index -> ReplicateMsg
-  typedef std::map<uint64_t, ReplicateRefPtr> MessageCache;
+  typedef std::map<uint64_t, CacheEntry> MessageCache;
   MessageCache cache_;
 
   // The next log index to append. Each append operation must either

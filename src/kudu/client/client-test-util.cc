@@ -17,14 +17,23 @@
 
 #include "kudu/client/client-test-util.h"
 
+#include <string>
+#include <ostream>
 #include <vector>
 
 #include <glog/logging.h>
+#include <gtest/gtest.h>
 
+#include "kudu/client/row_result.h"
+#include "kudu/client/scan_batch.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/write_op.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
-#include "kudu/util/test_util.h"
+
+using std::string;
+using std::vector;
 
 namespace kudu {
 namespace client {
@@ -32,7 +41,7 @@ namespace client {
 void LogSessionErrorsAndDie(const sp::shared_ptr<KuduSession>& session,
                             const Status& s) {
   CHECK(!s.ok());
-  std::vector<KuduError*> errors;
+  vector<KuduError*> errors;
   ElementDeleter d(&errors);
   bool overflow;
   session->GetPendingErrors(&errors, &overflow);
@@ -59,7 +68,7 @@ void ScanTableToStrings(KuduTable* table, vector<string>* row_strings) {
   // of the retry code below.
   ASSERT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
   ASSERT_OK(scanner.SetTimeoutMillis(15000));
-  ScanToStrings(&scanner, row_strings);
+  ASSERT_OK(ScanToStrings(&scanner, row_strings));
 }
 
 int64_t CountTableRows(KuduTable* table) {
@@ -111,15 +120,16 @@ Status CountRowsWithRetries(KuduScanner* scanner, size_t* row_count) {
   return Status::OK();
 }
 
-void ScanToStrings(KuduScanner* scanner, vector<string>* row_strings) {
-  ASSERT_OK(scanner->Open());
+Status ScanToStrings(KuduScanner* scanner, vector<string>* row_strings) {
+  RETURN_NOT_OK(scanner->Open());
   vector<KuduRowResult> rows;
   while (scanner->HasMoreRows()) {
-    ASSERT_OK(scanner->NextBatch(&rows));
+    RETURN_NOT_OK(scanner->NextBatch(&rows));
     for (const KuduRowResult& row : rows) {
       row_strings->push_back(row.ToString());
     }
   }
+  return Status::OK();
 }
 
 KuduSchema KuduSchemaFromSchema(const Schema& schema) {

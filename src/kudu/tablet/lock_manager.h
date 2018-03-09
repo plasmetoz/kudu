@@ -17,13 +17,13 @@
 #ifndef KUDU_TABLET_LOCK_MANAGER_H
 #define KUDU_TABLET_LOCK_MANAGER_H
 
+#include <cstddef>
+
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/move.h"
 #include "kudu/util/slice.h"
 
 namespace kudu { namespace tablet {
 
-class LockManager;
 class LockTable;
 class LockEntry;
 class TransactionState;
@@ -104,8 +104,8 @@ class ScopedRowLock {
                 const Slice &key, LockManager::LockMode mode);
 
   // Move constructor and assignment.
-  ScopedRowLock(ScopedRowLock&& other);
-  ScopedRowLock& operator=(ScopedRowLock&& other);
+  ScopedRowLock(ScopedRowLock&& other) noexcept;
+  ScopedRowLock& operator=(ScopedRowLock&& other) noexcept;
 
   void Release();
 

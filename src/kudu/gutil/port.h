@@ -231,9 +231,6 @@ inline size_t strnlen(const char *s, size_t maxlen) {
   return maxlen;
 }
 
-namespace std {}  // Avoid error if we didn't see std.
-using namespace std;  // Just like VC++, we need a using here.
-
 // Doesn't exist on OSX; used in google.cc for send() to mean "no flags".
 #define MSG_NOSIGNAL 0
 
@@ -421,6 +418,32 @@ inline void* memrchr(const void* bytes, int find_char, size_t len) {
     __attribute__((no_sanitize_thread))
 #else
 #define ATTRIBUTE_NO_SANITIZE_THREAD
+#endif
+
+// Tell UBSAN to ignore a given function completely. There is no
+// __has_feature(undefined_sanitizer) or equivalent, so ASAN support is used as
+// a proxy.
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#  define ATTRIBUTE_NO_SANITIZE_UNDEFINED \
+      __attribute__((no_sanitize("undefined")))
+#  endif
+#endif
+#ifndef ATTRIBUTE_NO_SANITIZE_UNDEFINED
+#define ATTRIBUTE_NO_SANITIZE_UNDEFINED
+#endif
+
+// Tell UBSAN to ignore integer overflows in a given function. There is no
+// __has_feature(undefined_sanitizer) or equivalent, so ASAN support is used as
+// a proxy.
+#if defined(__has_feature)
+#  if __has_feature(address_sanitizer)
+#  define ATTRIBUTE_NO_SANITIZE_INTEGER \
+      __attribute__((no_sanitize("integer")))
+#  endif
+#endif
+#ifndef ATTRIBUTE_NO_SANITIZE_INTEGER
+#define ATTRIBUTE_NO_SANITIZE_INTEGER
 #endif
 
 #ifndef HAVE_ATTRIBUTE_SECTION  // may have been pre-set to 0, e.g. for Darwin

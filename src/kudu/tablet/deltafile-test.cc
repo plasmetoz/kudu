@@ -15,18 +15,43 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
 
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/cfile/cfile_util.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/rowid.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs-test-util.h"
-#include "kudu/gutil/strings/strcat.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/tablet/delta_key.h"
+#include "kudu/tablet/delta_stats.h"
 #include "kudu/tablet/delta_store.h"
-#include "kudu/tablet/delta_tracker.h"
 #include "kudu/tablet/deltafile.h"
+#include "kudu/tablet/mutation.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 DECLARE_int32(deltafile_default_block_size);
@@ -37,6 +62,9 @@ DEFINE_int32(n_verify, 1, "number of times to verify the updates"
 
 using std::is_sorted;
 using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -50,7 +78,7 @@ class TestDeltaFile : public KuduTest {
  public:
   TestDeltaFile() :
     schema_(CreateSchema()),
-    arena_(1024, 1024) {
+    arena_(1024) {
   }
 
  public:
@@ -67,8 +95,8 @@ class TestDeltaFile : public KuduTest {
   }
 
   void WriteTestFile(int min_timestamp = 0, int max_timestamp = 0) {
-    gscoped_ptr<WritableBlock> block;
-    ASSERT_OK(fs_manager_->CreateNewBlock(&block));
+    unique_ptr<WritableBlock> block;
+    ASSERT_OK(fs_manager_->CreateNewBlock({}, &block));
     test_block_ = block->id();
     DeltaFileWriter dfw(std::move(block));
     ASSERT_OK(dfw.Start());
@@ -105,7 +133,7 @@ class TestDeltaFile : public KuduTest {
   }
 
   Status OpenDeltaFileReader(const BlockId& block_id, shared_ptr<DeltaFileReader>* out) {
-    gscoped_ptr<ReadableBlock> block;
+    unique_ptr<ReadableBlock> block;
     RETURN_NOT_OK(fs_manager_->OpenBlock(block_id, &block));
     return DeltaFileReader::Open(std::move(block), REDO, ReaderOptions(), out);
   }
@@ -217,8 +245,8 @@ TEST_F(TestDeltaFile, TestWriteDeltaFileIteratorToFile) {
   }
   ASSERT_OK(s);
 
-  gscoped_ptr<WritableBlock> block;
-  ASSERT_OK(fs_manager_->CreateNewBlock(&block));
+  unique_ptr<WritableBlock> block;
+  ASSERT_OK(fs_manager_->CreateNewBlock({}, &block));
   BlockId block_id(block->id());
   DeltaFileWriter dfw(std::move(block));
   ASSERT_OK(dfw.Start());
@@ -332,10 +360,10 @@ TEST_F(TestDeltaFile, TestLazyInit) {
   WriteTestFile();
 
   // Open it using a "counting" readable block.
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   ASSERT_OK(fs_manager_->OpenBlock(test_block_, &block));
   size_t bytes_read = 0;
-  gscoped_ptr<ReadableBlock> count_block(
+  unique_ptr<ReadableBlock> count_block(
       new CountingReadableBlock(std::move(block), &bytes_read));
 
   // Lazily opening the delta file should not trigger any reads.
@@ -364,8 +392,8 @@ TEST_F(TestDeltaFile, TestLazyInit) {
 // Check that, if a delta file is opened but no deltas are written,
 // Finish() will return Status::Aborted().
 TEST_F(TestDeltaFile, TestEmptyFileIsAborted) {
-  gscoped_ptr<WritableBlock> block;
-  ASSERT_OK(fs_manager_->CreateNewBlock(&block));
+  unique_ptr<WritableBlock> block;
+  ASSERT_OK(fs_manager_->CreateNewBlock({}, &block));
   test_block_ = block->id();
   {
     DeltaFileWriter dfw(std::move(block));
@@ -377,7 +405,7 @@ TEST_F(TestDeltaFile, TestEmptyFileIsAborted) {
   }
 
   // The block should have been deleted as well.
-  gscoped_ptr<ReadableBlock> rb;
+  unique_ptr<ReadableBlock> rb;
   Status s = fs_manager_->OpenBlock(test_block_, &rb);
   ASSERT_TRUE(s.IsNotFound()) << s.ToString();
 }

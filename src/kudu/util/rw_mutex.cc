@@ -17,8 +17,12 @@
 
 #include "kudu/util/rw_mutex.h"
 
-#include <glog/logging.h>
+#include <cerrno>
+#include <cstring>
 #include <mutex>
+#include <ostream>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/util/env.h"
@@ -135,6 +139,12 @@ bool RWMutex::TryWriteLock() {
 }
 
 #ifndef NDEBUG
+
+void RWMutex::AssertAcquired() const {
+  lock_guard<simple_spinlock> l(tid_lock_);
+  CHECK(ContainsKey(reader_tids_, Env::Default()->gettid()) ||
+        Env::Default()->gettid() == writer_tid_);
+}
 
 void RWMutex::AssertAcquiredForReading() const {
   lock_guard<simple_spinlock> l(tid_lock_);

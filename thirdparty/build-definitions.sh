@@ -27,6 +27,10 @@
 # * EXTRA_CXXFLAGS - additional flags to pass to the C++ compiler.
 # * EXTRA_LDFLAGS - additional flags to pass to the linker.
 # * EXTRA_LIBS - additional libraries to link.
+# * NINJA - if set, uses this instead of 'make' for cmake-configured libraries.
+#           note that 'EXTRA_CMAKE_FLAGS" should be set to include -GNinja as
+#           well to generate the proper build files.
+# * EXTRA_CMAKE_FLAGS - extra flags to pass to cmake
 #
 # build-definitions.sh is meant to be sourced from build-thirdparty.sh, and
 # relies on environment variables defined there and in vars.sh.
@@ -91,6 +95,8 @@ build_cmake() {
   $CMAKE_SOURCE/bootstrap \
     --prefix=$PREFIX \
     --parallel=$PARALLEL
+  # Unfortunately, cmake's bootstrap always uses Makefiles
+  # and can't be configured to build with ninja.
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
@@ -105,8 +111,9 @@ build_libcxxabi() {
     -DCMAKE_INSTALL_PREFIX=$PREFIX \
     -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS $EXTRA_LDFLAGS" \
     -DLLVM_PATH=$LLVM_SOURCE \
+    $EXTRA_CMAKE_FLAGS \
     $LLVM_SOURCE/projects/libcxxabi
-  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
 
@@ -134,8 +141,9 @@ build_libcxx() {
     -DLIBCXX_CXX_ABI=libcxxabi \
     -DLIBCXX_CXX_ABI_INCLUDE_PATHS=$LLVM_SOURCE/projects/libcxxabi/include \
     -DLLVM_USE_SANITIZER=$SANITIZER_TYPE \
+    $EXTRA_CMAKE_FLAGS \
     $LLVM_SOURCE/projects/libcxx
-  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
 
@@ -216,9 +224,10 @@ build_llvm() {
     -DCMAKE_CXX_FLAGS="$EXTRA_CXXFLAGS $EXTRA_LDFLAGS" \
     -DPYTHON_EXECUTABLE=$PYTHON_EXECUTABLE \
     $TOOLS_ARGS \
+    $EXTRA_CMAKE_FLAGS \
     $LLVM_SOURCE
 
-  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
 
   if [[ "$BUILD_TYPE" == "normal" ]]; then
     # Create a link from Clang to thirdparty/clang-toolchain. This path is used
@@ -244,8 +253,9 @@ build_gflags() {
     -DBUILD_SHARED_LIBS=On \
     -DBUILD_STATIC_LIBS=On \
     -DREGISTER_INSTALL_PREFIX=Off \
+    $EXTRA_CMAKE_FLAGS \
     $GFLAGS_SOURCE
-  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
 
@@ -302,7 +312,6 @@ build_gperftools() {
     LIBS="$EXTRA_LIBS" \
     $GPERFTOOLS_SOURCE/configure \
     --enable-frame-pointers \
-    --enable-heap-checker \
     --with-pic \
     --prefix=$PREFIX
   fixup_libtool
@@ -327,15 +336,20 @@ build_gmock() {
       -DCMAKE_BUILD_TYPE=Debug \
       -DCMAKE_POSITION_INDEPENDENT_CODE=On \
       -DBUILD_SHARED_LIBS=$SHARED \
-      $GMOCK_SOURCE
-    make -j$PARALLEL $EXTRA_MAKEFLAGS
+      $EXTRA_CMAKE_FLAGS \
+      $GMOCK_SOURCE/googlemock
+    ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS
     popd
   done
+
+  # Install gmock/gtest libraries and headers manually instead of using make
+  # install. Make install results in libraries with a malformed lib name on
+  # macOS.
   echo Installing gmock...
   cp -a $GMOCK_SHARED_BDIR/libgmock.$DYLIB_SUFFIX $PREFIX/lib/
   cp -a $GMOCK_STATIC_BDIR/libgmock.a $PREFIX/lib/
-  rsync -av $GMOCK_SOURCE/include/ $PREFIX/include/
-  rsync -av $GMOCK_SOURCE/gtest/include/ $PREFIX/include/
+  rsync -av $GMOCK_SOURCE/googlemock/include/ $PREFIX/include/
+  rsync -av $GMOCK_SOURCE/googletest/include/ $PREFIX/include/
 }
 
 build_protobuf() {
@@ -392,13 +406,15 @@ build_lz4() {
   LZ4_BDIR=$TP_BUILD_DIR/$LZ4_NAME$MODE_SUFFIX
   mkdir -p $LZ4_BDIR
   pushd $LZ4_BDIR
+  rm -Rf CMakeCache.txt CMakeFiles/
   CFLAGS="$EXTRA_CFLAGS" \
     cmake \
     -DCMAKE_BUILD_TYPE=release \
     -DBUILD_TOOLS=0 \
     -DCMAKE_INSTALL_PREFIX:PATH=$PREFIX \
+    $EXTRA_CMAKE_FLAGS \
     $LZ4_SOURCE/cmake_unofficial
-  make -j$PARALLEL $EXTRA_MAKEFLAGS install
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
 
@@ -486,6 +502,18 @@ build_squeasel() {
   popd
 }
 
+build_mustache() {
+  MUSTACHE_BDIR=$TP_BUILD_DIR/$MUSTACHE_NAME$MODE_SUFFIX
+  mkdir -p $MUSTACHE_BDIR
+  pushd $MUSTACHE_BDIR
+  # We add $PREFIX/include for boost and $PREFIX_COMMON/include for rapidjson.
+  ${CXX:-g++} $EXTRA_CXXFLAGS -I$PREFIX/include -I$PREFIX_COMMON/include -O3 -DNDEBUG -fPIC -c "$MUSTACHE_SOURCE/mustache.cc"
+  ar rs libmustache.a mustache.o
+  cp libmustache.a $PREFIX/lib/
+  cp $MUSTACHE_SOURCE/mustache.h $PREFIX/include/
+  popd
+}
+
 build_curl() {
   # Configure for a very minimal install - basically only HTTP(S), since we only
   # use this for testing our own HTTP/HTTPS endpoints at this point in time.
@@ -515,7 +543,8 @@ build_curl() {
     --disable-smtp \
     --disable-telnet \
     --disable-tftp \
-    --without-librtmp
+    --without-librtmp \
+    --without-libssh2
   make -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }
@@ -656,6 +685,12 @@ build_boost() {
     # and clang, even when they're called through ccache.
     local COMPILER=$($CC --version | awk 'NR==1 {print $1;}')
 
+    # If the compiler binary used was 'cc' and not 'gcc', it will also report
+    # itself as 'cc'. Coerce it to gcc.
+    if [ "$COMPILER" = "cc" ]; then
+      COMPILER=gcc
+    fi
+
     TOOLSET="toolset=${COMPILER}"
     echo "Using $TOOLSET"
     echo "using ${COMPILER} : : $CXX ;" > $USER_JAMFILE
@@ -676,5 +711,75 @@ build_boost() {
   if [ -e "$USER_JAMFILE" ]; then
     rm $USER_JAMFILE
   fi
+  popd
+}
+
+build_sparsehash() {
+  # This library is header-only, so we just copy the headers
+  pushd $SPARSEHASH_SOURCE
+  rsync -av --delete sparsehash/ $PREFIX/include/sparsehash/
+  popd
+}
+
+build_sparsepp() {
+  # This library is header-only, so we just copy the headers
+  pushd $SPARSEPP_SOURCE
+  rsync -av --delete sparsepp/ $PREFIX/include/sparsepp/
+  popd
+}
+
+build_thrift() {
+  THRIFT_BDIR=$TP_BUILD_DIR/$THRIFT_NAME$MODE_SUFFIX
+  mkdir -p $THRIFT_BDIR
+  pushd $THRIFT_BDIR
+  rm -Rf CMakeCache.txt CMakeFiles/
+
+  # Thrift depends on bison.
+  #
+  # Configure for a very minimal install - only the C++ client libraries are needed.
+  # Thrift requires C++11 when compiled on Linux against libc++ (see cxxfunctional.h).
+  CFLAGS="$EXTRA_CFLAGS" \
+    CXXFLAGS="$EXTRA_CXXFLAGS -std=c++11" \
+    LDFLAGS="$EXTRA_LDFLAGS" \
+    LIBS="$EXTRA_LIBS" \
+    cmake \
+    -DBOOST_ROOT=$PREFIX \
+    -DBUILD_C_GLIB=OFF \
+    -DBUILD_COMPILER=ON \
+    -DBUILD_CPP=ON \
+    -DBUILD_EXAMPLES=OFF \
+    -DBUILD_HASKELL=OFF \
+    -DBUILD_JAVA=OFF \
+    -DBUILD_PYTHON=OFF \
+    -DBUILD_TESTING=OFF \
+    -DBUILD_TUTORIALS=OFF \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=$PREFIX \
+    -DWITH_BOOSTTHREADS=OFF \
+    -DWITH_LIBEVENT=OFF \
+    -DWITH_OPENSSL=OFF \
+    -DWITH_PLUGIN=OFF \
+    $EXTRA_CMAKE_FLAGS \
+    $THRIFT_SOURCE
+
+  ${NINJA:-make} -j$PARALLEL $EXTRA_MAKEFLAGS install
+  popd
+
+  # Install fb303.thrift into the share directory.
+  mkdir -p $PREFIX/share/fb303/if
+  cp $THRIFT_SOURCE/contrib/fb303/if/fb303.thrift $PREFIX/share/fb303/if
+}
+
+build_bison() {
+  BISON_BDIR=$TP_BUILD_DIR/$BISON_NAME$MODE_SUFFIX
+  mkdir -p $BISON_BDIR
+  pushd $BISON_BDIR
+  CFLAGS="$EXTRA_CFLAGS" \
+    CXXFLAGS="$EXTRA_CXXFLAGS" \
+    LDFLAGS="$EXTRA_LDFLAGS" \
+    LIBS="$EXTRA_LIBS" \
+    $BISON_SOURCE/configure \
+    --prefix=$PREFIX
+  make -j$PARALLEL $EXTRA_MAKEFLAGS install
   popd
 }

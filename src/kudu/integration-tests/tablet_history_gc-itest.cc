@@ -15,34 +15,68 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cstdint>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <type_traits>
 #include <unordered_set>
 #include <utility>
+#include <vector>
 
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/clock/mock_ntp.h"
+#include "kudu/clock/time_service.h"
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/scan_batch.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/mini_cluster-itest-base.h"
+#include "kudu/integration-tests/internal_mini_cluster-itest-base.h"
 #include "kudu/integration-tests/test_workload.h"
-#include "kudu/server/hybrid_clock.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/tablet/local_tablet_writer.h"
+#include "kudu/tablet/rowset.h"
 #include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_metadata.h"
 #include "kudu/tablet/tablet_metrics.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/util/env.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
 
 using kudu::client::KuduScanner;
 using kudu::client::KuduTable;
 using kudu::client::sp::shared_ptr;
-using kudu::server::HybridClock;
+using kudu::clock::HybridClock;
 using kudu::tablet::Tablet;
-using kudu::tablet::TabletPeer;
+using kudu::tablet::TabletReplica;
 using kudu::tserver::MiniTabletServer;
 using kudu::tserver::TabletServer;
 using kudu::tserver::TSTabletManager;
@@ -52,7 +86,7 @@ using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(enable_maintenance_manager);
-DECLARE_bool(use_mock_wall_clock);
+DECLARE_string(time_source);
 DECLARE_double(missed_heartbeats_before_rejecting_snapshot_scans);
 DECLARE_int32(flush_threshold_secs);
 DECLARE_int32(maintenance_manager_num_threads);
@@ -61,7 +95,6 @@ DECLARE_int32(safe_time_max_lag_ms);
 DECLARE_int32(scanner_ttl_ms);
 DECLARE_int32(tablet_history_max_age_sec);
 DECLARE_int32(undo_delta_block_gc_init_budget_millis);
-DECLARE_string(block_manager);
 
 DEFINE_int32(test_num_rounds, 200, "Number of rounds to loop "
                                    "RandomizedTabletHistoryGcITest.TestRandomHistoryGCWorkload");
@@ -73,7 +106,8 @@ class TabletHistoryGcITest : public MiniClusterITestBase {
   void AddTimeToHybridClock(HybridClock* clock, MonoDelta delta) {
     uint64_t now = HybridClock::GetPhysicalValueMicros(clock->Now());
     uint64_t new_time = now + delta.ToMicroseconds();
-    clock->SetMockClockWallTimeForTests(new_time);
+    auto* ntp = down_cast<clock::MockNtp*>(clock->time_service());
+    ntp->SetMockClockWallTimeForTests(new_time);
   }
 };
 
@@ -103,7 +137,7 @@ TEST_F(TabletHistoryGcITest, TestSnapshotScanBeforeAHM) {
 
 // Check that the maintenance manager op to delete undo deltas actually deletes them.
 TEST_F(TabletHistoryGcITest, TestUndoDeltaBlockGc) {
-  FLAGS_use_mock_wall_clock = true; // Allow moving the clock.
+  FLAGS_time_source = "mock"; // Allow moving the clock.
   FLAGS_tablet_history_max_age_sec = 1000;
   FLAGS_flush_threshold_secs = 0; // Flush as aggressively as possible.
   FLAGS_maintenance_manager_polling_interval_ms = 1; // Spin on MM for a quick test.
@@ -121,10 +155,10 @@ TEST_F(TabletHistoryGcITest, TestUndoDeltaBlockGc) {
 
   // Find the tablet.
   tserver::MiniTabletServer* mts = cluster_->mini_tablet_server(0);
-  vector<scoped_refptr<TabletPeer>> tablet_peers;
-  mts->server()->tablet_manager()->GetTabletPeers(&tablet_peers);
-  ASSERT_EQ(1, tablet_peers.size());
-  std::shared_ptr<Tablet> tablet = tablet_peers[0]->shared_tablet();
+  vector<scoped_refptr<TabletReplica>> tablet_replicas;
+  mts->server()->tablet_manager()->GetTabletReplicas(&tablet_replicas);
+  ASSERT_EQ(1, tablet_replicas.size());
+  std::shared_ptr<Tablet> tablet = tablet_replicas[0]->shared_tablet();
 
   const int32_t kNumRows = AllowSlowTests() ? 100 : 10;
 
@@ -174,7 +208,7 @@ TEST_F(TabletHistoryGcITest, TestUndoDeltaBlockGc) {
   // no more undo deltas.
   HybridClock* c = down_cast<HybridClock*>(tablet->clock().get());
   AddTimeToHybridClock(c, MonoDelta::FromSeconds(FLAGS_tablet_history_max_age_sec));
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     ASSERT_EQ(0, tablet->CountUndoDeltasForTests());
   });
 
@@ -199,7 +233,7 @@ TEST_F(TabletHistoryGcITest, TestUndoDeltaBlockGc) {
   ASSERT_EQ(kNumRows, num_rows_scanned);
 
   // Check that the tablet metrics have reasonable values.
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     ASSERT_GT(tablet->metrics()->undo_delta_block_gc_init_duration->TotalCount(), 0);
     ASSERT_GT(tablet->metrics()->undo_delta_block_gc_delete_duration->TotalCount(), 0);
     ASSERT_GT(tablet->metrics()->undo_delta_block_gc_perform_duration->TotalCount(), 0);
@@ -238,7 +272,7 @@ class RandomizedTabletHistoryGcITest : public TabletHistoryGcITest {
   RandomizedTabletHistoryGcITest() {
     // We need to fully control compactions, flushes, and the clock.
     FLAGS_enable_maintenance_manager = false;
-    FLAGS_use_mock_wall_clock = true;
+    FLAGS_time_source = "mock";
     FLAGS_tablet_history_max_age_sec = 100;
 
     // Set these really high since we're using the mock clock.
@@ -308,10 +342,10 @@ class RandomizedTabletHistoryGcITest : public TabletHistoryGcITest {
                        int verify_round) {
     CHECK_GE(verify_round, cur_round_);
     if (verify_round == cur_round_) {
-      NO_FATALS(VerifySnapshotScan(std::move(scanner), std::move(snap_ts), verify_round));
+      NO_FATALS(VerifySnapshotScan(std::move(scanner), snap_ts, verify_round));
       return;
     }
-    ScannerTSPair pair(std::move(scanner), std::move(snap_ts));
+    ScannerTSPair pair(std::move(scanner), snap_ts);
     ScannerMap::value_type entry(verify_round, std::move(pair));
     scanners_.insert(std::move(entry));
   }
@@ -488,7 +522,7 @@ TEST_F(RandomizedTabletHistoryGcITest, TestRandomHistoryGCWorkload) {
   // time before reading from them.
   FLAGS_scanner_ttl_ms = 1000 * 60 * 60 * 24;
 
-  StartCluster(1); // Start MiniCluster with a single tablet server.
+  StartCluster(1); // Start InternalMiniCluster with a single tablet server.
   TestWorkload workload(cluster_.get());
   workload.set_num_replicas(1);
   workload.Setup(); // Convenient way to create a table.
@@ -500,15 +534,16 @@ TEST_F(RandomizedTabletHistoryGcITest, TestRandomHistoryGCWorkload) {
   MiniTabletServer* mts = cluster_->mini_tablet_server(0);
   TabletServer* ts = mts->server();
   clock_ = down_cast<HybridClock*>(ts->clock());
-  std::vector<scoped_refptr<TabletPeer>> peers;
-  ts->tablet_manager()->GetTabletPeers(&peers);
-  ASSERT_EQ(1, peers.size());
-  Tablet* tablet = peers[0]->tablet();
+  std::vector<scoped_refptr<TabletReplica>> replicas;
+  ts->tablet_manager()->GetTabletReplicas(&replicas);
+  ASSERT_EQ(1, replicas.size());
+  Tablet* tablet = replicas[0]->tablet();
 
   // Set initial clock time to 1000 seconds past 0, which is enough so that the
   // AHM will not be negative.
   const uint64_t kInitialMicroTime = 1L * 1000 * 1000 * 1000;
-  clock_->SetMockClockWallTimeForTests(kInitialMicroTime);
+  auto* ntp = down_cast<clock::MockNtp*>(clock_->time_service());
+  ntp->SetMockClockWallTimeForTests(kInitialMicroTime);
 
   LOG(INFO) << "Seeding random number generator";
   Random random(SeedRandom());
@@ -810,7 +845,7 @@ TEST_F(RandomizedTabletHistoryGcITest, TestRandomHistoryGCWorkload) {
         ASSERT_OK(scanner->SetSnapshotRaw(snapshot_ts.ToUint64()));
         ASSERT_OK(scanner->Open());
 
-        NO_FATALS(RegisterScanner(std::move(scanner), std::move(snapshot_ts), read_round));
+        NO_FATALS(RegisterScanner(std::move(scanner), snapshot_ts, read_round));
         break;
       }
       default: {

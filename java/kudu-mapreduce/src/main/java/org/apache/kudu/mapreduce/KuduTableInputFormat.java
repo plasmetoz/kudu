@@ -44,13 +44,13 @@ import org.apache.hadoop.mapreduce.JobContext;
 import org.apache.hadoop.mapreduce.RecordReader;
 import org.apache.hadoop.mapreduce.TaskAttemptContext;
 import org.apache.hadoop.net.DNS;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.AsyncKuduClient;
 import org.apache.kudu.client.Bytes;
 import org.apache.kudu.client.KuduClient;
@@ -70,9 +70,24 @@ import org.apache.kudu.client.RowResultIterator;
  *
  * <p>
  * Hadoop doesn't have the concept of "closing" the input format so in order to release the
- * resources we assume that once either {@link #getSplits(org.apache.hadoop.mapreduce.JobContext)}
- * or {@link KuduTableInputFormat.TableRecordReader#close()} have been called that
- * the object won't be used again and the AsyncKuduClient is shut down.
+ * resources (mainly, the Kudu client) we assume that once either
+ * {@link #getSplits(org.apache.hadoop.mapreduce.JobContext)}
+ * or {@link KuduTableInputFormat.TableRecordReader#close()}
+ * have been called that the object won't be used again and the AsyncKuduClient is shut down.
+ *
+ * To prevent a premature shutdown of the client, the KuduTableInputFormat and the
+ * TableRecordReader both get their own client that they don't share.
+ * </p>
+ *
+ * <p>
+ * Default behavior of hadoop is to call {@link #getSplits(org.apache.hadoop.mapreduce.JobContext)}
+ * in the MRAppMaster and for each inputSplit (in our case, Kudu tablet) will spawn one Mapper
+ * with a TableRecordReader reading one Tablet.
+ *
+ * Therefore, total number of Kudu clients opened over the course of a MR application can be
+ * estimated by (#Tablets +1). To reduce the number of concurrent open clients, it might be
+ * advisable to restrict resources of the MR application or implement the
+ * {@link org.apache.hadoop.mapred.lib.CombineFileInputFormat} over this InputFormat.
  * </p>
  */
 @InterfaceAudience.Public
@@ -87,6 +102,12 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
 
   /** Job parameter that specifies if the scanner should cache blocks or not (default: false). */
   static final String SCAN_CACHE_BLOCKS = "kudu.mapreduce.input.scan.cache.blocks";
+
+  /**
+   * Job parameter that specifies if the scanner should be fault tolerant
+   * or not (default: false).
+   */
+  static final String FAULT_TOLERANT_SCAN = "kudu.mapreduce.input.fault.tolerant.scan";
 
   /** Job parameter that specifies where the masters are. */
   static final String MASTER_ADDRESSES_KEY = "kudu.mapreduce.master.address";
@@ -123,6 +144,7 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
   private long operationTimeoutMs;
   private String nameServer;
   private boolean cacheBlocks;
+  private boolean isFaultTolerant;
   private List<String> projectedCols;
   private List<KuduPredicate> predicates;
 
@@ -137,7 +159,8 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
       KuduScanToken.KuduScanTokenBuilder tokenBuilder = client.newScanTokenBuilder(table)
                                                       .setProjectedColumnNames(projectedCols)
                                                       .cacheBlocks(cacheBlocks)
-                                                      .setTimeout(operationTimeoutMs);
+                                                      .setTimeout(operationTimeoutMs)
+                                                      .setFaultTolerant(isFaultTolerant);
       for (KuduPredicate predicate : predicates) {
         tokenBuilder.addPredicate(predicate);
       }
@@ -153,15 +176,7 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
       }
       return splits;
     } finally {
-      shutdownClient();
-    }
-  }
-
-  private void shutdownClient() throws IOException {
-    try {
-      client.shutdown();
-    } catch (Exception e) {
-      throw new IOException(e);
+      shutdownClient(client);
     }
   }
 
@@ -206,14 +221,10 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
 
     String tableName = conf.get(INPUT_TABLE_KEY);
     String masterAddresses = conf.get(MASTER_ADDRESSES_KEY);
-    this.operationTimeoutMs = conf.getLong(OPERATION_TIMEOUT_MS_KEY,
-                                           AsyncKuduClient.DEFAULT_OPERATION_TIMEOUT_MS);
-    this.client = new KuduClient.KuduClientBuilder(masterAddresses)
-                                .defaultOperationTimeoutMs(operationTimeoutMs)
-                                .build();
-    KuduTableMapReduceUtil.importCredentialsFromCurrentSubject(client);
+    this.client = buildKuduClient();
     this.nameServer = conf.get(NAME_SERVER_KEY);
     this.cacheBlocks = conf.getBoolean(SCAN_CACHE_BLOCKS, false);
+    this.isFaultTolerant = conf.getBoolean(FAULT_TOLERANT_SCAN, false);
 
     try {
       this.table = client.openTable(tableName);
@@ -251,6 +262,26 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
       }
     } catch (IOException e) {
       throw new RuntimeException("unable to deserialize predicates from the configuration", e);
+    }
+  }
+
+  private KuduClient buildKuduClient() {
+
+    String masterAddresses = conf.get(MASTER_ADDRESSES_KEY);
+    this.operationTimeoutMs = conf.getLong(OPERATION_TIMEOUT_MS_KEY,
+        AsyncKuduClient.DEFAULT_OPERATION_TIMEOUT_MS);
+    KuduClient kuduClient = new KuduClient.KuduClientBuilder(masterAddresses)
+        .defaultOperationTimeoutMs(operationTimeoutMs)
+        .build();
+    KuduTableMapReduceUtil.importCredentialsFromCurrentSubject(kuduClient);
+    return kuduClient;
+  }
+
+  private void shutdownClient(KuduClient kuduClient) throws IOException {
+    try {
+      kuduClient.shutdown();
+    } catch (Exception e) {
+      throw new IOException(e);
     }
   }
 
@@ -375,6 +406,7 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
     private RowResultIterator iterator;
     private KuduScanner scanner;
     private TableSplit split;
+    private KuduClient kuduClient;
 
     @Override
     public void initialize(InputSplit inputSplit, TaskAttemptContext taskAttemptContext)
@@ -384,9 +416,10 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
       }
 
       split = (TableSplit) inputSplit;
+      kuduClient = buildKuduClient();
       LOG.debug("Creating scanner for token: {}",
-                KuduScanToken.stringifySerializedToken(split.getScanToken(), client));
-      scanner = KuduScanToken.deserializeIntoScanner(split.getScanToken(), client);
+                KuduScanToken.stringifySerializedToken(split.getScanToken(), kuduClient));
+      scanner = KuduScanToken.deserializeIntoScanner(split.getScanToken(), kuduClient);
 
       // Calling this now to set iterator.
       tryRefreshIterator();
@@ -443,7 +476,7 @@ public class KuduTableInputFormat extends InputFormat<NullWritable, RowResult>
       } catch (Exception e) {
         throw new IOException(e);
       }
-      shutdownClient();
+      shutdownClient(kuduClient);
     }
   }
 }

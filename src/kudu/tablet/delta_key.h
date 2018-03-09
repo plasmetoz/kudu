@@ -20,13 +20,16 @@
 #include <string>
 
 #include "kudu/common/rowid.h"
-#include "kudu/gutil/endian.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/mvcc.h"
-#include "kudu/util/logging.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class faststring;
+
 namespace tablet {
 
 // The type of the delta.
@@ -53,7 +56,7 @@ class DeltaKey {
   {}
 
   DeltaKey(rowid_t id, Timestamp timestamp)
-      : row_idx_(id), timestamp_(std::move(timestamp)) {}
+      : row_idx_(id), timestamp_(timestamp) {}
 
   // Encode this key into the given buffer.
   //
@@ -89,7 +92,7 @@ class DeltaKey {
     return Status::OK();
   }
 
-  string ToString() const {
+  std::string ToString() const {
     return strings::Substitute("(row $0@tx$1)", row_idx_, timestamp_.ToString());
   }
 

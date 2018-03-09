@@ -25,7 +25,8 @@ PROTOBUF_GENERATE_CPP(
   BINARY_ROOT ${CMAKE_CURRENT_BINARY_DIR}/../..
   PROTO_FILES
     metadata.proto
-    opid.proto)
+    opid.proto
+    replica_management.proto)
 set(METADATA_PROTO_LIBS
   kudu_common_proto
   fs_proto
@@ -86,7 +87,7 @@ set(LOG_SRCS
 
 add_library(log ${LOG_SRCS})
 target_link_libraries(log
-  server_common
+  clock
   gutil
   kudu_common
   kudu_fs
@@ -96,16 +97,16 @@ target_link_libraries(log
   consensus_metadata_proto)
 
 set(CONSENSUS_SRCS
-  consensus.cc
   consensus_meta.cc
+  consensus_meta_manager.cc
   consensus_peers.cc
   consensus_queue.cc
   leader_election.cc
   log_cache.cc
   peer_manager.cc
+  pending_rounds.cc
   quorum_util.cc
   raft_consensus.cc
-  raft_consensus_state.cc
   time_manager.cc
 )
 
@@ -127,14 +128,16 @@ set(KUDU_TEST_LINK_LIBS
 )
 
 ADD_KUDU_TEST(consensus_meta-test)
+ADD_KUDU_TEST(consensus_meta_manager-stress-test RUN_SERIAL true)
+ADD_KUDU_TEST(consensus_meta_manager-test)
 ADD_KUDU_TEST(consensus_peers-test)
 ADD_KUDU_TEST(consensus_queue-test)
 ADD_KUDU_TEST(leader_election-test)
 ADD_KUDU_TEST(log-test)
 ADD_KUDU_TEST(log_anchor_registry-test)
-ADD_KUDU_TEST(log_cache-test)
+ADD_KUDU_TEST(log_cache-test PROCESSORS 2)
 ADD_KUDU_TEST(log_index-test)
-ADD_KUDU_TEST(mt-log-test)
+ADD_KUDU_TEST(mt-log-test PROCESSORS 5)
 ADD_KUDU_TEST(quorum_util-test)
 ADD_KUDU_TEST(raft_consensus_quorum-test)
 ADD_KUDU_TEST(time_manager-test)

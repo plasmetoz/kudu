@@ -20,22 +20,26 @@
 #ifndef KUDU_COMMON_ROW_CHANGELIST_H
 #define KUDU_COMMON_ROW_CHANGELIST_H
 
-#include <gtest/gtest_prod.h>
+#include <cstddef>
 #include <string>
 #include <vector>
 
-#include "kudu/common/row.h"
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
+#include "kudu/common/schema.h"
 #include "kudu/gutil/casts.h"
-#include "kudu/util/bitmap.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
-class faststring;
-
 class Arena;
 class ColumnBlock;
+class DeltaProjector;
 class RowBlockRow;
-class Schema;
 
 // A RowChangeList is a wrapper around a Slice which contains a "changelist".
 //
@@ -95,7 +99,7 @@ class RowChangeList {
     : encoded_data_(fs) {
   }
 
-  explicit RowChangeList(Slice s) : encoded_data_(std::move(s)) {}
+  explicit RowChangeList(Slice s) : encoded_data_(s) {}
 
   // Create a RowChangeList which represents a delete.
   // This points to static (const) memory and should not be
@@ -107,7 +111,7 @@ class RowChangeList {
   const Slice &slice() const { return encoded_data_; }
 
   // Return a string form of this changelist.
-  string ToString(const Schema &schema) const;
+  std::string ToString(const Schema &schema) const;
 
   bool is_reinsert() const {
     DCHECK_GT(encoded_data_.size(), 0);

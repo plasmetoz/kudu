@@ -17,15 +17,18 @@
 
 #include "kudu/util/oid_generator.h"
 
-#include <boost/uuid/uuid_generators.hpp>
+#include <cstdint>
 #include <exception>
 #include <mutex>
 #include <string>
+
+#include <boost/uuid/uuid.hpp>
 
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/status.h"
 
+using std::string;
 using strings::Substitute;
 
 namespace kudu {

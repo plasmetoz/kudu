@@ -15,620 +15,387 @@
 // specific language governing permissions and limitations
 // under the License.
 
-//
-// This is a small load generation tool which pushes data to a tablet
-// server as fast as possible. The table is supposed to be created already,
-// and this tool populates it with generated data. As an option, it's possible
-// to run a post-scan over the inserted rows to get total table row count
-// as reported by the scan operation.
-//
-// See below for examples of usage.
-//
-// Run in MANUAL_FLUSH mode, 1 thread inserting 8M rows into auto-created table,
-// flushing every 2000 rows, unlimited number of buffers with 32MB
-// limit on their total size, with auto-generated strings
-// of length 64 for binary and string fields
-// with Kudu master server listening on the default port at localhost:
-//
-//   kudu test loadgen \
-//     --num_threads=1 \
-//     --num_rows_per_thread=8000000 \
-//     --string_len=64 \
-//     --buffer_size_bytes=33554432 \
-//     --buffers_num=0 \
-//     --flush_per_n_rows=2000 \
-//     127.0.0.1
-//
-//
-// Run in AUTO_FLUSH_BACKGROUND mode, 2 threads inserting 4M rows each inserting
-// into auto-created table, with limit of 8 buffers max 1MB in size total,
-// having 12.5% for buffer flush watermark,
-// using the specified pre-set string for binary and string fields
-// with Kudu master server listening on the default port at localhost:
-//
-//   kudu test loadgen \
-//     --num_threads=2 \
-//     --num_rows_per_thread=4000000 \
-//     --string_fixed=012345678901234567890123456789012 \
-//     --buffer_size_bytes=1048576 \
-//     --buffer_flush_watermark_pct=0.125 \
-//     --buffers_num=8 \
-//     127.0.0.1
-//
-//
-// Run in AUTO_FLUSH_BACKGROUND mode, 4 threads inserting 2M rows each inserting
-// into auto-created table, with limit of 4 buffers max 64KB in size total,
-// having 25% for buffer flush watermark,
-// using the specified pre-set string for binary and string fields
-// with Kudu master server listening at 127.0.0.1:8765
-//
-//   kudu test loadgen \
-//     --num_threads=4 \
-//     --num_rows_per_thread=2000000 \
-//     --string_fixed=0123456789 \
-//     --buffer_size_bytes=65536 \
-//     --buffers_num=4 \
-//     --buffer_flush_watermark_pct=0.25 \
-//     --table_name=bench_02 \
-//     127.0.0.1:8765
-//
-//
-// Run with default parameter values for data generation and batching,
-// inserting data into auto-created table,
-// with Kudu master server listening on the default port at localhost,
-// plus run post-insertion row scan to verify
-// that the count of the inserted rows matches the expected number:
-//
-//   kudu test loadgen \
-//     --run_scan=true \
-//     127.0.0.1
-//
-
 #include "kudu/tools/tool_action.h"
 
-#include <cstdint>
+#include <unistd.h>
+
 #include <cstdlib>
-#include <ctime>
-
-#include <algorithm>
-#include <chrono>
-#include <iomanip>
-#include <iostream>
-#include <limits>
+#include <map>
 #include <memory>
-#include <mutex>
-#include <sstream>
-#include <thread>
-#include <vector>
+#include <string>
+#include <utility>
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <google/protobuf/stubs/status.h>
+#include <google/protobuf/stubs/stringpiece.h>
+#include <google/protobuf/util/json_util.h>
 
-#include "kudu/client/client.h"
-#include "kudu/common/schema.h"
-#include "kudu/common/types.h"
-#include "kudu/gutil/strings/split.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/security/test/mini_kdc.h"
+#include "kudu/tools/tool.pb.h"
 #include "kudu/tools/tool_action_common.h"
-#include "kudu/util/oid_generator.h"
-#include "kudu/util/random.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/util/env.h"
+#include "kudu/util/env_util.h"
+#include "kudu/util/path_util.h"
+#include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
 
-using kudu::ColumnSchema;
-using kudu::KuduPartialRow;
-using kudu::Stopwatch;
-using kudu::TypeInfo;
-using kudu::client::KuduClient;
-using kudu::client::KuduClientBuilder;
-using kudu::client::KuduColumnSchema;
-using kudu::client::KuduError;
-using kudu::client::KuduInsert;
-using kudu::client::KuduRowResult;
-using kudu::client::KuduSchema;
-using kudu::client::KuduSchemaBuilder;
-using kudu::client::KuduScanBatch;
-using kudu::client::KuduScanner;
-using kudu::client::KuduSession;
-using kudu::client::KuduTable;
-using kudu::client::KuduTableCreator;
-using kudu::client::sp::shared_ptr;
-using std::accumulate;
-using std::cerr;
-using std::cout;
-using std::endl;
-using std::lock_guard;
-using std::mutex;
-using std::numeric_limits;
-using std::ostringstream;
-using std::string;
-using std::thread;
-using std::vector;
-using std::unique_ptr;
-using strings::Substitute;
-using strings::SubstituteAndAppend;
-
-DEFINE_double(buffer_flush_watermark_pct, 0.5,
-              "Mutation buffer flush watermark, in percentage of total size.");
-DEFINE_int32(buffer_size_bytes, 4 * 1024 * 1024,
-             "Size of the mutation buffer, per session (bytes).");
-DEFINE_int32(buffers_num, 2,
-             "Number of mutation buffers per session.");
-DEFINE_int32(flush_per_n_rows, 0,
-             "Perform async flush per given number of rows added. "
-             "Setting to non-zero implicitly turns on manual flush mode.");
-DEFINE_bool(keep_auto_table, false,
-            "If using the auto-generated table, enabling this option "
-            "retains the table populated with the data after the test "
-            "finishes. By default, the auto-generated table is dropped "
-            "after sucessfully finishing the test. NOTE: this parameter "
-            "has no effect if using already existing table "
-            "(see the '--table_name' flag): the existing tables nor their data "
-            "are never dropped/deleted.");
-DEFINE_uint64(num_rows_per_thread, 1000,
-              "Number of rows each thread generates and inserts; "
-              "0 means unlimited. All rows generated by a thread are inserted "
-              "in the context of the same session.");
-DEFINE_int32(num_threads, 2,
-             "Number of generator threads to run. Each thread runs its own "
-             "KuduSession.");
-DEFINE_bool(run_scan, false,
-            "Whether to run post-insertion scan to verify that the count of "
-            "the inserted rows matches the expected number. If enabled, "
-            "the scan is run only if no errors were encountered "
-            "while inserting the generated rows.");
-DEFINE_uint64(seq_start, 0,
-              "Initial value for the generator in sequential mode. "
-              "This is useful when running multiple times against already "
-              "existing table: for every next run, set this flag to "
-              "(num_threads * num_rows_per_thread * column_num + seq_start).");
-DEFINE_int32(show_first_n_errors, 0,
-             "Output detailed information on the specified number of "
-             "first n errors (if any).");
-DEFINE_string(string_fixed, "",
-              "Pre-defined string to write into binary and string columns. "
-              "Client generates more data per second using pre-defined string "
-              "compared with auto-generated strings of the same length "
-              "if run with the same CPU/memory configuration. If left empty, "
-              "then auto-generated strings of length specified by the "
-              "'--string_len' parameter are used instead.");
-DEFINE_int32(string_len, 32,
-             "Length of strings to put into string and binary columns. This "
-             "parameter is not in effect if '--string_fixed' is specified.");
-DEFINE_string(table_name, "",
-              "Name of an existing table to use for the test. The test will "
-              "determine the structure of the table schema and "
-              "populate it with data accordingly. If left empty, "
-              "the test automatically creates a table of pre-defined columnar "
-              "structure with unique name and uses it to insert "
-              "auto-generated data. The auto-created table is dropped "
-              "upon successful completion of the test if not overridden "
-              "by the '--keep_auto_table' flag. If running the test against "
-              "an already existing table, it's highly recommended to use a "
-              "dedicated table created just for testing purposes: "
-              "the existing table nor its data is never dropped/deleted.");
-DEFINE_int32(table_num_buckets, 8,
-             "The number of buckets to create when this tool creates a new table.");
-DEFINE_int32(table_num_replicas, 1,
-             "The number of replicas for the auto-created table; "
-             "0 means 'use server-side default'.");
-DEFINE_bool(use_random, false,
-            "Whether to use random numbers instead of sequential ones. "
-            "In case of using random numbers collisions are possible over "
-            "the data for columns with unique constraint (e.g. primary key).");
+DEFINE_string(serialization, "json", "Serialization method to be used by the "
+              "control shell. Valid values are 'json' (protobuf serialized "
+              "into JSON and terminated with a newline character) or 'pb' "
+              "(four byte protobuf message length in big endian followed by "
+              "the protobuf message itself).");
+DEFINE_validator(serialization, [](const char* /*n*/, const std::string& v) {
+  return boost::iequals(v, "pb") ||
+         boost::iequals(v, "json");
+});
 
 namespace kudu {
+
 namespace tools {
+
+using cluster::ExternalDaemon;
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
+using std::string;
+using std::unique_ptr;
+using strings::Substitute;
 
 namespace {
 
-class Generator {
- public:
-  enum Mode {
-    MODE_SEQ,
-    MODE_RAND,
-  };
+Status MakeClusterRoot(string* cluster_root) {
+  // The ExternalMiniCluster can't generate the cluster root on our behalf because
+  // we're not running inside a gtest. So we'll use this approach instead,
+  // which is what the Java external mini cluster used for a long time.
+  const char* tmpdir = getenv("TEST_TMPDIR");
+  string tmpdir_str = tmpdir ? tmpdir : Substitute("/tmp/kudutest-$0", getuid());
+  string root = JoinPathSegments(tmpdir_str, "minicluster-data");
+  RETURN_NOT_OK(env_util::CreateDirsRecursively(Env::Default(), root));
 
-  Generator(Mode m, int64_t seed, size_t string_len)
-      : mode_(m),
-        seq_(seed),
-        random_(seed),
-        string_len_(string_len) {
-  }
-
-  ~Generator() = default;
-
-  uint64_t NextImpl() {
-    if (mode_ == MODE_SEQ) {
-      return seq_++;
-    }
-    return random_.Next64();
-  }
-
-  template <typename T>
-  T Next() {
-    return NextImpl() & numeric_limits<T>::max();
-  }
-
- private:
-  const Mode mode_;
-  uint64_t seq_;
-  Random random_;
-  const size_t string_len_;
-};
-
-template <>
-bool Generator::Next() {
-  return (NextImpl() & 0x1);
+  *cluster_root = root;
+  return Status::OK();
 }
 
-template <>
-double Generator::Next() {
-  return static_cast<double>(NextImpl());
-}
-
-template <>
-float Generator::Next() {
-  return static_cast<float>(NextImpl());
-}
-
-template <>
-string Generator::Next() {
-  ostringstream ss;
-  ss << NextImpl() << ".";
-  string str(ss.str());
-  if (str.size() >= string_len_) {
-    str = str.substr(0, string_len_);
-  } else {
-    str += string(string_len_ - str.size(), 'x');
-  }
-  return str;
-}
-
-Status GenerateRowData(Generator* gen, KuduPartialRow* row,
-                       const string& fixed_string) {
-  const vector<ColumnSchema>& columns(row->schema()->columns());
-  for (size_t idx = 0; idx < columns.size(); ++idx) {
-    const TypeInfo* tinfo = columns[idx].type_info();
-    switch (tinfo->type()) {
-      case BOOL:
-        RETURN_NOT_OK(row->SetBool(idx, gen->Next<bool>()));
-        break;
-      case INT8:
-        RETURN_NOT_OK(row->SetInt8(idx, gen->Next<int8_t>()));
-        break;
-      case INT16:
-        RETURN_NOT_OK(row->SetInt16(idx, gen->Next<int16_t>()));
-        break;
-      case INT32:
-        RETURN_NOT_OK(row->SetInt32(idx, gen->Next<int32_t>()));
-        break;
-      case INT64:
-        RETURN_NOT_OK(row->SetInt64(idx, gen->Next<int64_t>()));
-        break;
-      case UNIXTIME_MICROS:
-        RETURN_NOT_OK(row->SetUnixTimeMicros(idx, gen->Next<int64_t>()));
-        break;
-      case FLOAT:
-        RETURN_NOT_OK(row->SetFloat(idx, gen->Next<float>()));
-        break;
-      case DOUBLE:
-        RETURN_NOT_OK(row->SetDouble(idx, gen->Next<double>()));
-        break;
-      case BINARY:
-        if (fixed_string.empty()) {
-          RETURN_NOT_OK(row->SetBinary(idx, gen->Next<string>()));
-        } else {
-          RETURN_NOT_OK(row->SetBinaryNoCopy(idx, fixed_string));
-        }
-        break;
-      case STRING:
-        if (fixed_string.empty()) {
-          RETURN_NOT_OK(row->SetString(idx, gen->Next<string>()));
-        } else {
-          RETURN_NOT_OK(row->SetStringNoCopy(idx, fixed_string));
-        }
-        break;
-      default:
-        return Status::InvalidArgument("unknown data type");
-    }
+Status CheckClusterExists(const unique_ptr<ExternalMiniCluster>& cluster) {
+  if (!cluster) {
+    return Status::NotFound("cluster not found");
   }
   return Status::OK();
 }
 
-mutex cerr_lock;
+Status FindDaemon(const unique_ptr<ExternalMiniCluster>& cluster,
+                  const DaemonIdentifierPB& id,
+                  ExternalDaemon** daemon,
+                  MiniKdc** kdc) {
+  RETURN_NOT_OK(CheckClusterExists(cluster));
 
-void GeneratorThread(
-    const shared_ptr<KuduClient>& client, const string& table_name,
-    size_t gen_idx, size_t gen_num,
-    Status* status, uint64_t* row_count, uint64_t* err_count) {
+  if (!id.has_type()) {
+    return Status::InvalidArgument("request is missing daemon type");
+  }
 
-  const Generator::Mode gen_mode = FLAGS_use_random ? Generator::MODE_RAND
-                                                    : Generator::MODE_SEQ;
-  const size_t flush_per_n_rows = FLAGS_flush_per_n_rows;
-  const uint64_t gen_seq_start = FLAGS_seq_start;
-  shared_ptr<KuduSession> session(client->NewSession());
-  uint64_t idx = 0;
-
-  auto generator = [&]() -> Status {
-    RETURN_NOT_OK(session->SetMutationBufferFlushWatermark(
-                     FLAGS_buffer_flush_watermark_pct));
-    RETURN_NOT_OK(session->SetMutationBufferSpace(
-                     FLAGS_buffer_size_bytes));
-    RETURN_NOT_OK(session->SetMutationBufferMaxNum(FLAGS_buffers_num));
-    RETURN_NOT_OK(session->SetFlushMode(
-        flush_per_n_rows == 0 ? KuduSession::AUTO_FLUSH_BACKGROUND
-                              : KuduSession::MANUAL_FLUSH));
-    const size_t num_rows_per_gen = FLAGS_num_rows_per_thread;
-
-    shared_ptr<KuduTable> table;
-    RETURN_NOT_OK(client->OpenTable(table_name, &table));
-    const size_t num_columns = table->schema().num_columns();
-
-    // Planning for non-intersecting ranges for different generator threads
-    // in sequential generation mode.
-    const int64_t gen_span =
-        (num_rows_per_gen == 0) ? numeric_limits<int64_t>::max() / gen_num
-                                : num_rows_per_gen * num_columns;
-    const int64_t gen_seed = gen_idx * gen_span + gen_seq_start;
-    Generator gen(gen_mode, gen_seed, FLAGS_string_len);
-    for (; num_rows_per_gen == 0 || idx < num_rows_per_gen; ++idx) {
-      unique_ptr<KuduInsert> insert_op(table->NewInsert());
-      RETURN_NOT_OK(GenerateRowData(&gen, insert_op->mutable_row(),
-                                   FLAGS_string_fixed));
-      RETURN_NOT_OK(session->Apply(insert_op.release()));
-      if (flush_per_n_rows != 0 && idx != 0 && idx % flush_per_n_rows == 0) {
-        session->FlushAsync(nullptr);
+  switch (id.type()) {
+    case MASTER:
+      if (!id.has_index()) {
+        return Status::InvalidArgument("request is missing daemon index");
       }
-    }
-    RETURN_NOT_OK(session->Flush());
-
-    return Status::OK();
-  };
-
-  *status = generator();
-  if (row_count != nullptr) {
-    *row_count = idx;
-  }
-  vector<KuduError*> errors;
-  ElementDeleter d(&errors);
-  session->GetPendingErrors(&errors, nullptr);
-  if (err_count != nullptr) {
-    *err_count = errors.size();
-  }
-  if (!errors.empty() && FLAGS_show_first_n_errors > 0) {
-    ostringstream str;
-    str << "Error from generator " << std::setw(4) << gen_idx << ":" << endl;
-    for (size_t i = 0; i < errors.size() && i < FLAGS_show_first_n_errors; ++i) {
-      str << "  " << errors[i]->status().ToString() << endl;
-    }
-    // Serialize access to the stderr to prevent garbled output.
-    lock_guard<mutex> lock(cerr_lock);
-    cerr << str.str() << endl;
-  }
-}
-
-Status GenerateInsertRows(const shared_ptr<KuduClient>& client,
-                          const string& table_name,
-                          uint64_t* total_row_count,
-                          uint64_t* total_err_count) {
-
-  const size_t gen_num = FLAGS_num_threads;
-  vector<Status> status(gen_num);
-  vector<uint64_t> row_count(gen_num, 0);
-  vector<uint64_t> err_count(gen_num, 0);
-  vector<thread> threads;
-  for (size_t i = 0; i < gen_num; ++i) {
-    threads.emplace_back(&GeneratorThread, client, table_name, i, gen_num,
-                         &status[i], &row_count[i], &err_count[i]);
-  }
-  for (auto& t : threads) {
-    t.join();
-  }
-  if (total_row_count != nullptr) {
-    *total_row_count = accumulate(row_count.begin(), row_count.end(), 0UL);
-  }
-  if (total_err_count != nullptr) {
-    *total_err_count = accumulate(err_count.begin(), err_count.end(), 0UL);
-  }
-  // Return first non-OK error status, if any, as a result.
-  const auto it = find_if(status.begin(), status.end(),
-                          [&](const Status& s) { return !s.ok(); });
-  if (it != status.end()) {
-    return *it;
+      if (id.index() >= cluster->num_masters()) {
+        return Status::NotFound(Substitute("no master with index $0",
+                                           id.index()));
+      }
+      *daemon = cluster->master(id.index());
+      *kdc = nullptr;
+      break;
+    case TSERVER:
+      if (!id.has_index()) {
+        return Status::InvalidArgument("request is missing daemon index");
+      }
+      if (id.index() >= cluster->num_tablet_servers()) {
+        return Status::NotFound(Substitute("no tserver with index $0",
+                                           id.index()));
+      }
+      *daemon = cluster->tablet_server(id.index());
+      *kdc = nullptr;
+      break;
+    case KDC:
+      if (!cluster->kdc()) {
+        return Status::NotFound("kdc not found");
+      }
+      *daemon = nullptr;
+      *kdc = cluster->kdc();
+      break;
+    default:
+      return Status::InvalidArgument(
+          Substitute("unknown daemon type: $0", DaemonType_Name(id.type())));
   }
   return Status::OK();
 }
 
-// Fetch all rows from the table with the specified name; iterate over them
-// and output their total count.
-Status CountTableRows(const shared_ptr<KuduClient>& client,
-                      const string& table_name, uint64_t* count) {
-  // It's assumed that all writing activity has stopped at this point.
-  const uint64_t snapshot_timestamp = client->GetLatestObservedTimestamp();
-
-  shared_ptr<KuduTable> table;
-  RETURN_NOT_OK(client->OpenTable(table_name, &table));
-
-  // It's necessary to have read-what-you-write behavior here. Since
-  // tablet leader can change and there might be replica propagation delays,
-  // set the snapshot to the latest observed one to get correct row count.
-  // Due to KUDU-1656, there might be timeouts due to tservers catching up with
-  // the requested snapshot. The simple workaround: if the timeout error occurs,
-  // retry the row count operation.
-  Status row_count_status;
-  uint64_t row_count = 0;
-  for (size_t i = 0; i < 3; ++i) {
-    KuduScanner scanner(table.get());
-    // NOTE: +1 is due to the current implementation of the scanner.
-    RETURN_NOT_OK(scanner.SetSnapshotRaw(snapshot_timestamp + 1));
-    RETURN_NOT_OK(scanner.SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
-    RETURN_NOT_OK(scanner.SetSelection(KuduClient::LEADER_ONLY));
-    row_count_status = scanner.Open();
-    if (!row_count_status.ok()) {
-      if (row_count_status.IsTimedOut()) {
-        // Retry condition: start the row count over again.
-        continue;
+Status ProcessRequest(const ControlShellRequestPB& req,
+                      ControlShellResponsePB* resp,
+                      unique_ptr<ExternalMiniCluster>* cluster) {
+  switch (req.request_case()) {
+    case ControlShellRequestPB::kCreateCluster:
+    {
+      if (*cluster) {
+        RETURN_NOT_OK(Status::InvalidArgument("cluster already created"));
       }
-      return row_count_status;
-    }
-    row_count = 0;
-    while (scanner.HasMoreRows()) {
-      KuduScanBatch batch;
-      row_count_status = scanner.NextBatch(&batch);
-      if (!row_count_status.ok()) {
-        if (row_count_status.IsTimedOut()) {
-          // Retry condition: start the row count over again.
-          break;
+      const CreateClusterRequestPB& cc = req.create_cluster();
+      ExternalMiniClusterOptions opts;
+      if (cc.has_num_masters()) {
+        if (cc.num_masters() != 1 && cc.num_masters() != 3) {
+          RETURN_NOT_OK(Status::InvalidArgument(
+              "only one or three masters are supported"));
         }
-        return row_count_status;
+        opts.num_masters = cc.num_masters();
       }
-      row_count += batch.NumRows();
-    }
-    if (row_count_status.ok()) {
-      // If it reaches this point with success,
-      // stop the retry cycle since the result is ready.
+      if (cc.has_num_tservers()) {
+        opts.num_tablet_servers = cc.num_tservers();
+      }
+      opts.enable_kerberos = cc.enable_kerberos();
+      opts.enable_hive_metastore = cc.enable_hive_metastore();
+      if (cc.has_cluster_root()) {
+        opts.cluster_root = cc.cluster_root();
+      } else {
+        RETURN_NOT_OK(MakeClusterRoot(&opts.cluster_root));
+      }
+      opts.extra_master_flags.assign(cc.extra_master_flags().begin(),
+                                     cc.extra_master_flags().end());
+      opts.extra_tserver_flags.assign(cc.extra_tserver_flags().begin(),
+                                      cc.extra_tserver_flags().end());
+      if (opts.num_masters > 1) {
+        opts.master_rpc_ports = { 11030, 11031, 11032 };
+      }
+      if (opts.enable_kerberos) {
+        opts.mini_kdc_options.data_root = JoinPathSegments(opts.cluster_root, "krb5kdc");
+      }
+
+      cluster->reset(new ExternalMiniCluster(std::move(opts)));
       break;
     }
-  }
-  RETURN_NOT_OK(row_count_status);
-  if (count != nullptr) {
-    *count = row_count;
+    case ControlShellRequestPB::kDestroyCluster:
+    {
+      RETURN_NOT_OK(CheckClusterExists(*cluster));
+      cluster->reset();
+      break;
+    }
+    case ControlShellRequestPB::kStartCluster:
+    {
+      RETURN_NOT_OK(CheckClusterExists(*cluster));
+      if ((*cluster)->num_masters() != 0) {
+        DCHECK_GT((*cluster)->num_tablet_servers(), 0);
+        RETURN_NOT_OK((*cluster)->Restart());
+      } else {
+        RETURN_NOT_OK((*cluster)->Start());
+      }
+      break;
+    }
+    case ControlShellRequestPB::kStopCluster:
+    {
+      RETURN_NOT_OK(CheckClusterExists(*cluster));
+      (*cluster)->Shutdown();
+      break;
+    }
+    case ControlShellRequestPB::kStartDaemon:
+    {
+      if (!req.start_daemon().has_id()) {
+        RETURN_NOT_OK(Status::InvalidArgument("missing process id"));
+      }
+      ExternalDaemon* daemon;
+      MiniKdc* kdc;
+      RETURN_NOT_OK(FindDaemon(*cluster, req.start_daemon().id(), &daemon, &kdc));
+      if (daemon) {
+        DCHECK(!kdc);
+        RETURN_NOT_OK(daemon->Restart());
+      } else {
+        DCHECK(kdc);
+        RETURN_NOT_OK(kdc->Start());
+      }
+      break;
+    }
+    case ControlShellRequestPB::kStopDaemon:
+    {
+      if (!req.stop_daemon().has_id()) {
+        RETURN_NOT_OK(Status::InvalidArgument("missing process id"));
+      }
+      ExternalDaemon* daemon;
+      MiniKdc* kdc;
+      RETURN_NOT_OK(FindDaemon(*cluster, req.stop_daemon().id(), &daemon, &kdc));
+      if (daemon) {
+        DCHECK(!kdc);
+        daemon->Shutdown();
+      } else {
+        DCHECK(kdc);
+        RETURN_NOT_OK(kdc->Stop());
+      }
+      break;
+    }
+    case ControlShellRequestPB::kGetMasters:
+    {
+      RETURN_NOT_OK(CheckClusterExists(*cluster));
+      for (int i = 0; i < (*cluster)->num_masters(); i++) {
+        HostPortPB pb;
+        RETURN_NOT_OK(HostPortToPB((*cluster)->master(i)->bound_rpc_hostport(), &pb));
+        DaemonInfoPB* info = resp->mutable_get_masters()->mutable_masters()->Add();
+        info->mutable_id()->set_type(MASTER);
+        info->mutable_id()->set_index(i);
+        *info->mutable_bound_rpc_address() = std::move(pb);
+      }
+      break;
+    }
+    case ControlShellRequestPB::kGetTservers:
+    {
+      RETURN_NOT_OK(CheckClusterExists(*cluster));
+      for (int i = 0; i < (*cluster)->num_tablet_servers(); i++) {
+        HostPortPB pb;
+        RETURN_NOT_OK(HostPortToPB((*cluster)->tablet_server(i)->bound_rpc_hostport(), &pb));
+        DaemonInfoPB* info = resp->mutable_get_tservers()->mutable_tservers()->Add();
+        info->mutable_id()->set_type(TSERVER);
+        info->mutable_id()->set_index(i);
+        *info->mutable_bound_rpc_address() = std::move(pb);
+      }
+      break;
+    }
+    case ControlShellRequestPB::kGetKdcEnvVars:
+    {
+      if (!(*cluster)->kdc()) {
+        RETURN_NOT_OK(Status::NotFound("kdc not found"));
+      }
+      auto env_vars = (*cluster)->kdc()->GetEnvVars();
+      resp->mutable_get_kdc_env_vars()->mutable_env_vars()->insert(
+          env_vars.begin(), env_vars.end());
+      break;
+    }
+    case ControlShellRequestPB::kKdestroy:
+    {
+      if (!(*cluster)->kdc()) {
+        RETURN_NOT_OK(Status::NotFound("kdc not found"));
+      }
+      RETURN_NOT_OK((*cluster)->kdc()->Kdestroy());
+      break;
+    }
+    default:
+      RETURN_NOT_OK(Status::InvalidArgument("unknown cluster control request"));
   }
 
   return Status::OK();
 }
 
-Status TestLoadGenerator(const RunnerContext& context) {
-  const string& master_addresses_str =
-      FindOrDie(context.required_args, kMasterAddressesArg);
-
-  vector<string> master_addrs(strings::Split(master_addresses_str, ","));
-  if (master_addrs.empty()) {
-    return Status::InvalidArgument(
-        "At least one master address must be specified");
-  }
-  shared_ptr<KuduClient> client;
-  RETURN_NOT_OK(KuduClientBuilder()
-                .master_server_addrs(master_addrs)
-                .Build(&client));
-  string table_name;
-  bool is_auto_table = false;
-  if (!FLAGS_table_name.empty()) {
-    table_name = FLAGS_table_name;
+Status RunControlShell(const RunnerContext& /*context*/) {
+  // Set up the protocol.
+  //
+  // Because we use stdin and stdout to communicate with the shell's parent,
+  // it's critical that none of our subprocesses write to stdout. To that end,
+  // the protocol will use stdout via another fd, and we'll redirect fd 1 to stderr.
+  int new_stdout = dup(STDOUT_FILENO);
+  PCHECK(new_stdout != -1);
+  PCHECK(dup2(STDERR_FILENO, STDOUT_FILENO) == STDOUT_FILENO);
+  ControlShellProtocol::SerializationMode serde_mode;
+  if (boost::iequals(FLAGS_serialization, "json")) {
+    serde_mode = ControlShellProtocol::SerializationMode::JSON;
   } else {
-    static const string kKeyColumnName = "key";
-
-    // The auto-created table case.
-    is_auto_table = true;
-    ObjectIdGenerator oid_generator;
-    table_name = "loadgen_auto_" + oid_generator.Next();
-    KuduSchema schema;
-    KuduSchemaBuilder b;
-    b.AddColumn(kKeyColumnName)->Type(KuduColumnSchema::INT64)->NotNull()->PrimaryKey();
-    b.AddColumn("int_val")->Type(KuduColumnSchema::INT32);
-    b.AddColumn("string_val")->Type(KuduColumnSchema::STRING);
-    RETURN_NOT_OK(b.Build(&schema));
-
-    unique_ptr<KuduTableCreator> table_creator(client->NewTableCreator());
-    RETURN_NOT_OK(table_creator->table_name(table_name)
-                  .schema(&schema)
-                  .num_replicas(FLAGS_table_num_replicas)
-                  .add_hash_partitions(vector<string>({ kKeyColumnName }),
-                                       FLAGS_table_num_buckets)
-                  .wait(true)
-                  .Create());
+    DCHECK(boost::iequals(FLAGS_serialization, "pb"));
+    serde_mode = ControlShellProtocol::SerializationMode::PB;
   }
-  cout << "Using " << (is_auto_table ? "auto-created " : "")
-       << "table '" << table_name << "'" << endl;
+  ControlShellProtocol protocol(serde_mode,
+                                ControlShellProtocol::CloseMode::NO_CLOSE_ON_DESTROY,
+                                STDIN_FILENO,
+                                new_stdout);
 
-  uint64_t total_row_count = 0;
-  uint64_t total_err_count = 0;
-  Stopwatch sw(Stopwatch::ALL_THREADS);
-  sw.start();
-  Status status = GenerateInsertRows(client, table_name,
-                                     &total_row_count, &total_err_count);
-  sw.stop();
-  const double total = sw.elapsed().wall_millis();
-  cout << endl << "Generator report" << endl
-       << "  time total  : " << total << " ms" << endl;
-  if (total_row_count != 0) {
-    cout << "  time per row: " << total / total_row_count << " ms" << endl;
-  }
-  if (!status.ok() || total_err_count != 0) {
-    string err_str;
-    if (!status.ok()) {
-      SubstituteAndAppend(&err_str, status.ToString());
+  // Run the shell loop, processing each message as it is received.
+  unique_ptr<ExternalMiniCluster> cluster;
+  while (true) {
+    ControlShellRequestPB req;
+    ControlShellResponsePB resp;
+
+    // Receive a new request, blocking until one is received.
+    //
+    // IO errors are fatal while others will result in an error response.
+    Status s = protocol.ReceiveMessage(&req);
+    if (s.IsEndOfFile()) {
+      break;
     }
-    if (total_err_count != 0) {
-      if (!status.ok()) {
-        SubstituteAndAppend(&err_str,  "; ");
-      }
-      SubstituteAndAppend(&err_str, "Encountered $0 write operation errors",
-                          total_err_count);
+    if (s.IsIOError()) {
+      return s;
     }
-    return Status::RuntimeError(err_str);
-  }
 
-  if (FLAGS_run_scan) {
-    // Run a table scan to count inserted rows.
-    uint64_t count;
-    RETURN_NOT_OK(CountTableRows(client, table_name, &count));
-    cout << endl << "Scanner report" << endl
-         << "  expected rows: " << total_row_count << endl
-         << "  actual rows  : " << count << endl;
-    if (count != total_row_count) {
-      return Status::RuntimeError(
-            Substitute("Row count mismatch: expected $0, actual $1",
-                       total_row_count, count));
+    // If we've made it here, we're definitely going to respond.
+
+    if (s.ok()) {
+      // We've successfully received a message. Try to process it.
+      s = ProcessRequest(req, &resp, &cluster);
     }
+
+    if (!s.ok()) {
+      // This may be the result of ReceiveMessage() or ProcessRequest(),
+      // whichever failed first.
+      StatusToPB(s, resp.mutable_error());
+    }
+
+    // Send the response. All errors are fatal.
+    s = protocol.SendMessage(resp);
+    if (s.IsEndOfFile()) {
+      break;
+    }
+    RETURN_NOT_OK(s);
   }
 
-  if (is_auto_table && !FLAGS_keep_auto_table) {
-    cout << "Dropping auto-created table '" << table_name << "'" << endl;
-    // Drop the table which was automatically created to run the test.
-    RETURN_NOT_OK(client->DeleteTable(table_name));
+  // Normal exit, clean up cluster root.
+  if (cluster) {
+    cluster->Shutdown();
+    WARN_NOT_OK(Env::Default()->DeleteRecursively(cluster->cluster_root()),
+                "Could not delete cluster root");
   }
-
   return Status::OK();
+}
+
+string SerializeRequest(const ControlShellRequestPB& req) {
+  string serialized;
+  auto google_status = google::protobuf::util::MessageToJsonString(
+      req, &serialized);
+  CHECK(google_status.ok()) << Substitute(
+      "unable to serialize JSON ($0): $1",
+      google_status.error_message().ToString(), pb_util::SecureDebugString(req));
+  return serialized;
 }
 
 } // anonymous namespace
 
 unique_ptr<Mode> BuildTestMode() {
-  unique_ptr<Action> insert =
-      ActionBuilder("loadgen", &TestLoadGenerator)
-      .Description("Run load generation test with optional scan afterwards")
-      .ExtraDescription(
-          "Run load generation tool which inserts auto-generated data "
-          "into already existing or auto-created table as fast as possible. "
-          "If requested, also run scan over the inserted rows to check whether "
-          "the actual count or inserted rows matches the expected one.")
-      .AddRequiredParameter({ kMasterAddressesArg,
-          "Comma-separated list of master addresses to run against. "
-          "Addresses are in 'hostname:port' form where port may be omitted "
-          "if a master server listens at the default port." })
-      .AddOptionalParameter("buffer_flush_watermark_pct")
-      .AddOptionalParameter("buffer_size_bytes")
-      .AddOptionalParameter("buffers_num")
-      .AddOptionalParameter("flush_per_n_rows")
-      .AddOptionalParameter("keep_auto_table")
-      .AddOptionalParameter("num_rows_per_thread")
-      .AddOptionalParameter("num_threads")
-      .AddOptionalParameter("run_scan")
-      .AddOptionalParameter("seq_start")
-      .AddOptionalParameter("show_first_n_errors")
-      .AddOptionalParameter("string_fixed")
-      .AddOptionalParameter("string_len")
-      .AddOptionalParameter("table_name")
-      .AddOptionalParameter("table_num_buckets")
-      .AddOptionalParameter("table_num_replicas")
-      .AddOptionalParameter("use_random")
+
+  ControlShellRequestPB create;
+  create.mutable_create_cluster()->set_num_tservers(3);
+  ControlShellRequestPB start;
+  start.mutable_start_cluster();
+
+  string extra = Substitute(
+      "The protocol for the control shell is protobuf-based and is documented "
+      "in src/kudu/tools/tool.proto. It is currently considered to be highly "
+      "experimental and subject to change.\n"
+      "\n"
+      "Example JSON input to create and start a cluster:\n"
+      "    $0\n"
+      "    $1\n",
+      SerializeRequest(create),
+      SerializeRequest(start));
+
+  unique_ptr<Action> control_shell =
+      ActionBuilder("mini_cluster", &RunControlShell)
+      .Description("Spawn a control shell for running a mini-cluster")
+      .ExtraDescription(extra)
+      .AddOptionalParameter("serialization")
       .Build();
 
   return ModeBuilder("test")
-      .Description("Run various tests against a Kudu cluster")
-      .AddAction(std::move(insert))
+      .Description("Various test actions")
+      .AddAction(std::move(control_shell))
       .Build();
 }
 
 } // namespace tools
 } // namespace kudu
+

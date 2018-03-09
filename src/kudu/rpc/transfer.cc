@@ -17,20 +17,21 @@
 
 #include "kudu/rpc/transfer.h"
 
-#include <stdint.h>
+#include <sys/uio.h>
 
+#include <cstdint>
 #include <iostream>
-#include <sstream>
+#include <set>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/endian.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/constants.h"
-#include "kudu/rpc/messenger.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
-#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
 
 DEFINE_int32(rpc_max_message_size, (50 * 1024 * 1024),
@@ -76,7 +77,7 @@ InboundTransfer::InboundTransfer()
 
 Status InboundTransfer::ReceiveBuffer(Socket &socket) {
   if (cur_offset_ < kMsgLengthPrefixLength) {
-    // receive int32 length prefix
+    // receive uint32 length prefix
     int32_t rem = kMsgLengthPrefixLength - cur_offset_;
     int32_t nread;
     Status status = socket.Recv(&buf_[cur_offset_], rem, &nread);
@@ -115,6 +116,9 @@ Status InboundTransfer::ReceiveBuffer(Socket &socket) {
 
   // receive message body
   int32_t nread;
+
+  // If total_length_ > INT_MAX, then it would exceed the maximum rpc_max_message_size
+  // and exit above. Hence, it is safe to use int32_t here.
   int32_t rem = total_length_ - cur_offset_;
   Status status = socket.Recv(&buf_[cur_offset_], rem, &nread);
   RETURN_ON_ERROR_OR_SOCKET_NOT_READY(status);
@@ -135,32 +139,32 @@ string InboundTransfer::StatusAsString() const {
   return Substitute("$0/$1 bytes received", cur_offset_, total_length_);
 }
 
-OutboundTransfer* OutboundTransfer::CreateForCallRequest(
-    int32_t call_id,
-    const std::vector<Slice> &payload,
-    TransferCallbacks *callbacks) {
-  return new OutboundTransfer(call_id, payload, callbacks);
+OutboundTransfer* OutboundTransfer::CreateForCallRequest(int32_t call_id,
+                                                         const TransferPayload &payload,
+                                                         size_t n_payload_slices,
+                                                         TransferCallbacks *callbacks) {
+  return new OutboundTransfer(call_id, payload, n_payload_slices, callbacks);
 }
 
-OutboundTransfer* OutboundTransfer::CreateForCallResponse(const std::vector<Slice> &payload,
+OutboundTransfer* OutboundTransfer::CreateForCallResponse(const TransferPayload &payload,
+                                                          size_t n_payload_slices,
                                                           TransferCallbacks *callbacks) {
-  return new OutboundTransfer(kInvalidCallId, payload, callbacks);
+  return new OutboundTransfer(kInvalidCallId, payload, n_payload_slices, callbacks);
 }
-
 
 OutboundTransfer::OutboundTransfer(int32_t call_id,
-                                   const std::vector<Slice> &payload,
+                                   const TransferPayload &payload,
+                                   size_t n_payload_slices,
                                    TransferCallbacks *callbacks)
   : cur_slice_idx_(0),
     cur_offset_in_slice_(0),
     callbacks_(callbacks),
     call_id_(call_id),
     aborted_(false) {
-  CHECK(!payload.empty());
 
-  n_payload_slices_ = payload.size();
-  CHECK_LE(n_payload_slices_, arraysize(payload_slices_));
-  for (int i = 0; i < payload.size(); i++) {
+  n_payload_slices_ = n_payload_slices;
+  CHECK_LE(n_payload_slices_, payload_slices_.size());
+  for (int i = 0; i < n_payload_slices; i++) {
     payload_slices_[i] = payload[i];
   }
 }

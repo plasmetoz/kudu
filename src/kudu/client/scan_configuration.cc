@@ -19,11 +19,18 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "kudu/client/client.h"
-#include "kudu/client/scan_predicate.h"
 #include "kudu/client/scan_predicate-internal.h"
+#include "kudu/client/scan_predicate.h"
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/encoded_key.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/schema.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/strings/substitute.h"
 
 using std::unique_ptr;
 using std::string;
@@ -45,8 +52,10 @@ ScanConfiguration::ScanConfiguration(KuduTable* table)
       read_mode_(KuduScanner::READ_LATEST),
       is_fault_tolerant_(false),
       snapshot_timestamp_(kNoTimestamp),
+      lower_bound_propagation_timestamp_(kNoTimestamp),
       timeout_(MonoDelta::FromMilliseconds(KuduScanner::kScanTimeoutMillis)),
-      arena_(1024, 1024 * 1024) {
+      arena_(256),
+      row_format_flags_(KuduScanner::NO_FLAGS) {
 }
 
 Status ScanConfiguration::SetProjectedColumnNames(const vector<string>& col_names) {
@@ -172,8 +181,17 @@ void ScanConfiguration::SetSnapshotRaw(uint64_t snapshot_timestamp) {
   snapshot_timestamp_ = snapshot_timestamp;
 }
 
+void ScanConfiguration::SetScanLowerBoundTimestampRaw(uint64_t propagation_timestamp) {
+  lower_bound_propagation_timestamp_ = propagation_timestamp;
+}
+
 void ScanConfiguration::SetTimeoutMillis(int millis) {
   timeout_ = MonoDelta::FromMilliseconds(millis);
+}
+
+Status ScanConfiguration::SetRowFormatFlags(uint64_t flags) {
+  row_format_flags_ = flags;
+  return Status::OK();
 }
 
 void ScanConfiguration::OptimizeScanSpec() {

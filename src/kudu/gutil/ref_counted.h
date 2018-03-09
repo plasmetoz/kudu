@@ -6,9 +6,11 @@
 #define BASE_MEMORY_REF_COUNTED_H_
 
 #include <cassert>
+#include <cstddef>
+#include <utility>  // IWYU pragma: keep
 
-#include "kudu/gutil/atomic_refcount.h"
-#include "kudu/gutil/port.h"
+#include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/threading/thread_collision_warner.h"
 
 namespace kudu {
@@ -234,19 +236,28 @@ class scoped_refptr {
       ptr_->AddRef();
   }
 
+  // Copy constructor.
   scoped_refptr(const scoped_refptr<T>& r) : ptr_(r.ptr_) {
     if (ptr_)
       ptr_->AddRef();
   }
 
+  // Copy conversion constructor.
   template <typename U>
   scoped_refptr(const scoped_refptr<U>& r) : ptr_(r.get()) {
     if (ptr_)
       ptr_->AddRef();
   }
 
+  // Move constructor. This is required in addition to the conversion
+  // constructor below in order for clang to warn about pessimizing moves.
+  scoped_refptr(scoped_refptr&& r) noexcept : ptr_(r.get()) { // NOLINT
+    r.ptr_ = nullptr;
+  }
+
+  // Move conversion constructor.
   template <typename U>
-  scoped_refptr(scoped_refptr<U>&& r) : ptr_(r.get()) {
+  scoped_refptr(scoped_refptr<U>&& r) noexcept : ptr_(r.get()) { // NOLINT
     r.ptr_ = nullptr;
   }
 
@@ -295,13 +306,13 @@ class scoped_refptr {
   }
 
   scoped_refptr<T>& operator=(scoped_refptr<T>&& r) {
-    scoped_refptr<T>(r).swap(*this);
+    scoped_refptr<T>(std::move(r)).swap(*this);
     return *this;
   }
 
   template <typename U>
   scoped_refptr<T>& operator=(scoped_refptr<U>&& r) {
-    scoped_refptr<T>(r).swap(*this);
+    scoped_refptr<T>(std::move(r)).swap(*this);
     return *this;
   }
 

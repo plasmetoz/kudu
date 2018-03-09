@@ -17,9 +17,16 @@
 
 #include "kudu/rpc/rpc_sidecar.h"
 
-#include "kudu/util/status.h"
-#include "kudu/rpc/transfer.h"
+#include <cstdint>
+#include <memory>
+#include <utility>
+
+#include <google/protobuf/repeated_field.h>
+
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/transfer.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/status.h"
 
 using std::unique_ptr;
 

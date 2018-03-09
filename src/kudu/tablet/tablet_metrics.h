@@ -17,17 +17,15 @@
 #ifndef KUDU_TABLET_TABLET_METRICS_H
 #define KUDU_TABLET_TABLET_METRICS_H
 
-#include "kudu/gutil/macros.h"
-#include "kudu/tablet/rowset.h"
+#include <cstdint>
+#include <stddef.h>
+
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/util/metrics.h"
 
 namespace kudu {
 
 class Arena;
-class Counter;
-template<class T>
-class AtomicGauge;
-class Histogram;
-class MetricEntity;
 
 namespace tablet {
 
@@ -51,6 +49,9 @@ struct TabletMetrics {
   scoped_refptr<Counter> rows_updated;
   scoped_refptr<Counter> rows_deleted;
   scoped_refptr<Counter> insertions_failed_dup_key;
+  scoped_refptr<Counter> upserts_as_updates;
+
+  // Scanner metrics
   scoped_refptr<Counter> scanner_rows_returned;
   scoped_refptr<Counter> scanner_cells_returned;
   scoped_refptr<Counter> scanner_bytes_returned;
@@ -58,6 +59,7 @@ struct TabletMetrics {
   scoped_refptr<Counter> scanner_cells_scanned_from_disk;
   scoped_refptr<Counter> scanner_bytes_scanned_from_disk;
   scoped_refptr<Counter> scans_started;
+  scoped_refptr<AtomicGauge<size_t>> tablet_active_scanners;
 
   // Probe stats
   scoped_refptr<Counter> bloom_lookups;

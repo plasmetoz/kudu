@@ -27,12 +27,12 @@
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/cache.h"
 #include "kudu/util/countdown_latch.h"
-#include "kudu/util/env.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class Env;
 
 namespace internal {
 
@@ -129,6 +129,29 @@ class FileCache {
   // deferred until the last referent is dropped. Otherwise, the file is
   // deleted immediately.
   Status DeleteFile(const std::string& file_name);
+
+  // Invalidate the given path in the cache if present. This removes the
+  // path from the cache, and invalidates any previously-opened descriptors
+  // associated with this file.
+  //
+  // If a file with the same path is opened again, the actual path will be opened from
+  // disk.
+  //
+  // This operation should be used during 'rename-to-replace' patterns, eg:
+  //
+  //    WriteNewDataTo(tmp_path);
+  //    env->RenameFile(tmp_path, p);
+  //    file_cache->Invalidate(p);
+  //
+  // NOTE: if any reader of 'p' holds an open descriptor from the cache
+  // prior to this operation, that descriptor is invalidated and any
+  // further operations on that descriptor will result in a CHECK failure.
+  // Hence this is not safe to use without some external synchronization
+  // which prevents concurrent access to the same file.
+  //
+  // NOTE: this function must not be called concurrently on the same file name
+  // from multiple threads.
+  void Invalidate(const std::string& file_name);
 
   // Returns the number of entries in the descriptor map.
   //

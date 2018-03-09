@@ -16,25 +16,36 @@
 // under the License.
 
 #include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <ostream>
 #include <string>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
-#include <glog/stl_logging.h>
-#include <gmock/gmock.h>
+#include <glog/stl_logging.h> // IWYU pragma: keep
+#include <gmock/gmock-matchers.h>
+#include <gtest/gtest.h>
 
 #include "kudu/codegen/code_generator.h"
 #include "kudu/codegen/compilation_manager.h"
 #include "kudu/codegen/row_projector.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/row.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/util/bitmap.h"
+#include "kudu/gutil/singleton.h"
 #include "kudu/util/logging_test_util.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using std::string;
@@ -54,9 +65,8 @@ class CodegenTest : public KuduTest {
  public:
   CodegenTest()
     : random_(SeedRandom()),
-      // Set the arena size as small as possible to catch errors during relocation,
-      // for its initial size and its eventual max size.
-      projections_arena_(16, kIndirectPerProjection * 2) {
+      // Set the initial Arena size as small as possible to catch errors during relocation.
+      projections_arena_(16) {
     // Create the base schema.
     vector<ColumnSchema> cols = { ColumnSchema("key           ", UINT64, false),
                                   ColumnSchema("int32         ",  INT32, false),
@@ -69,14 +79,14 @@ class CodegenTest : public KuduTest {
     base_ = SchemaBuilder(base_).Build(); // add IDs
 
     // Create an extended default schema
-    cols.push_back(ColumnSchema("int32-R ",  INT32, false, kI32R,  nullptr));
-    cols.push_back(ColumnSchema("int32-RW",  INT32, false, kI32R, kI32W));
-    cols.push_back(ColumnSchema("str32-R ", STRING, false, kStrR,  nullptr));
-    cols.push_back(ColumnSchema("str32-RW", STRING, false, kStrR, kStrW));
+    cols.emplace_back("int32-R ",  INT32, false, kI32R,  nullptr);
+    cols.emplace_back("int32-RW",  INT32, false, kI32R, kI32W);
+    cols.emplace_back("str32-R ", STRING, false, kStrR,  nullptr);
+    cols.emplace_back("str32-RW", STRING, false, kStrR, kStrW);
     defaults_.Reset(cols, 1);
     defaults_ = SchemaBuilder(defaults_).Build(); // add IDs
 
-    test_rows_arena_.reset(new Arena(2 * 1024, 1024 * 1024));
+    test_rows_arena_.reset(new Arena(2 * 1024));
     RowBuilder rb(base_);
     for (int i = 0; i < kNumTestRows; ++i) {
       rb.AddUint64(i);
@@ -258,6 +268,14 @@ TEST_F(CodegenTest, ObservablesTest) {
   ASSERT_EQ(iwith->is_identity(), iwithout.is_identity());
   ASSERT_TRUE(iwith->is_identity());
 }
+
+// Test empty projection
+TEST_F(CodegenTest, TestEmpty) {
+  Schema empty;
+  TestProjection<true>(&empty);
+  TestProjection<false>(&empty);
+}
+
 // Test key projection
 TEST_F(CodegenTest, TestKey) {
   Schema key = base_.CreateKeyProjection();

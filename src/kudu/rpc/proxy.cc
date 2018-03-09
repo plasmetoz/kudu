@@ -17,25 +17,22 @@
 
 #include "kudu/rpc/proxy.h"
 
-#include <boost/bind.hpp>
-#include <glog/logging.h>
-#include <inttypes.h>
-#include <memory>
-#include <stdint.h>
-
 #include <iostream>
-#include <sstream>
-#include <vector>
+#include <memory>
+#include <utility>
 
-#include "kudu/gutil/stringprintf.h"
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <boost/core/ref.hpp>
+#include <glog/logging.h>
+
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/outbound_call.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/response_callback.h"
-#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/util/net/sockaddr.h"
-#include "kudu/util/net/socket.h"
 #include "kudu/util/countdown_latch.h"
 #include "kudu/util/status.h"
 #include "kudu/util/user.h"
@@ -48,7 +45,9 @@ namespace kudu {
 namespace rpc {
 
 Proxy::Proxy(std::shared_ptr<Messenger> messenger,
-             const Sockaddr& remote, string service_name)
+             const Sockaddr& remote,
+             string hostname,
+             string service_name)
     : service_name_(std::move(service_name)),
       messenger_(std::move(messenger)),
       is_started_(false) {
@@ -64,8 +63,9 @@ Proxy::Proxy(std::shared_ptr<Messenger> messenger,
         << s.ToString() << " before connecting to remote: " << remote.ToString();
   }
 
-  conn_id_.set_remote(remote);
-  conn_id_.mutable_user_credentials()->set_real_user(real_user);
+  UserCredentials creds;
+  creds.set_real_user(std::move(real_user));
+  conn_id_ = ConnectionId(remote, std::move(hostname), std::move(creds));
 }
 
 Proxy::~Proxy() {
@@ -76,12 +76,13 @@ void Proxy::AsyncRequest(const string& method,
                          google::protobuf::Message* response,
                          RpcController* controller,
                          const ResponseCallback& callback) const {
-  CHECK(controller->call_.get() == nullptr) << "Controller should be reset";
+  CHECK(!controller->call_) << "Controller should be reset";
   base::subtle::NoBarrier_Store(&is_started_, true);
   RemoteMethod remote_method(service_name_, method);
-  OutboundCall* call = new OutboundCall(conn_id_, remote_method, response, controller, callback);
-  controller->call_.reset(call);
+  controller->call_.reset(
+      new OutboundCall(conn_id_, remote_method, response, controller, callback));
   controller->SetRequestParam(req);
+  controller->SetMessenger(messenger_.get());
 
   // If this fails to queue, the callback will get called immediately
   // and the controller will be in an ERROR state.

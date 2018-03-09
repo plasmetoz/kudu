@@ -21,15 +21,17 @@
 
 #include <gtest/gtest.h>
 
-#include "kudu/integration-tests/external_mini_cluster.h"
 #include "kudu/integration-tests/linked_list-test-util.h"
 #include "kudu/integration-tests/test_workload.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 namespace kudu {
 
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -45,6 +47,24 @@ TEST_F(KuduTest, TestWebUIDoesNotCrashCluster) {
   const int kNumTablets = 50;
 
   ExternalMiniClusterOptions opts;
+  // Force specific ports so that we can restart and guarantee we
+  // can bind the same port. If we use ephemeral ports, it's possible
+  // for one of the 'curl' threads to grab one of the ports as the local
+  // side of a client TCP connection while the server is down, preventing
+  // it from restarting. Choosing ports from the non-ephemeral range
+  // prevents this.
+  opts.master_rpc_ports = { 11010, 11011, 11012 };
+#ifdef __linux__
+  // We can only do explicit webserver ports on Linux, where we use
+  // IPs like 127.x.y.z to bind the minicluster servers to different
+  // hosts. This might make the test marginally flaky on OSX, but
+  // it's easier than adding the ability to pipe separate webserver
+  // ports to each server.
+  opts.extra_master_flags.emplace_back("-webserver_port=11013");
+  opts.extra_tserver_flags.emplace_back("-webserver_port=11014");
+#endif
+  opts.num_masters = opts.master_rpc_ports.size();
+
   ExternalMiniCluster cluster(opts);
   ASSERT_OK(cluster.Start());
 

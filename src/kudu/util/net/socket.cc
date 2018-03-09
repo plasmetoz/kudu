@@ -17,20 +17,25 @@
 
 #include "kudu/util/net/socket.h"
 
-#include <errno.h>
 #include <fcntl.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
-#include <sys/types.h>
+#include <sys/time.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cinttypes>
+#include <cstring>
 #include <limits>
+#include <ostream>
 #include <string>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/debug/trace_event.h"
@@ -39,9 +44,10 @@
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
+#include "kudu/util/os-util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
-#include "kudu/util/subprocess.h"
+#include "kudu/util/slice.h"
 
 DEFINE_string(local_ip_for_outbound_sockets, "",
               "IP to bind to when making outgoing socket connections. "
@@ -81,16 +87,16 @@ Socket::~Socket() {
 }
 
 Status Socket::Close() {
-  if (fd_ < 0)
+  if (fd_ < 0) {
     return Status::OK();
-  int err, fd = fd_;
-  fd_ = -1;
+  }
+  int fd = fd_;
   if (::close(fd) < 0) {
-    err = errno;
+    int err = errno;
     return Status::NetworkError(std::string("close error: ") +
                                 ErrnoToString(err), Slice(), err);
   }
-  fd = -1;
+  fd_ = -1;
   return Status::OK();
 }
 
@@ -255,10 +261,10 @@ Status Socket::SetReuseAddr(bool flag) {
 }
 
 Status Socket::BindAndListen(const Sockaddr &sockaddr,
-                             int listenQueueSize) {
+                             int listen_queue_size) {
   RETURN_NOT_OK(SetReuseAddr(true));
   RETURN_NOT_OK(Bind(sockaddr));
-  RETURN_NOT_OK(Listen(listenQueueSize));
+  RETURN_NOT_OK(Listen(listen_queue_size));
   return Status::OK();
 }
 
@@ -276,7 +282,7 @@ Status Socket::GetSocketAddress(Sockaddr *cur_addr) const {
   DCHECK_GE(fd_, 0);
   if (::getsockname(fd_, (struct sockaddr *)&sin, &len) == -1) {
     int err = errno;
-    return Status::NetworkError(string("getsockname error: ") +
+    return Status::NetworkError(std::string("getsockname error: ") +
                                 ErrnoToString(err), Slice(), err);
   }
   *cur_addr = sin;
@@ -289,7 +295,7 @@ Status Socket::GetPeerAddress(Sockaddr *cur_addr) const {
   DCHECK_GE(fd_, 0);
   if (::getpeername(fd_, (struct sockaddr *)&sin, &len) == -1) {
     int err = errno;
-    return Status::NetworkError(string("getpeername error: ") +
+    return Status::NetworkError(std::string("getpeername error: ") +
                                 ErrnoToString(err), Slice(), err);
   }
   *cur_addr = sin;
@@ -337,20 +343,25 @@ Status Socket::Accept(Socket *new_conn, Sockaddr *remote, int flags) {
   if (flags & FLAG_NONBLOCKING) {
     accept_flags |= SOCK_NONBLOCK;
   }
-  new_conn->Reset(::accept4(fd_, (struct sockaddr*)&addr,
-                  &olen, accept_flags));
-  if (new_conn->GetFd() < 0) {
+  int fd = -1;
+  RETRY_ON_EINTR(fd, accept4(fd_, (struct sockaddr*)&addr,
+                             &olen, accept_flags));
+  if (fd < 0) {
     int err = errno;
     return Status::NetworkError(std::string("accept4(2) error: ") +
                                 ErrnoToString(err), Slice(), err);
   }
+  new_conn->Reset(fd);
+
 #else
-  new_conn->Reset(::accept(fd_, (struct sockaddr*)&addr, &olen));
-  if (new_conn->GetFd() < 0) {
+  int fd = -1;
+  RETRY_ON_EINTR(fd, accept(fd_, (struct sockaddr*)&addr, &olen));
+  if (fd < 0) {
     int err = errno;
     return Status::NetworkError(std::string("accept(2) error: ") +
                                 ErrnoToString(err), Slice(), err);
   }
+  new_conn->Reset(fd);
   RETURN_NOT_OK(new_conn->SetNonBlocking(flags & FLAG_NONBLOCKING));
   RETURN_NOT_OK(new_conn->SetCloseOnExec());
 #endif // defined(__linux__)
@@ -507,7 +518,8 @@ Status Socket::Recv(uint8_t *buf, int32_t amt, int32_t *nread) {
   }
 
   DCHECK_GE(fd_, 0);
-  int res = ::recv(fd_, buf, amt, 0);
+  int res;
+  RETRY_ON_EINTR(res, recv(fd_, buf, amt, 0));
   if (res <= 0) {
     if (res == 0) {
       return Status::NetworkError("Recv() got EOF from remote", Slice(), ESHUTDOWN);

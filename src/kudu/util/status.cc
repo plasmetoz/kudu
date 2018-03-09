@@ -4,8 +4,10 @@
 
 #include "kudu/util/status.h"
 
-#include <stdio.h>
-#include <stdint.h>
+#include <cstdio>
+#include <cstring>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/util/malloc.h"
@@ -145,10 +147,16 @@ int16_t Status::posix_code() const {
 }
 
 Status Status::CloneAndPrepend(const Slice& msg) const {
+  if (ok()) {
+    return *this;
+  }
   return Status(code(), msg, message(), posix_code());
 }
 
 Status Status::CloneAndAppend(const Slice& msg) const {
+  if (ok()) {
+    return *this;
+  }
   return Status(code(), message(), msg, posix_code());
 }
 

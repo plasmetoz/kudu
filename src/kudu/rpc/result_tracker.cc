@@ -18,17 +18,25 @@
 #include "kudu/rpc/result_tracker.h"
 
 #include <algorithm>
-#include <limits>
+#include <mutex>
+#include <ostream>
+
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/inbound_call.h"
+#include "kudu/rpc/remote_method.h"
 #include "kudu/rpc/rpc_context.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/thread.h"
 #include "kudu/util/trace.h"
+// IWYU pragma: no_include <deque>
 
 DEFINE_int64(remember_clients_ttl_ms, 3600 * 1000 /* 1 hour */,
     "Maximum amount of time, in milliseconds, the server \"remembers\" a client for the "
@@ -54,12 +62,17 @@ namespace rpc {
 
 using google::protobuf::Message;
 using kudu::MemTracker;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
 using rpc::InboundCall;
+using std::make_pair;
 using std::move;
 using std::lock_guard;
+using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
 

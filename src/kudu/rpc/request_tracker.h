@@ -16,9 +16,11 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <set>
 #include <string>
 
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/status.h"
 
@@ -48,8 +50,8 @@ namespace rpc {
 class RequestTracker : public RefCountedThreadSafe<RequestTracker> {
  public:
   typedef int64_t SequenceNumber;
-  static const RequestTracker::SequenceNumber NO_SEQ_NO;
-  explicit RequestTracker(const std::string& client_id);
+  static const RequestTracker::SequenceNumber kNoSeqNo;
+  explicit RequestTracker(std::string client_id);
 
   // Creates a new, unique, sequence number.
   // Sequence numbers are assigned in increasing integer order.
@@ -59,7 +61,7 @@ class RequestTracker : public RefCountedThreadSafe<RequestTracker> {
   Status NewSeqNo(SequenceNumber* seq_no);
 
   // Returns the sequence number of the first incomplete RPC.
-  // If there is no incomplete RPC returns NO_SEQ_NO.
+  // If there is no incomplete RPC returns kNoSeqNo.
   SequenceNumber FirstIncomplete();
 
   // Marks the rpc with 'seq_no' as completed.

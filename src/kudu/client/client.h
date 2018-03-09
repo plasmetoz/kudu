@@ -26,15 +26,15 @@
 #define KUDU_CLIENT_CLIENT_H
 
 #include <stdint.h>
+
+#include <cstddef>
 #include <string>
 #include <vector>
 
-#include "kudu/client/resource_metrics.h"
 #include "kudu/client/row_result.h"
-#include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_predicate.h"
 #include "kudu/client/schema.h"
-#include "kudu/client/shared_ptr.h"
+#include "kudu/client/shared_ptr.h" // IWYU pragma: keep
 #ifdef KUDU_HEADERS_NO_STUBS
 #include <gtest/gtest_prod.h>
 #include "kudu/gutil/macros.h"
@@ -42,21 +42,30 @@
 #else
 #include "kudu/client/stubs.h"
 #endif
-#include "kudu/client/write_op.h"
 #include "kudu/util/kudu_export.h"
-#include "kudu/util/monotime.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
 class ClientStressTest_TestUniqueClientIds_Test;
-class LinkedListTester;
+class KuduPartialRow;
+class MonoDelta;
 class PartitionSchema;
+class SecurityUnknownTskTest;
+
+namespace tools {
+class LeaderMasterProxy;
+} // namespace tools
 
 namespace client {
 
+class KuduClient;
+class KuduDelete;
+class KuduInsert;
 class KuduLoggingCallback;
-class KuduScanToken;
+class KuduPartitioner;
+class KuduScanBatch;
 class KuduSession;
 class KuduStatusCallback;
 class KuduTable;
@@ -64,8 +73,11 @@ class KuduTableAlterer;
 class KuduTableCreator;
 class KuduTablet;
 class KuduTabletServer;
+class KuduUpdate;
+class KuduUpsert;
 class KuduValue;
 class KuduWriteOperation;
+class ResourceMetrics;
 
 namespace internal {
 class Batcher;
@@ -75,6 +87,7 @@ class LookupRpc;
 class MetaCache;
 class RemoteTablet;
 class RemoteTabletServer;
+class ReplicaController;
 class WriteRpc;
 } // namespace internal
 
@@ -248,6 +261,8 @@ class KUDU_EXPORT KuduClientBuilder {
  private:
   class KUDU_NO_EXPORT Data;
 
+  friend class internal::ReplicaController;
+
   // Owned.
   Data* data_;
 
@@ -299,7 +314,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   the operation is in progress.
   /// @return Operation status.
   Status IsCreateTableInProgress(const std::string& table_name,
-                                 bool *create_in_progress);
+                                 bool* create_in_progress);
 
   /// Delete/drop a table.
   ///
@@ -325,7 +340,7 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///   the operation is in progress.
   /// @return Operation status.
   Status IsAlterTableInProgress(const std::string& table_name,
-                                bool *alter_in_progress);
+                                bool* alter_in_progress);
   /// Get table's schema.
   ///
   /// @param [in] table_name
@@ -367,6 +382,9 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   ///
   /// This method does an RPC to ensure that the table exists and
   /// looks up its schema.
+  ///
+  /// @note New range partitions created by other clients will immediately be
+  ///   available after opening the table.
   ///
   /// @param [in] table_name
   ///   Name of the table.
@@ -509,8 +527,10 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class internal::RemoteTablet;
   friend class internal::RemoteTabletServer;
   friend class internal::WriteRpc;
+  friend class ConnectToClusterBaseTest;
   friend class ClientTest;
   friend class KuduClientBuilder;
+  friend class KuduPartitionerBuilder;
   friend class KuduScanner;
   friend class KuduScanToken;
   friend class KuduScanTokenBuilder;
@@ -518,6 +538,8 @@ class KUDU_EXPORT KuduClient : public sp::enable_shared_from_this<KuduClient> {
   friend class KuduTable;
   friend class KuduTableAlterer;
   friend class KuduTableCreator;
+  friend class ::kudu::SecurityUnknownTskTest;
+  friend class tools::LeaderMasterProxy;
 
   FRIEND_TEST(kudu::ClientStressTest, TestUniqueClientIds);
   FRIEND_TEST(ClientTest, TestGetSecurityInfoFromMaster);
@@ -589,6 +611,7 @@ class KUDU_EXPORT KuduReplica {
  private:
   friend class KuduClient;
   friend class KuduScanTokenBuilder;
+  friend class internal::ReplicaController;
 
   class KUDU_NO_EXPORT Data;
 
@@ -977,6 +1000,7 @@ class KUDU_EXPORT KuduTable : public sp::enable_shared_from_this<KuduTable> {
   class KUDU_NO_EXPORT Data;
 
   friend class KuduClient;
+  friend class KuduPartitioner;
 
   KuduTable(const sp::shared_ptr<KuduClient>& client,
             const std::string& name,
@@ -1711,7 +1735,19 @@ class KUDU_EXPORT KuduScanner {
     ///   by which writes are sometimes not externally consistent even when
     ///   action was taken to make them so. In these cases Isolation may
     ///   degenerate to mode "Read Committed". See KUDU-430.
-    READ_AT_SNAPSHOT
+    READ_AT_SNAPSHOT,
+
+    /// When @c READ_YOUR_WRITES is specified, the client will perform a read
+    /// such that it follows all previously known writes and reads from this client.
+    /// Specifically this mode:
+    ///  (1) ensures read-your-writes and read-your-reads session guarantees,
+    ///  (2) minimizes latency caused by waiting for outstanding write
+    ///      transactions to complete.
+    ///
+    /// Reads in this mode are not repeatable: two READ_YOUR_WRITES reads, even if
+    /// they provide the same propagated timestamp bound, can execute at different
+    /// timestamps and thus return different results.
+    READ_YOUR_WRITES
   };
 
   /// Whether the rows should be returned in order.
@@ -2011,6 +2047,48 @@ class KUDU_EXPORT KuduScanner {
   /// @return Schema of the projection being scanned.
   KuduSchema GetProjectionSchema() const;
 
+  /// @name Advanced/Unstable API
+  //
+  ///@{
+  /// Modifier flags for the row format returned from the server.
+  ///
+  /// @note Each flag corresponds to a bit that gets set on a bitset that is sent
+  ///   to the server. See SetRowFormatFlags() for example usage.
+  static const uint64_t NO_FLAGS = 0;
+  /// Makes the server pad UNIXTIME_MICROS slots to 16 bytes.
+  /// @note This flag actually wastes throughput by making messages larger than they need to
+  ///   be. It exists merely for compatibility reasons and requires the user to know the row
+  ///   format in order to decode the data. That is, if this flag is enabled, the user _must_
+  ///   use KuduScanBatch::direct_data() and KuduScanBatch::indirect_data() to obtain the row
+  ///   data for further decoding. Using KuduScanBatch::Row() might yield incorrect/corrupt
+  ///   results and might even cause the client to crash.
+  static const uint64_t PAD_UNIXTIME_MICROS_TO_16_BYTES = 1 << 0;
+  /// Optionally set row format modifier flags.
+  ///
+  /// If flags is RowFormatFlags::NO_FLAGS, then no modifications will be made to the row
+  /// format and the default will be used.
+  ///
+  /// Some flags require server-side server-side support, thus the caller should be prepared to
+  /// handle a NotSupported status in Open() and NextBatch().
+  ///
+  /// Example usage (without error handling, for brevity):
+  /// @code
+  ///   KuduScanner scanner(...);
+  ///   uint64_t row_format_flags = KuduScanner::NO_FLAGS;
+  ///   row_format_flags |= KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES;
+  ///   scanner.SetRowFormatFlags(row_format_flags);
+  ///   scanner.Open();
+  ///   while (scanner.HasMoreRows()) {
+  ///     KuduScanBatch batch;
+  ///     scanner.NextBatch(&batch);
+  ///     Slice direct_data = batch.direct_data();
+  ///     Slice indirect_data = batch.indirect_data();
+  ///     ... // Row data decoding and handling.
+  ///   }
+  /// @endcode
+  Status SetRowFormatFlags(uint64_t flags);
+  ///@}
+
   /// @return String representation of this scan.
   ///
   /// @internal
@@ -2028,6 +2106,7 @@ class KUDU_EXPORT KuduScanner {
   FRIEND_TEST(ClientTest, TestScanTimeout);
   FRIEND_TEST(ClientTest, TestReadAtSnapshotNoTimestampSet);
   FRIEND_TEST(ConsistencyITest, TestSnapshotScanTimestampReuse);
+  FRIEND_TEST(ScanTokenTest, TestScanTokens);
 
   // Owned.
   Data* data_;
@@ -2213,6 +2292,85 @@ class KUDU_EXPORT KuduScanTokenBuilder {
 
   DISALLOW_COPY_AND_ASSIGN(KuduScanTokenBuilder);
 };
+
+/// @brief Builder for Partitioner instances.
+class KUDU_EXPORT KuduPartitionerBuilder {
+ public:
+  /// Construct an instance of the class.
+  ///
+  /// @param [in] table
+  ///   The table whose rows should be partitioned.
+  explicit KuduPartitionerBuilder(sp::shared_ptr<KuduTable> table);
+  ~KuduPartitionerBuilder();
+
+  /// Set the timeout used for building the Partitioner object.
+  KuduPartitionerBuilder* SetBuildTimeout(MonoDelta timeout);
+
+  /// Create a KuduPartitioner object for the specified table.
+  ///
+  /// This fetches all of the partitioning information up front if it
+  /// is not already cached by the associated KuduClient object. Thus,
+  /// it may time out or have an error if the Kudu master is not accessible.
+  ///
+  /// @param [out] partitioner
+  ///   The resulting KuduPartitioner instance; caller gets ownership.
+  ///
+  /// @note If the KuduClient object associated with the table already has
+  /// some partition information cached (e.g. due to the construction of
+  /// other Partitioners, or due to normal read/write activity), the
+  /// resulting Partitioner will make use of that cached information.
+  /// This means that the resulting partitioner is not guaranteed to have
+  /// up-to-date partition information in the case that there has been
+  /// a recent change to the partitioning of the target table.
+  Status Build(KuduPartitioner** partitioner);
+ private:
+  class KUDU_NO_EXPORT Data;
+
+  // Owned.
+  Data* data_;
+
+  DISALLOW_COPY_AND_ASSIGN(KuduPartitionerBuilder);
+};
+
+/// A KuduPartitioner allows clients to determine the target partition of a
+/// row without actually performing a write. The set of partitions is eagerly
+/// fetched when the KuduPartitioner is constructed so that the actual partitioning
+/// step can be performed synchronously without any network trips.
+///
+/// @note Because this operates on a metadata snapshot retrieved at construction
+/// time, it will not reflect any metadata changes to the table that have occurred
+/// since its creation.
+///
+/// @warning This class is not thread-safe.
+class KUDU_EXPORT KuduPartitioner {
+ public:
+  ~KuduPartitioner();
+
+  /// Return the number of partitions known by this partitioner.
+  /// The partition indices returned by @c PartitionRow are guaranteed
+  /// to be less than this value.
+  int NumPartitions() const;
+
+  /// Determine the partition index that the given row falls into.
+  ///
+  /// @param [in] row
+  ///   The row to be partitioned.
+  /// @param [out] partition
+  ///   The resulting partition index, or -1 if the row falls into a
+  ///   non-covered range. The result will be less than @c NumPartitioons().
+  ///
+  /// @return Status OK if successful. May return a bad Status if the
+  /// provided row does not have all columns of the partition key
+  /// set.
+  Status PartitionRow(const KuduPartialRow& row, int* partition);
+ private:
+  class KUDU_NO_EXPORT Data;
+  friend class KuduPartitionerBuilder;
+
+  explicit KuduPartitioner(Data* data);
+  Data* data_; // Owned.
+};
+
 
 } // namespace client
 } // namespace kudu

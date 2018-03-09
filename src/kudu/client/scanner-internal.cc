@@ -18,32 +18,47 @@
 #include "kudu/client/scanner-internal.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
-#include <cmath>
+#include <cstdint>
+#include <ostream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
+
+#include <google/protobuf/descriptor.h>
+#include <google/protobuf/message.h>
 
 #include "kudu/client/client-internal.h"
 #include "kudu/client/meta_cache.h"
-#include "kudu/client/row_result.h"
-#include "kudu/client/table-internal.h"
 #include "kudu/common/common.pb.h"
+#include "kudu/common/encoded_key.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/connection.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/async_util.h"
+#include "kudu/util/bitmap.h"
 #include "kudu/util/hexdump.h"
+#include "kudu/util/logging.h"
+#include "kudu/util/monotime.h"
 
 using google::protobuf::FieldDescriptor;
 using google::protobuf::Reflection;
-
 using std::set;
 using std::string;
+using std::vector;
 
 namespace kudu {
 
+using rpc::CredentialsPolicy;
 using rpc::RpcController;
 using strings::Substitute;
-using strings::SubstituteAndAppend;
 using tserver::NewScanRequestPB;
 using tserver::TabletServerFeatures;
 
@@ -82,8 +97,9 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
   bool mark_locations_stale = false;
   bool can_retry = true;
   bool backoff = false;
+  bool reacquire_authn_token = false;
   switch (err.result) {
-    case ScanRpcStatus::SERVER_BUSY:
+    case ScanRpcStatus::SERVICE_UNAVAILABLE:
       backoff = true;
       break;
     case ScanRpcStatus::RPC_DEADLINE_EXCEEDED:
@@ -92,6 +108,11 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
       mark_ts_failed = true;
       break;
     case ScanRpcStatus::SCANNER_EXPIRED:
+      break;
+    case ScanRpcStatus::RPC_INVALID_AUTHENTICATION_TOKEN:
+      // Usually this happens if doing an RPC call with an expired auth token.
+      // Retrying with a new authn token should help.
+      reacquire_authn_token = true;
       break;
     case ScanRpcStatus::TABLET_NOT_RUNNING:
       blacklist_location = true;
@@ -121,6 +142,18 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
     remote_->MarkStale();
   }
 
+  if (reacquire_authn_token) {
+    // Re-connect to the cluster to get a new authn token.
+    KuduClient* c = table_->client();
+    const Status& s = c->data_->ConnectToCluster(
+        c, deadline, CredentialsPolicy::PRIMARY_CREDENTIALS);
+    if (!s.ok()) {
+      KLOG_EVERY_N_SECS(WARNING, 1)
+          << "Couldn't reconnect to the cluster: " << s.ToString();
+      backoff = true;
+    }
+  }
+
   if (backoff) {
     MonoDelta sleep =
         KuduClient::Data::ComputeExponentialBackoff(scan_attempts_);
@@ -136,6 +169,7 @@ Status KuduScanner::Data::HandleError(const ScanRpcStatus& err,
             << sleep.ToString() << "; attempt " << scan_attempts_;
     SleepFor(sleep);
   }
+
   if (can_retry) {
     return Status::OK();
   }
@@ -173,10 +207,22 @@ ScanRpcStatus KuduScanner::Data::AnalyzeResponse(const Status& rpc_status,
       switch (controller_.error_response()->code()) {
         case rpc::ErrorStatusPB::ERROR_INVALID_REQUEST:
           return ScanRpcStatus{ScanRpcStatus::INVALID_REQUEST, rpc_status};
-        case rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY:
-          return ScanRpcStatus{ScanRpcStatus::SERVER_BUSY, rpc_status};
+        case rpc::ErrorStatusPB::ERROR_SERVER_TOO_BUSY: // fall-through
+        case rpc::ErrorStatusPB::ERROR_UNAVAILABLE:
+          return ScanRpcStatus{
+              ScanRpcStatus::SERVICE_UNAVAILABLE, rpc_status};
         default:
           return ScanRpcStatus{ScanRpcStatus::RPC_ERROR, rpc_status};
+      }
+    }
+
+    if (rpc_status.IsNotAuthorized() && controller_.error_response()) {
+      switch (controller_.error_response()->code()) {
+        case rpc::ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN:
+          return ScanRpcStatus{
+              ScanRpcStatus::RPC_INVALID_AUTHENTICATION_TOKEN, rpc_status};
+        default:
+          return ScanRpcStatus{ScanRpcStatus::OTHER_TS_ERROR, rpc_status};
       }
     }
 
@@ -200,6 +246,7 @@ ScanRpcStatus KuduScanner::Data::AnalyzeResponse(const Status& rpc_status,
       return ScanRpcStatus{ScanRpcStatus::SCANNER_EXPIRED, server_status};
     case tserver::TabletServerErrorPB::TABLET_NOT_RUNNING:
       return ScanRpcStatus{ScanRpcStatus::TABLET_NOT_RUNNING, server_status};
+    case tserver::TabletServerErrorPB::TABLET_FAILED: // fall-through
     case tserver::TabletServerErrorPB::TABLET_NOT_FOUND:
       return ScanRpcStatus{ScanRpcStatus::TABLET_NOT_FOUND, server_status};
     default:
@@ -231,7 +278,7 @@ ScanRpcStatus KuduScanner::Data::SendScanRpc(const MonoTime& overall_deadline,
   MonoTime rpc_deadline;
   if (allow_time_for_failover) {
     rpc_deadline = MonoTime::Now() + table_->client()->default_rpc_timeout();
-    rpc_deadline = MonoTime::Earliest(overall_deadline, rpc_deadline);
+    rpc_deadline = std::min(overall_deadline, rpc_deadline);
   } else {
     rpc_deadline = overall_deadline;
   }
@@ -240,6 +287,9 @@ ScanRpcStatus KuduScanner::Data::SendScanRpc(const MonoTime& overall_deadline,
   controller_.set_deadline(rpc_deadline);
   if (!configuration_.spec().predicates().empty()) {
     controller_.RequireServerFeature(TabletServerFeatures::COLUMN_PREDICATES);
+  }
+  if (configuration().row_format_flags() & KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES) {
+    controller_.RequireServerFeature(TabletServerFeatures::PAD_UNIXTIME_MICROS_TO_16_BYTES);
   }
   ScanRpcStatus scan_status = AnalyzeResponse(
       proxy_->Scan(next_req_,
@@ -259,19 +309,27 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
   PrepareRequest(KuduScanner::Data::NEW);
   next_req_.clear_scanner_id();
   NewScanRequestPB* scan = next_req_.mutable_new_scan_request();
+  scan->set_row_format_flags(configuration_.row_format_flags());
   const KuduScanner::ReadMode read_mode = configuration_.read_mode();
   switch (read_mode) {
     case KuduScanner::READ_LATEST:
       scan->set_read_mode(kudu::READ_LATEST);
       if (configuration_.has_snapshot_timestamp()) {
-        LOG(WARNING) << "Ignoring snapshot timestamp since "
-                        "not in READ_AT_SNAPSHOT mode.";
+        LOG(FATAL) << "Snapshot timestamp should only be configured "
+                      "for READ_AT_SNAPSHOT scan mode.";
       }
       break;
     case KuduScanner::READ_AT_SNAPSHOT:
       scan->set_read_mode(kudu::READ_AT_SNAPSHOT);
       if (configuration_.has_snapshot_timestamp()) {
         scan->set_snap_timestamp(configuration_.snapshot_timestamp());
+      }
+      break;
+    case KuduScanner::READ_YOUR_WRITES:
+      scan->set_read_mode(kudu::READ_YOUR_WRITES);
+      if (configuration_.has_snapshot_timestamp()) {
+        LOG(FATAL) << "Snapshot timestamp should only be configured "
+                      "for READ_AT_SNAPSHOT scan mode.";
       }
       break;
     default:
@@ -293,10 +351,18 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
   scan->set_cache_blocks(configuration_.spec().cache_blocks());
 
   // For consistent operations, propagate the timestamp among all operations
-  // performed the context of the same client.
-  const uint64_t lo_ts = table_->client()->data_->GetLatestObservedTimestamp();
-  if (lo_ts != KuduClient::kNoTimestamp) {
-    scan->set_propagated_timestamp(lo_ts);
+  // performed the context of the same client. For READ_YOUR_WRITES scan, use
+  // the propagation timestamp from the scan config.
+  uint64_t ts = KuduClient::kNoTimestamp;
+  if (read_mode == KuduScanner::READ_YOUR_WRITES) {
+    if (configuration_.has_lower_bound_propagation_timestamp()) {
+      ts = configuration_.lower_bound_propagation_timestamp();
+    }
+  } else {
+    ts = table_->client()->data_->GetLatestObservedTimestamp();
+  }
+  if (ts != KuduClient::kNoTimestamp) {
+    scan->set_propagated_timestamp(ts);
   }
 
   // Set up the predicates.
@@ -334,9 +400,8 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
       // No more tablets in the table.
       partition_pruner_.RemovePartitionKeyRange("");
       return Status::OK();
-    } else {
-      RETURN_NOT_OK(s);
     }
+    RETURN_NOT_OK(s);
 
     // Check if the meta cache returned a tablet covering a partition key range past
     // what we asked for. This can happen if the requested partition key falls
@@ -380,7 +445,7 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
     ts_ = CHECK_NOTNULL(ts);
     proxy_ = ts_->proxy();
 
-    bool allow_time_for_failover = static_cast<int>(candidates.size()) - blacklist->size() > 1;
+    bool allow_time_for_failover = candidates.size() > blacklist->size() + 1;
     ScanRpcStatus scan_status = SendScanRpc(deadline, allow_time_for_failover);
     if (scan_status.result == ScanRpcStatus::OK) {
       last_error_ = Status::OK();
@@ -394,7 +459,7 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
   partition_pruner_.RemovePartitionKeyRange(remote_->partition().partition_key_end());
 
   next_req_.clear_new_scan_request();
-  data_in_open_ = last_response_.has_data();
+  data_in_open_ = last_response_.has_data() && last_response_.data().num_rows() > 0;
   if (last_response_.has_more_results()) {
     next_req_.set_scanner_id(last_response_.scanner_id());
     VLOG(2) << "Opened tablet " << remote_->tablet_id()
@@ -423,7 +488,14 @@ Status KuduScanner::Data::OpenTablet(const string& partition_key,
     configuration_.SetSnapshotRaw(last_response_.snap_timestamp());
   }
 
-  if (last_response_.has_propagated_timestamp()) {
+  // For READ_YOUR_WRITES mode, updates the latest observed timestamp with
+  // the chosen snapshot timestamp sent back from the server, to avoid
+  // unnecessarily wait for subsequent reads.
+  if (configuration_.read_mode() == KuduScanner::READ_YOUR_WRITES) {
+    CHECK(last_response_.has_snap_timestamp());
+    table_->client()->data_->UpdateLatestObservedTimestamp(
+        last_response_.snap_timestamp());
+  } else if (last_response_.has_propagated_timestamp()) {
     table_->client()->data_->UpdateLatestObservedTimestamp(
         last_response_.propagated_timestamp());
   }
@@ -483,7 +555,7 @@ void KuduScanner::Data::UpdateLastError(const Status& error) {
 // KuduScanBatch
 ////////////////////////////////////////////////////////////
 
-KuduScanBatch::Data::Data() : projection_(NULL) {}
+KuduScanBatch::Data::Data() : projection_(NULL), row_format_flags_(KuduScanner::NO_FLAGS) {}
 
 KuduScanBatch::Data::~Data() {}
 
@@ -495,12 +567,22 @@ size_t KuduScanBatch::Data::CalculateProjectedRowSize(const Schema& proj) {
 Status KuduScanBatch::Data::Reset(RpcController* controller,
                                   const Schema* projection,
                                   const KuduSchema* client_projection,
-                                  gscoped_ptr<RowwiseRowBlockPB> data) {
+                                  uint64_t row_format_flags,
+                                  gscoped_ptr<RowwiseRowBlockPB> resp_data) {
   CHECK(controller->finished());
   controller_.Swap(controller);
   projection_ = projection;
+  projected_row_size_ = CalculateProjectedRowSize(*projection_);
   client_projection_ = client_projection;
-  resp_data_.Swap(data.get());
+  row_format_flags_ = row_format_flags;
+  if (!resp_data) {
+    // No new data; just clear out the old stuff.
+    resp_data_.Clear();
+    return Status::OK();
+  }
+
+  // There's new data. Swap it in and process it.
+  resp_data_.Swap(resp_data.get());
 
   // First, rewrite the relative addresses into absolute ones.
   if (PREDICT_FALSE(!resp_data_.has_rows_sidecar())) {
@@ -509,25 +591,31 @@ Status KuduScanBatch::Data::Reset(RpcController* controller,
 
   Status s = controller_.GetInboundSidecar(resp_data_.rows_sidecar(), &direct_data_);
   if (!s.ok()) {
-    return Status::Corruption("Server sent invalid response: row data "
-        "sidecar index corrupt", s.ToString());
+    return Status::Corruption("Server sent invalid response: "
+        "row data sidecar index corrupt", s.ToString());
   }
 
   if (resp_data_.has_indirect_data_sidecar()) {
     Status s = controller_.GetInboundSidecar(resp_data_.indirect_data_sidecar(),
-                                      &indirect_data_);
+                                             &indirect_data_);
     if (!s.ok()) {
-      return Status::Corruption("Server sent invalid response: indirect data "
-                                "sidecar index corrupt", s.ToString());
+      return Status::Corruption("Server sent invalid response: "
+          "indirect data sidecar index corrupt", s.ToString());
     }
   }
 
-  RETURN_NOT_OK(RewriteRowBlockPointers(*projection_, resp_data_, indirect_data_, &direct_data_));
-  projected_row_size_ = CalculateProjectedRowSize(*projection_);
-  return Status::OK();
+  bool pad_unixtime_micros_to_16_bytes = false;
+  if (row_format_flags_ & KuduScanner::PAD_UNIXTIME_MICROS_TO_16_BYTES) {
+    pad_unixtime_micros_to_16_bytes = true;
+  }
+
+  return RewriteRowBlockPointers(*projection_, resp_data_, indirect_data_, &direct_data_,
+                                 pad_unixtime_micros_to_16_bytes);
 }
 
 void KuduScanBatch::Data::ExtractRows(vector<KuduScanBatch::RowPtr>* rows) {
+  DCHECK_EQ(row_format_flags_, KuduScanner::NO_FLAGS) << "Cannot extract rows. "
+      << "Row format modifier flags were selected: " << row_format_flags_;
   int n_rows = resp_data_.num_rows();
   rows->resize(n_rows);
 

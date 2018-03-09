@@ -17,18 +17,24 @@
 
 #include "kudu/master/ts_descriptor.h"
 
-#include <math.h>
+#include <cmath>
 #include <mutex>
+#include <ostream>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus.proxy.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/master/master.pb.h"
 #include "kudu/tserver/tserver_admin.proxy.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 
 DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,
@@ -37,8 +43,12 @@ DEFINE_int32(tserver_unresponsive_timeout_ms, 60 * 1000,
              "selected when assigning replicas during table creation or re-replication.");
 TAG_FLAG(tserver_unresponsive_timeout_ms, advanced);
 
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
 using std::make_shared;
 using std::shared_ptr;
+using std::string;
+using std::vector;
 
 namespace kudu {
 namespace master {
@@ -192,12 +202,12 @@ void TSDescriptor::GetNodeInstancePB(NodeInstancePB* instance_pb) const {
   instance_pb->set_instance_seqno(latest_seqno_);
 }
 
-Status TSDescriptor::ResolveSockaddr(Sockaddr* addr) const {
+Status TSDescriptor::ResolveSockaddr(Sockaddr* addr, string* host) const {
   vector<HostPort> hostports;
   {
     std::lock_guard<simple_spinlock> l(lock_);
     for (const HostPortPB& addr : registration_->rpc_addresses()) {
-      hostports.push_back(HostPort(addr.host(), addr.port()));
+      hostports.emplace_back(addr.host(), addr.port());
     }
   }
 
@@ -212,7 +222,7 @@ Status TSDescriptor::ResolveSockaddr(Sockaddr* addr) const {
     }
   }
 
-  if (addrs.size() == 0) {
+  if (addrs.empty()) {
     return Status::NetworkError("Unable to find the TS address: ",
                                 SecureDebugString(*registration_));
   }
@@ -223,6 +233,7 @@ Status TSDescriptor::ResolveSockaddr(Sockaddr* addr) const {
                   << addrs[0].ToString();
   }
   *addr = addrs[0];
+  *host = last_hostport.host();
   return Status::OK();
 }
 
@@ -237,11 +248,13 @@ Status TSDescriptor::GetTSAdminProxy(const shared_ptr<rpc::Messenger>& messenger
   }
 
   Sockaddr addr;
-  RETURN_NOT_OK(ResolveSockaddr(&addr));
+  string host;
+  RETURN_NOT_OK(ResolveSockaddr(&addr, &host));
 
   std::lock_guard<simple_spinlock> l(lock_);
   if (!ts_admin_proxy_) {
-    ts_admin_proxy_.reset(new tserver::TabletServerAdminServiceProxy(messenger, addr));
+    ts_admin_proxy_.reset(new tserver::TabletServerAdminServiceProxy(
+        messenger, addr, std::move(host)));
   }
   *proxy = ts_admin_proxy_;
   return Status::OK();
@@ -258,11 +271,13 @@ Status TSDescriptor::GetConsensusProxy(const shared_ptr<rpc::Messenger>& messeng
   }
 
   Sockaddr addr;
-  RETURN_NOT_OK(ResolveSockaddr(&addr));
+  string host;
+  RETURN_NOT_OK(ResolveSockaddr(&addr, &host));
 
   std::lock_guard<simple_spinlock> l(lock_);
   if (!consensus_proxy_) {
-    consensus_proxy_.reset(new consensus::ConsensusServiceProxy(messenger, addr));
+    consensus_proxy_.reset(new consensus::ConsensusServiceProxy(
+        messenger, addr, std::move(host)));
   }
   *proxy = consensus_proxy_;
   return Status::OK();

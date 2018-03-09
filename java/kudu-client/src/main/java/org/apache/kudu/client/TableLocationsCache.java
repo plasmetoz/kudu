@@ -19,6 +19,7 @@ package org.apache.kudu.client;
 
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.NavigableMap;
@@ -31,10 +32,9 @@ import javax.annotation.concurrent.ThreadSafe;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.primitives.UnsignedBytes;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import org.apache.kudu.annotations.InterfaceAudience;
 
 /**
  * A cache of the tablet locations in a table, keyed by partition key. Entries
@@ -205,6 +205,23 @@ class TableLocationsCache {
 
       for (Entry entry : newEntries) {
         entries.put(entry.getLowerBoundPartitionKey(), entry);
+      }
+    } finally {
+      rwl.writeLock().unlock();
+    }
+  }
+
+  /**
+   * Clears all non-covered range entries from the cache.
+   */
+  public void clearNonCoveredRangeEntries() {
+    rwl.writeLock().lock();
+    try {
+      Iterator<Map.Entry<byte[], Entry>> it = entries.entrySet().iterator();
+      while (it.hasNext()) {
+        if (it.next().getValue().isNonCoveredRange()) {
+          it.remove();
+        }
       }
     } finally {
       rwl.writeLock().unlock();

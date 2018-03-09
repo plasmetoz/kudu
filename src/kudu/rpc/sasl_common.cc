@@ -17,40 +17,35 @@
 
 #include "kudu/rpc/sasl_common.h"
 
-#include <string.h>
-
-#include <algorithm>
+#include <cstdio>
+#include <cstring>
 #include <limits>
 #include <mutex>
+#include <ostream>
 #include <string>
 
 #include <boost/algorithm/string/predicate.hpp>
-#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <regex.h>
 #include <sasl/sasl.h>
 #include <sasl/saslplug.h>
 
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/once.h"
-#include "kudu/gutil/stringprintf.h"
 #include "kudu/rpc/constants.h"
-#include "kudu/util/flag_tags.h"
+#include "kudu/security/init.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/rw_mutex.h"
-#include "kudu/security/init.h"
 
 using std::set;
-
-DECLARE_string(keytab_file);
+using std::string;
 
 namespace kudu {
 namespace rpc {
 
 const char* const kSaslMechPlain = "PLAIN";
 const char* const kSaslMechGSSAPI = "GSSAPI";
-extern const size_t kSaslMaxOutBufLen = 1024;
+extern const size_t kSaslMaxBufSize = 1024;
 
 // See WrapSaslCall().
 static __thread string* g_auth_failure_capture = nullptr;
@@ -61,6 +56,9 @@ static bool sasl_is_initialized = false;
 
 // If true, then we expect someone else has initialized SASL.
 static bool g_disable_sasl_init = false;
+
+// If true, we expect kerberos to be enabled.
+static bool has_kerberos_keytab = false;
 
 // Output Sasl messages.
 // context: not used.
@@ -211,8 +209,10 @@ static bool SaslMutexImplementationProvided() {
 
 // Actually perform the initialization for the SASL subsystem.
 // Meant to be called via GoogleOnceInit().
-static void DoSaslInit() {
+static void DoSaslInit(bool kerberos_keytab_provided) {
   VLOG(3) << "Initializing SASL library";
+
+  has_kerberos_keytab = kerberos_keytab_provided;
 
   bool sasl_initialized = SaslIsInitialized();
   if (sasl_initialized && !g_disable_sasl_init) {
@@ -264,10 +264,12 @@ Status DisableSaslInitialization() {
   return Status::OK();
 }
 
-Status SaslInit() {
+Status SaslInit(bool kerberos_keytab_provided) {
   // Only execute SASL initialization once
-  static GoogleOnceType once = GOOGLE_ONCE_INIT;
-  GoogleOnceInit(&once, &DoSaslInit);
+  static std::once_flag once;
+  std::call_once(once, DoSaslInit, kerberos_keytab_provided);
+  DCHECK_EQ(kerberos_keytab_provided, has_kerberos_keytab);
+
   return sasl_init_status;
 }
 
@@ -319,10 +321,9 @@ Status WrapSaslCall(sasl_conn_t* conn, const std::function<int()>& call) {
   g_auth_failure_capture = &err;
 
   // Take the 'kerberos_reinit_lock' here to avoid a possible race with ticket renewal.
-  bool kerberos_supported = !FLAGS_keytab_file.empty();
-  if (kerberos_supported) kudu::security::KerberosReinitLock()->ReadLock();
+  if (has_kerberos_keytab) kudu::security::KerberosReinitLock()->ReadLock();
   int rc = call();
-  if (kerberos_supported) kudu::security::KerberosReinitLock()->ReadUnlock();
+  if (has_kerberos_keytab) kudu::security::KerberosReinitLock()->ReadUnlock();
   g_auth_failure_capture = nullptr;
 
   switch (rc) {
@@ -349,45 +350,44 @@ Status WrapSaslCall(sasl_conn_t* conn, const std::function<int()>& call) {
   }
 }
 
-Status SaslEncode(sasl_conn_t* conn, const std::string& plaintext, std::string* encoded) {
-  size_t offset = 0;
+bool NeedsWrap(sasl_conn_t* sasl_conn) {
+  const unsigned* ssf;
+  int rc = sasl_getprop(sasl_conn, SASL_SSF, reinterpret_cast<const void**>(&ssf));
+  CHECK_EQ(rc, SASL_OK) << "Failed to get SSF property on authenticated SASL connection";
+  return *ssf != 0;
+}
 
-  // The SASL library can only encode up to a maximum amount at a time, so we
-  // have to call encode multiple times if our input is larger than this max.
-  while (offset < plaintext.size()) {
-    const char* out;
-    unsigned out_len;
-    size_t len = std::min(kSaslMaxOutBufLen, plaintext.size() - offset);
+uint32_t GetMaxSendBufferSize(sasl_conn_t* sasl_conn) {
+  const unsigned* max_buf_size;
+  int rc = sasl_getprop(sasl_conn, SASL_MAXOUTBUF, reinterpret_cast<const void**>(&max_buf_size));
+  CHECK_EQ(rc, SASL_OK)
+      << "Failed to get max output buffer property on authenticated SASL connection";
+  return *max_buf_size;
+}
 
-    RETURN_NOT_OK(WrapSaslCall(conn, [&]() {
-        return sasl_encode(conn, plaintext.data() + offset, len, &out, &out_len);
-    }));
-
-    encoded->append(out, out_len);
-    offset += len;
-  }
-
+Status SaslEncode(sasl_conn_t* conn, Slice plaintext, Slice* ciphertext) {
+  const char* out;
+  unsigned out_len;
+  RETURN_NOT_OK_PREPEND(WrapSaslCall(conn, [&] {
+      return sasl_encode(conn,
+                         reinterpret_cast<const char*>(plaintext.data()),
+                         plaintext.size(),
+                         &out, &out_len);
+  }), "SASL encode failed");
+  *ciphertext = Slice(out, out_len);
   return Status::OK();
 }
 
-Status SaslDecode(sasl_conn_t* conn, const string& encoded, string* plaintext) {
-  size_t offset = 0;
-
-  // The SASL library can only decode up to a maximum amount at a time, so we
-  // have to call decode multiple times if our input is larger than this max.
-  while (offset < encoded.size()) {
-    const char* out;
-    unsigned out_len;
-    size_t len = std::min(kSaslMaxOutBufLen, encoded.size() - offset);
-
-    RETURN_NOT_OK(WrapSaslCall(conn, [&]() {
-        return sasl_decode(conn, encoded.data() + offset, len, &out, &out_len);
-    }));
-
-    plaintext->append(out, out_len);
-    offset += len;
-  }
-
+Status SaslDecode(sasl_conn_t* conn, Slice ciphertext, Slice* plaintext) {
+  const char* out;
+  unsigned out_len;
+  RETURN_NOT_OK_PREPEND(WrapSaslCall(conn, [&] {
+    return sasl_decode(conn,
+                       reinterpret_cast<const char*>(ciphertext.data()),
+                       ciphertext.size(),
+                       &out, &out_len);
+  }), "SASL decode failed");
+  *plaintext = Slice(out, out_len);
   return Status::OK();
 }
 
@@ -423,14 +423,16 @@ sasl_callback_t SaslBuildCallback(int id, int (*proc)(void), void* context) {
   return callback;
 }
 
-Status EnableIntegrityProtection(sasl_conn_t* sasl_conn) {
+Status EnableProtection(sasl_conn_t* sasl_conn,
+                        SaslProtection::Type minimum_protection,
+                        size_t max_recv_buf_size) {
   sasl_security_properties_t sec_props;
   memset(&sec_props, 0, sizeof(sec_props));
-  sec_props.min_ssf = 1;
+  sec_props.min_ssf = minimum_protection;
   sec_props.max_ssf = std::numeric_limits<sasl_ssf_t>::max();
-  sec_props.maxbufsize = kSaslMaxOutBufLen;
+  sec_props.maxbufsize = max_recv_buf_size;
 
-  RETURN_NOT_OK_PREPEND(WrapSaslCall(sasl_conn, [&] () {
+  RETURN_NOT_OK_PREPEND(WrapSaslCall(sasl_conn, [&] {
     return sasl_setprop(sasl_conn, SASL_SEC_PROPS, &sec_props);
   }), "failed to set SASL security properties");
   return Status::OK();
@@ -453,6 +455,15 @@ const char* SaslMechanism::name_of(SaslMechanism::Type val) {
     default:
       return "INVALID";
   }
+}
+
+const char* SaslProtection::name_of(SaslProtection::Type val) {
+  switch (val) {
+    case SaslProtection::kAuthentication: return "authentication";
+    case SaslProtection::kIntegrity: return "integrity";
+    case SaslProtection::kPrivacy: return "privacy";
+  }
+  LOG(FATAL) << "unknown SASL protection type: " << val;
 }
 
 } // namespace rpc

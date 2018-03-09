@@ -56,25 +56,33 @@
 // 'N','O',74476040,111701729697.74,106118230307.6,110367043872.5,25.5,38249.1,0,2920374
 // 'R','F',37719753,56568041380.90,53741292684.6,55889619119.8,25.5,38250.9,0.1,1478870
 // ====
-#include <boost/bind.hpp>
-#include <unordered_map>
-#include <stdlib.h>
 
+#include <cstdint>
+#include <cstdlib>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <boost/bind.hpp>
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/benchmarks/tpch/tpch-schemas.h"
-#include "kudu/benchmarks/tpch/rpc_line_item_dao.h"
 #include "kudu/benchmarks/tpch/line_item_tsv_importer.h"
+#include "kudu/benchmarks/tpch/rpc_line_item_dao.h"
+#include "kudu/client/row_result.h"
 #include "kudu/codegen/compilation_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/hash/city.h"
-#include "kudu/gutil/strings/numbers.h"
-#include "kudu/integration-tests/mini_cluster.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/master/mini_master.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/util/env.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 
 DEFINE_string(tpch_path_to_data, "/tmp/lineitem.tbl",
@@ -95,13 +103,13 @@ DEFINE_int32(tpch_max_batch_size, 1000,
 DEFINE_string(table_name, "lineitem",
               "The table name to write/read");
 
+using std::string;
+using std::unordered_map;
+using std::vector;
+
 namespace kudu {
 
-using client::KuduColumnSchema;
 using client::KuduRowResult;
-using client::KuduSchema;
-
-using std::unordered_map;
 
 struct Result {
   int32_t l_quantity;
@@ -129,7 +137,7 @@ struct SliceMapKey {
   }
 };
 
-struct hash {
+struct Hash {
   size_t operator()(const SliceMapKey &key) const {
     return util_hash::CityHash64(
       reinterpret_cast<const char *>(key.slice.data()), key.slice.size());
@@ -154,8 +162,8 @@ void WarmupScanCache(RpcLineItemDAO* dao) {
 }
 
 void Tpch1(RpcLineItemDAO *dao) {
-  typedef unordered_map<SliceMapKey, Result*, hash> slice_map;
-  typedef unordered_map<SliceMapKey, slice_map*, hash> slice_map_map;
+  typedef unordered_map<SliceMapKey, Result*, Hash> slice_map;
+  typedef unordered_map<SliceMapKey, slice_map*, Hash> slice_map_map;
 
   gscoped_ptr<RpcLineItemDAO::Scanner> scanner;
   dao->OpenTpch1Scanner(&scanner);
@@ -246,23 +254,25 @@ int main(int argc, char **argv) {
   kudu::InitGoogleLoggingSafe(argv[0]);
 
   kudu::Env* env;
-  gscoped_ptr<kudu::MiniCluster> cluster;
+  gscoped_ptr<kudu::cluster::InternalMiniCluster> cluster;
   string master_address;
   if (FLAGS_use_mini_cluster) {
     env = kudu::Env::Default();
     kudu::Status s = env->CreateDir(FLAGS_mini_cluster_base_dir);
     CHECK(s.IsAlreadyPresent() || s.ok()) << s.ToString();
-    kudu::MiniClusterOptions options;
-    options.data_root = FLAGS_mini_cluster_base_dir;
-    cluster.reset(new kudu::MiniCluster(env, options));
+    kudu::cluster::InternalMiniClusterOptions options;
+    options.cluster_root = FLAGS_mini_cluster_base_dir;
+    cluster.reset(new kudu::cluster::InternalMiniCluster(env, options));
     CHECK_OK(cluster->StartSync());
     master_address = cluster->mini_master()->bound_rpc_addr_str();
   } else {
     master_address = FLAGS_master_address;
   }
 
-  gscoped_ptr<kudu::RpcLineItemDAO> dao(new kudu::RpcLineItemDAO(master_address, FLAGS_table_name,
-                                                                 FLAGS_tpch_max_batch_size));
+  gscoped_ptr<kudu::RpcLineItemDAO> dao(new kudu::RpcLineItemDAO(
+      master_address, FLAGS_table_name, FLAGS_tpch_max_batch_size,
+      /* timeout = */ 5000, kudu::RpcLineItemDAO::RANGE,
+      /* num_buckets = */ 1));
   dao->Init();
 
   kudu::WarmupScanCache(dao.get());

@@ -19,13 +19,16 @@
 
 #include <functional>
 #include <memory>
+#include <ostream>
 #include <string>
 
+#include <glog/logging.h>
+#include <openssl/err.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 
-#include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 // Forward declarations for the OpenSSL typedefs.
@@ -49,8 +52,26 @@ typedef struct x509_st X509;
     return Status::RuntimeError((msg), GetOpenSSLErrors()); \
   }
 
+// Scoped helper which DCHECKs that on both scope entry and exit, there are no
+// pending OpenSSL errors for the current thread.
+//
+// This allows us to avoid calling ERR_clear_error() defensively before every
+// OpenSSL call, but rather call it only when we get an error code indicating
+// there may be some pending error.
+//
+// Example usage:
+//
+//    void MyFunc() {
+//      SCOPED_OPENSSL_NO_PENDING_ERRORS;
+//      ... use OpenSSL APIs ...
+//    }
+#define SCOPED_OPENSSL_NO_PENDING_ERRORS \
+  kudu::security::internal::ScopedCheckNoPendingSSLErrors _no_ssl_errors(__PRETTY_FUNCTION__)
+
 namespace kudu {
 namespace security {
+
+using PasswordCallback = std::function<std::string(void)>;
 
 // Disable initialization of OpenSSL. Must be called before
 // any call to InitializeOpenSSL().
@@ -79,6 +100,12 @@ std::string GetOpenSSLErrors();
 // See man(3) SSL_get_error for more discussion.
 std::string GetSSLErrorDescription(int error_code);
 
+// Runs the shell command 'cmd' which should give a password to a private key file
+// as the output.
+//
+// 'password' is populated with the password string if the command was a success.
+// An error Status object is returned otherwise.
+Status GetPasswordFromShellCommand(const std::string& cmd, std::string* password);
 
 // A generic wrapper for OpenSSL structures.
 template <typename T>
@@ -90,32 +117,48 @@ template<typename SSL_TYPE>
 struct SslTypeTraits {};
 
 template<> struct SslTypeTraits<X509> {
-  static constexpr auto free = &X509_free;
-  static constexpr auto read_pem = &PEM_read_bio_X509;
-  static constexpr auto read_der = &d2i_X509_bio;
-  static constexpr auto write_pem = &PEM_write_bio_X509;
-  static constexpr auto write_der = &i2d_X509_bio;
+  static constexpr auto kFreeFunc = &X509_free;
+  static constexpr auto kReadPemFunc = &PEM_read_bio_X509;
+  static constexpr auto kReadDerFunc = &d2i_X509_bio;
+  static constexpr auto kWritePemFunc = &PEM_write_bio_X509;
+  static constexpr auto kWriteDerFunc = &i2d_X509_bio;
+};
+
+// SslTypeTraits functions for Type STACK_OF(X509)
+STACK_OF(X509)* PEM_read_STACK_OF_X509(BIO* bio, void* /* unused */,
+    pem_password_cb* /* unused */, void* /* unused */);
+int PEM_write_STACK_OF_X509(BIO* bio, STACK_OF(X509)* obj);
+STACK_OF(X509)* DER_read_STACK_OF_X509(BIO* bio, void* /* unused */);
+int DER_write_STACK_OF_X509(BIO* bio, STACK_OF(X509)* obj);
+void free_STACK_OF_X509(STACK_OF(X509)* sk);
+
+template<> struct SslTypeTraits<STACK_OF(X509)> {
+  static constexpr auto kFreeFunc = &free_STACK_OF_X509;
+  static constexpr auto kReadPemFunc = &PEM_read_STACK_OF_X509;
+  static constexpr auto kReadDerFunc = &DER_read_STACK_OF_X509;
+  static constexpr auto kWritePemFunc = &PEM_write_STACK_OF_X509;
+  static constexpr auto kWriteDerFunc = &DER_write_STACK_OF_X509;
 };
 template<> struct SslTypeTraits<X509_EXTENSION> {
-  static constexpr auto free = &X509_EXTENSION_free;
+  static constexpr auto kFreeFunc = &X509_EXTENSION_free;
 };
 template<> struct SslTypeTraits<X509_REQ> {
-  static constexpr auto free = &X509_REQ_free;
-  static constexpr auto read_pem = &PEM_read_bio_X509_REQ;
-  static constexpr auto read_der = &d2i_X509_REQ_bio;
-  static constexpr auto write_pem = &PEM_write_bio_X509_REQ;
-  static constexpr auto write_der = &i2d_X509_REQ_bio;
+  static constexpr auto kFreeFunc = &X509_REQ_free;
+  static constexpr auto kReadPemFunc = &PEM_read_bio_X509_REQ;
+  static constexpr auto kReadDerFunc = &d2i_X509_REQ_bio;
+  static constexpr auto kWritePemFunc = &PEM_write_bio_X509_REQ;
+  static constexpr auto kWriteDerFunc = &i2d_X509_REQ_bio;
 };
 template<> struct SslTypeTraits<EVP_PKEY> {
-  static constexpr auto free = &EVP_PKEY_free;
+  static constexpr auto kFreeFunc = &EVP_PKEY_free;
 };
 template<> struct SslTypeTraits<SSL_CTX> {
-  static constexpr auto free = &SSL_CTX_free;
+  static constexpr auto kFreeFunc = &SSL_CTX_free;
 };
 
 template<typename SSL_TYPE, typename Traits = SslTypeTraits<SSL_TYPE>>
 c_unique_ptr<SSL_TYPE> ssl_make_unique(SSL_TYPE* d) {
-  return {d, Traits::free};
+  return {d, Traits::kFreeFunc};
 }
 
 // Acceptable formats for keys, X509 certificates and X509 CSRs.
@@ -146,5 +189,29 @@ class RawDataWrapper {
   c_unique_ptr<RawDataType> data_;
 };
 
+
+namespace internal {
+
+// Implementation of SCOPED_OPENSSL_NO_PENDING_ERRORS. Use the macro form
+// instead of directly instantiating the implementation class.
+struct ScopedCheckNoPendingSSLErrors {
+ public:
+  explicit ScopedCheckNoPendingSSLErrors(const char* func)
+      : func_(func) {
+    DCHECK_EQ(ERR_peek_error(), 0)
+        << "Expected no pending OpenSSL errors on " << func_
+        << " entry, but had: " << GetOpenSSLErrors();
+  }
+  ~ScopedCheckNoPendingSSLErrors() {
+    DCHECK_EQ(ERR_peek_error(), 0)
+        << "Expected no pending OpenSSL errors on " << func_
+        << " exit, but had: " << GetOpenSSLErrors();
+  }
+
+ private:
+  const char* const func_;
+};
+
+} // namespace internal
 } // namespace security
 } // namespace kudu

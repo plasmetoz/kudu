@@ -17,19 +17,25 @@
 
 #include "kudu/rpc/server_negotiation.h"
 
-#include <limits>
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <mutex>
+#include <ostream>
 #include <set>
 #include <string>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
-#include <google/protobuf/message_lite.h>
 #include <sasl/sasl.h>
 
-#include "kudu/gutil/casts.h"
-#include "kudu/gutil/endian.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/constants.h"
@@ -40,22 +46,72 @@
 #include "kudu/security/init.h"
 #include "kudu/security/tls_context.h"
 #include "kudu/security/tls_handshake.h"
-#include "kudu/security/tls_socket.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/fault_injection.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
-#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/trace.h"
 
 using std::set;
 using std::string;
 using std::unique_ptr;
+using std::vector;
+
+// Fault injection flags.
+DEFINE_double(rpc_inject_invalid_authn_token_ratio, 0,
+              "If set higher than 0, AuthenticateByToken() randomly injects "
+              "errors replying with FATAL_INVALID_AUTHENTICATION_TOKEN code. "
+              "The flag's value corresponds to the probability of the fault "
+              "injection event. Used for only for tests.");
+TAG_FLAG(rpc_inject_invalid_authn_token_ratio, runtime);
+TAG_FLAG(rpc_inject_invalid_authn_token_ratio, unsafe);
 
 DECLARE_bool(rpc_encrypt_loopback_connections);
 
+DEFINE_string(trusted_subnets,
+              "127.0.0.0/8,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16,169.254.0.0/16",
+              "A trusted subnet whitelist. If set explicitly, all unauthenticated "
+              "or unencrypted connections are prohibited except the ones from the "
+              "specified address blocks. Otherwise, private network (127.0.0.0/8, etc.) "
+              "and local subnets of all local network interfaces will be used. Set it "
+              "to '0.0.0.0/0' to allow unauthenticated/unencrypted connections from all "
+              "remote IP addresses. However, if network access is not otherwise restricted "
+              "by a firewall, malicious users may be able to gain unauthorized access.");
+TAG_FLAG(trusted_subnets, advanced);
+TAG_FLAG(trusted_subnets, evolving);
+
+static bool ValidateTrustedSubnets(const char* /*flagname*/, const string& value) {
+  if (value.empty()) {
+    return true;
+  }
+
+  for (const auto& t : strings::Split(value, ",", strings::SkipEmpty())) {
+    kudu::Network network;
+    kudu::Status s = network.ParseCIDRString(t.ToString());
+    if (!s.ok()) {
+      LOG(ERROR) << "Invalid subnet address: " << t
+                 << ". Subnet must be specified in CIDR notation.";
+      return false;
+    }
+  }
+
+  return true;
+}
+
+DEFINE_validator(trusted_subnets, &ValidateTrustedSubnets);
+
 namespace kudu {
 namespace rpc {
+
+namespace {
+vector<Network>* g_trusted_subnets = nullptr;
+} // anonymous namespace
 
 static int ServerNegotiationGetoptCb(ServerNegotiation* server_negotiation,
                                      const char* plugin_name,
@@ -77,7 +133,8 @@ static int ServerNegotiationPlainAuthCb(sasl_conn_t* conn,
 ServerNegotiation::ServerNegotiation(unique_ptr<Socket> socket,
                                      const security::TlsContext* tls_context,
                                      const security::TokenVerifier* token_verifier,
-                                     RpcEncryption encryption)
+                                     RpcEncryption encryption,
+                                     std::string sasl_proto_name)
     : socket_(std::move(socket)),
       helper_(SaslHelper::SERVER),
       tls_context_(tls_context),
@@ -86,6 +143,7 @@ ServerNegotiation::ServerNegotiation(unique_ptr<Socket> socket,
       token_verifier_(token_verifier),
       negotiated_authn_(AuthenticationType::INVALID),
       negotiated_mech_(SaslMechanism::INVALID),
+      sasl_proto_name_(std::move(sasl_proto_name)),
       deadline_(MonoTime::Max()) {
   callbacks_.push_back(SaslBuildCallback(SASL_CB_GETOPT,
       reinterpret_cast<int (*)()>(&ServerNegotiationGetoptCb), this));
@@ -125,7 +183,7 @@ Status ServerNegotiation::Negotiate() {
   DCHECK(token_verifier_);
 
   // Ensure we can use blocking calls on the socket during negotiation.
-  RETURN_NOT_OK(EnsureBlockingMode(socket_.get()));
+  RETURN_NOT_OK(CheckInBlockingMode(socket_.get()));
 
   faststring recv_buf;
 
@@ -162,6 +220,30 @@ Status ServerNegotiation::Negotiate() {
     tls_negotiated_ = true;
   }
 
+  // Rejects any connection from public routable IPs if encryption
+  // is disabled. See KUDU-1875.
+  if (!tls_negotiated_) {
+    Sockaddr addr;
+    RETURN_NOT_OK(socket_->GetPeerAddress(&addr));
+
+    if (!IsTrustedConnection(addr)) {
+      // Receives client response before sending error
+      // message, even though the response is never used,
+      // to avoid risk condition that connection gets
+      // closed before client receives server's error
+      // message.
+      NegotiatePB request;
+      RETURN_NOT_OK(RecvNegotiatePB(&request, &recv_buf));
+
+      Status s = Status::NotAuthorized("unencrypted connections from publicly routable "
+                                       "IPs are prohibited. See --trusted_subnets flag "
+                                       "for more information.",
+                                       addr.ToString());
+      RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_UNAUTHORIZED, s));
+      return s;
+    }
+  }
+
   // Step 4: Authentication
   switch (negotiated_authn_) {
     case AuthenticationType::SASL:
@@ -183,7 +265,7 @@ Status ServerNegotiation::Negotiate() {
   return Status::OK();
 }
 
-Status ServerNegotiation::PreflightCheckGSSAPI() {
+Status ServerNegotiation::PreflightCheckGSSAPI(const std::string& sasl_proto_name) {
   // TODO(todd): the error messages that come from this function on el6
   // are relatively useless due to the following krb5 bug:
   // http://krbdev.mit.edu/rt/Ticket/Display.html?id=6973
@@ -195,7 +277,8 @@ Status ServerNegotiation::PreflightCheckGSSAPI() {
   //
   // We aren't going to actually send/receive any messages, but
   // this makes it easier to reuse the initialization code.
-  ServerNegotiation server(nullptr, nullptr, nullptr, RpcEncryption::OPTIONAL);
+  ServerNegotiation server(
+      nullptr, nullptr, nullptr, RpcEncryption::OPTIONAL, sasl_proto_name);
   Status s = server.EnableGSSAPI();
   if (!s.ok()) {
     return Status::RuntimeError(s.message());
@@ -272,7 +355,7 @@ Status ServerNegotiation::SendError(ErrorStatusPB::RpcErrorCodePB code, const St
   msg.set_code(code);
   msg.set_message(err.ToString());
 
-  TRACE("Sending RPC error: $0", ErrorStatusPB::RpcErrorCodePB_Name(code));
+  TRACE("Sending RPC error: $0: $1", ErrorStatusPB::RpcErrorCodePB_Name(code), err.ToString());
   RETURN_NOT_OK(SendFramedMessageBlocking(socket(), header, msg, deadline_));
 
   return Status::OK();
@@ -293,8 +376,6 @@ Status ServerNegotiation::ValidateConnectionHeader(faststring* recv_buf) {
 
 // calls sasl_server_init() and sasl_server_new()
 Status ServerNegotiation::InitSaslServer() {
-  RETURN_NOT_OK(SaslInit());
-
   // TODO(unknown): Support security flags.
   unsigned secflags = 0;
 
@@ -302,7 +383,7 @@ Status ServerNegotiation::InitSaslServer() {
   RETURN_NOT_OK_PREPEND(WrapSaslCall(nullptr /* no conn */, [&]() {
       return sasl_server_new(
           // Registered name of the service using SASL. Required.
-          kSaslProtoName,
+          sasl_proto_name_.c_str(),
           // The fully qualified domain name of this server.
           helper_.server_fqdn(),
           // Permits multiple user realms on server. NULL == use default.
@@ -364,7 +445,11 @@ Status ServerNegotiation::HandleNegotiate(const NegotiatePB& request) {
           authn_types.insert(AuthenticationType::TOKEN);
           break;
         case AuthenticationTypePB::kCertificate:
-          authn_types.insert(AuthenticationType::CERTIFICATE);
+          // We only provide authenticated TLS if the certificates are generated
+          // by the internal CA.
+          if (!tls_context_->is_external_cert()) {
+            authn_types.insert(AuthenticationType::CERTIFICATE);
+          }
           break;
         case AuthenticationTypePB::TYPE_NOT_SET: {
           Sockaddr addr;
@@ -487,13 +572,13 @@ Status ServerNegotiation::HandleTlsHandshake(const NegotiatePB& request) {
   // TLS handshake is finished.
   if (ContainsKey(server_features_, TLS_AUTHENTICATION_ONLY) &&
       ContainsKey(client_features_, TLS_AUTHENTICATION_ONLY)) {
-    TRACE("Negotiated auth-only $0 with cipher suite $1",
-          tls_handshake_.GetProtocol(), tls_handshake_.GetCipherSuite());
+    TRACE("Negotiated auth-only $0 with cipher $1",
+          tls_handshake_.GetProtocol(), tls_handshake_.GetCipherDescription());
     return tls_handshake_.FinishNoWrap(*socket_);
   }
 
-  TRACE("Negotiated $0 with cipher suite $1",
-        tls_handshake_.GetProtocol(), tls_handshake_.GetCipherSuite());
+  TRACE("Negotiated $0 with cipher $1",
+        tls_handshake_.GetProtocol(), tls_handshake_.GetCipherDescription());
   return tls_handshake_.Finish(&socket_);
 }
 
@@ -606,6 +691,31 @@ Status ServerNegotiation::AuthenticateByToken(faststring* recv_buf) {
     RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN, s));
     return s;
   }
+
+  if (PREDICT_FALSE(FLAGS_rpc_inject_invalid_authn_token_ratio > 0)) {
+    security::VerificationResult res;
+    int sel = rand() % 4;
+    switch (sel) {
+      case 0:
+        res = security::VerificationResult::INVALID_TOKEN;
+        break;
+      case 1:
+        res = security::VerificationResult::INVALID_SIGNATURE;
+        break;
+      case 2:
+        res = security::VerificationResult::EXPIRED_TOKEN;
+        break;
+      case 3:
+        res = security::VerificationResult::EXPIRED_SIGNING_KEY;
+        break;
+    }
+    if (kudu::fault_injection::MaybeTrue(FLAGS_rpc_inject_invalid_authn_token_ratio)) {
+      Status s = Status::NotAuthorized(VerificationResultToString(res));
+      RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN, s));
+      return s;
+    }
+  }
+
   authenticated_user_.SetAuthenticatedByToken(token.authn().username());
 
   // Respond with success message.
@@ -659,11 +769,27 @@ Status ServerNegotiation::HandleSaslInitiate(const NegotiatePB& request) {
 
   negotiated_mech_ = SaslMechanism::value_of(mechanism);
 
+  // Rejects any connection from public routable IPs if authentication mechanism
+  // is plain. See KUDU-1875.
+  if (negotiated_mech_ == SaslMechanism::PLAIN) {
+    Sockaddr addr;
+    RETURN_NOT_OK(socket_->GetPeerAddress(&addr));
+
+    if (!IsTrustedConnection(addr)) {
+      Status s = Status::NotAuthorized("unauthenticated connections from publicly "
+                                       "routable IPs are prohibited. See "
+                                       "--trusted_subnets flag for more information.",
+                                       addr.ToString());
+      RETURN_NOT_OK(SendError(ErrorStatusPB::FATAL_UNAUTHORIZED, s));
+      return s;
+    }
+  }
+
   // If the negotiated mechanism is GSSAPI (Kerberos), configure SASL to use
   // integrity protection so that the channel bindings and nonce can be
   // verified.
   if (negotiated_mech_ == SaslMechanism::GSSAPI) {
-    RETURN_NOT_OK(EnableIntegrityProtection(sasl_conn_.get()));
+    RETURN_NOT_OK(EnableProtection(sasl_conn_.get(), SaslProtection::kIntegrity));
   }
 
   const char* server_out = nullptr;
@@ -758,9 +884,12 @@ Status ServerNegotiation::SendSaslSuccess() {
 
       string plaintext_channel_bindings;
       RETURN_NOT_OK(cert.GetServerEndPointChannelBindings(&plaintext_channel_bindings));
+
+      Slice ciphertext;
       RETURN_NOT_OK(SaslEncode(sasl_conn_.get(),
                                plaintext_channel_bindings,
-                               response.mutable_channel_bindings()));
+                               &ciphertext));
+      *response.mutable_channel_bindings() = ciphertext.ToString();
     }
   }
 
@@ -793,7 +922,7 @@ Status ServerNegotiation::RecvConnectionContext(faststring* recv_buf) {
       return Status::NotAuthorized("ConnectionContextPB wrapped nonce missing");
     }
 
-    string decoded_nonce;
+    Slice decoded_nonce;
     s = SaslDecode(sasl_conn_.get(), conn_context.encoded_nonce(), &decoded_nonce);
     if (!s.ok()) {
       return Status::NotAuthorized("failed to decode nonce", s.message());
@@ -831,6 +960,29 @@ int ServerNegotiation::PlainAuthCb(sasl_conn_t* /*conn*/,
   }
   // We always allow PLAIN authentication to succeed.
   return SASL_OK;
+}
+
+bool ServerNegotiation::IsTrustedConnection(const Sockaddr& addr) {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    g_trusted_subnets = new vector<Network>();
+    CHECK_OK(Network::ParseCIDRStrings(FLAGS_trusted_subnets, g_trusted_subnets));
+
+    // If --trusted_subnets is not set explicitly, local subnets of all local network
+    // interfaces as well as the default private subnets will be used.
+    if (google::GetCommandLineFlagInfoOrDie("trusted_subnets").is_default) {
+      std::vector<Network> local_networks;
+      WARN_NOT_OK(GetLocalNetworks(&local_networks),
+                  "Unable to get local networks.");
+
+      g_trusted_subnets->insert(g_trusted_subnets->end(),
+                                local_networks.begin(),
+                                local_networks.end());
+    }
+  });
+
+  return std::any_of(g_trusted_subnets->begin(), g_trusted_subnets->end(),
+                     [&](const Network& t) { return t.WithinNetwork(addr); });
 }
 
 } // namespace rpc

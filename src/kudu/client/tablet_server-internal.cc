@@ -18,6 +18,7 @@
 #include "kudu/client/tablet_server-internal.h"
 
 #include <string>
+#include <utility>
 
 #include "kudu/util/net/net_util.h"
 

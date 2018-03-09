@@ -15,25 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <sys/types.h>
-#include <unistd.h>
-
+#include <cstdint>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <gflags/gflags_declare.h>
+#include <gflags/gflags.h>
+#include <google/protobuf/descriptor.h>
 #include <google/protobuf/descriptor.pb.h>
 #include <gtest/gtest.h>
 
+#include "kudu/gutil/port.h"
+#include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/pb_util-internal.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/pb_util_test.pb.h"
 #include "kudu/util/proto_container_test.pb.h"
 #include "kudu/util/proto_container_test2.pb.h"
 #include "kudu/util/proto_container_test3.pb.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 namespace kudu {
@@ -80,7 +86,7 @@ class TestPBUtil : public KuduTest {
   // XORs the data in the specified range of the file at the given path.
   Status BitFlipFileByteRange(const string& path, uint64_t offset, uint64_t length);
 
-  void DumpPBCToString(const string& path, bool oneline_output, string* ret);
+  void DumpPBCToString(const string& path, ReadablePBContainerFile::Format format, string* ret);
 
   // Truncate the specified file to the specified length.
   Status TruncateFile(const string& path, uint64_t size);
@@ -132,7 +138,7 @@ Status TestPBUtil::CreateKnownGoodContainerFileWithVersion(int version,
 
   unique_ptr<WritablePBContainerFile> pb_writer;
   RETURN_NOT_OK(NewPBCWriter(version, RWFileOptions(), &pb_writer));
-  RETURN_NOT_OK(pb_writer->Init(test_pb));
+  RETURN_NOT_OK(pb_writer->CreateNew(test_pb));
   RETURN_NOT_OK(pb_writer->Append(test_pb));
   RETURN_NOT_OK(pb_writer->Close());
   return Status::OK();
@@ -146,10 +152,10 @@ Status TestPBUtil::BitFlipFileByteRange(const string& path, uint64_t offset, uin
     RETURN_NOT_OK(env_->NewRandomAccessFile(path, &file));
     uint64_t size;
     RETURN_NOT_OK(file->Size(&size));
-    Slice slice;
     faststring scratch;
     scratch.resize(size);
-    RETURN_NOT_OK(env_util::ReadFully(file.get(), 0, size, &slice, scratch.data()));
+    Slice slice(scratch.data(), size);
+    RETURN_NOT_OK(file->Read(0, slice));
     buf.append(slice.data(), slice.size());
   }
 
@@ -368,7 +374,7 @@ TEST_P(TestPBContainerVersions, TestAppendAfterPartialWrite) {
   RWFileOptions opts;
   opts.mode = Env::OPEN_EXISTING;
   ASSERT_OK(NewPBCWriter(version_, opts, &writer));
-  ASSERT_OK(writer->Reopen());
+  ASSERT_OK(writer->OpenExisting());
 
   ASSERT_OK(TruncateFile(path_, known_good_size - 2));
 
@@ -393,7 +399,8 @@ TEST_P(TestPBContainerVersions, TestAppendAfterPartialWrite) {
 
   // Reopen the writer to allow appending more records.
   // Append a record and read it back.
-  ASSERT_OK(writer->Reopen());
+  ASSERT_OK(NewPBCWriter(version_, opts, &writer));
+  ASSERT_OK(writer->OpenExisting());
   test_pb.set_name("hello");
   test_pb.set_value(1);
   ASSERT_OK(writer->Append(test_pb));
@@ -419,7 +426,7 @@ TEST_P(TestPBContainerVersions, TestMultipleMessages) {
 
   unique_ptr<WritablePBContainerFile> pb_writer;
   ASSERT_OK(NewPBCWriter(version_, RWFileOptions(), &pb_writer));
-  ASSERT_OK(pb_writer->Init(pb));
+  ASSERT_OK(pb_writer->CreateNew(pb));
 
   for (int i = 0; i < 10; i++) {
     pb.set_value(i);
@@ -461,10 +468,11 @@ TEST_P(TestPBContainerVersions, TestInterleavedReadWrite) {
   ReadablePBContainerFile pb_reader(std::move(reader));
 
   // Write the header (writer) and validate it (reader).
-  ASSERT_OK(pb_writer->Init(pb));
+  ASSERT_OK(pb_writer->CreateNew(pb));
   ASSERT_OK(pb_reader.Open());
 
   for (int i = 0; i < 10; i++) {
+    SCOPED_TRACE(i);
     // Write a message and read it back.
     pb.set_value(i);
     ASSERT_OK(pb_writer->Append(pb));
@@ -508,14 +516,15 @@ TEST_F(TestPBUtil, TestPopulateDescriptorSet) {
   }
 }
 
-void TestPBUtil::DumpPBCToString(const string& path, bool oneline_output,
+void TestPBUtil::DumpPBCToString(const string& path,
+                                 ReadablePBContainerFile::Format format,
                                  string* ret) {
   unique_ptr<RandomAccessFile> reader;
   ASSERT_OK(env_->NewRandomAccessFile(path, &reader));
   ReadablePBContainerFile pb_reader(std::move(reader));
   ASSERT_OK(pb_reader.Open());
   ostringstream oss;
-  ASSERT_OK(pb_reader.Dump(&oss, oneline_output));
+  ASSERT_OK(pb_reader.Dump(&oss, format));
   ASSERT_OK(pb_reader.Close());
   *ret = oss.str();
 }
@@ -552,13 +561,17 @@ TEST_P(TestPBContainerVersions, TestDumpPBContainer) {
     "0\trecord_one { name: \"foo\" value: 0 } record_two { record { name: \"foo\" value: 0 } }\n"
     "1\trecord_one { name: \"foo\" value: 1 } record_two { record { name: \"foo\" value: 2 } }\n";
 
+  const char* kExpectedOutputJson =
+      "{\"recordOne\":{\"name\":\"foo\",\"value\":0},\"recordTwo\":{\"record\":{\"name\":\"foo\",\"value\":0}}}\n" // NOLINT
+      "{\"recordOne\":{\"name\":\"foo\",\"value\":1},\"recordTwo\":{\"record\":{\"name\":\"foo\",\"value\":2}}}\n"; // NOLINT
+
   ProtoContainerTest3PB pb;
   pb.mutable_record_one()->set_name("foo");
   pb.mutable_record_two()->mutable_record()->set_name("foo");
 
   unique_ptr<WritablePBContainerFile> pb_writer;
   ASSERT_OK(NewPBCWriter(version_, RWFileOptions(), &pb_writer));
-  ASSERT_OK(pb_writer->Init(pb));
+  ASSERT_OK(pb_writer->CreateNew(pb));
 
   for (int i = 0; i < 2; i++) {
     pb.mutable_record_one()->set_value(i);
@@ -568,11 +581,14 @@ TEST_P(TestPBContainerVersions, TestDumpPBContainer) {
   ASSERT_OK(pb_writer->Close());
 
   string output;
-  NO_FATALS(DumpPBCToString(path_, false, &output));
+  NO_FATALS(DumpPBCToString(path_, ReadablePBContainerFile::Format::DEFAULT, &output));
   ASSERT_STREQ(kExpectedOutput, output.c_str());
 
-  NO_FATALS(DumpPBCToString(path_, true, &output));
+  NO_FATALS(DumpPBCToString(path_, ReadablePBContainerFile::Format::ONELINE, &output));
   ASSERT_STREQ(kExpectedOutputShort, output.c_str());
+
+  NO_FATALS(DumpPBCToString(path_, ReadablePBContainerFile::Format::JSON, &output));
+  ASSERT_STREQ(kExpectedOutputJson, output.c_str());
 }
 
 TEST_F(TestPBUtil, TestOverwriteExistingPB) {

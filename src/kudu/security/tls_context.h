@@ -17,15 +17,16 @@
 
 #pragma once
 
-#include <functional>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
-#include "kudu/security/cert.h"
+#include "kudu/gutil/port.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_handshake.h"
-#include "kudu/util/atomic.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/rw_mutex.h"
 #include "kudu/util/status.h"
@@ -34,6 +35,7 @@ namespace kudu {
 namespace security {
 
 class Cert;
+class CertSignRequest;
 class PrivateKey;
 
 // TlsContext wraps data required by the OpenSSL library for creating and
@@ -68,6 +70,8 @@ class TlsContext {
  public:
 
   TlsContext();
+
+  TlsContext(std::string tls_ciphers, std::string tls_min_protocol);
 
   ~TlsContext() = default;
 
@@ -145,6 +149,13 @@ class TlsContext {
   Status LoadCertificateAndKey(const std::string& certificate_path,
                                const std::string& key_path) WARN_UNUSED_RESULT;
 
+  // Load the server certificate and key (PEM encoded), and use the callback
+  // 'password_cb' to obtain the password that can decrypt the key.
+  Status LoadCertificateAndPasswordProtectedKey(const std::string& certificate_path,
+                                                const std::string& key_path,
+                                                const PasswordCallback& password_cb)
+                                                WARN_UNUSED_RESULT;
+
   // Load the certificate authority (PEM encoded).
   Status LoadCertificateAuthority(const std::string& certificate_path) WARN_UNUSED_RESULT;
 
@@ -159,9 +170,19 @@ class TlsContext {
     return trusted_cert_count_;
   }
 
+  bool is_external_cert() const { return is_external_cert_; }
+
  private:
 
   Status VerifyCertChainUnlocked(const Cert& cert) WARN_UNUSED_RESULT;
+
+  // The cipher suite preferences to use for TLS-secured RPC connections. Uses the OpenSSL
+  // cipher preference list format. See man (1) ciphers for more information.
+  std::string tls_ciphers_;
+
+  // The minimum protocol version to allow when for securing RPC connections with TLS. May be
+  // one of 'TLSv1', 'TLSv1.1', or 'TLSv1.2'.
+  std::string tls_min_protocol_;
 
   // Protects all members.
   //
@@ -172,6 +193,7 @@ class TlsContext {
   c_unique_ptr<SSL_CTX> ctx_;
   int32_t trusted_cert_count_;
   bool has_cert_;
+  bool is_external_cert_;
   boost::optional<CertSignRequest> csr_;
 };
 

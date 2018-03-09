@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+syntax = "proto2";
 package kudu.server;
 
 option java_package = "org.apache.kudu.server";
@@ -106,11 +107,12 @@ message GetStatusRequestPB {
 }
 message GetStatusResponsePB {
   required ServerStatusPB status = 1;
+  optional AppStatusPB error = 2;
 }
 
 // Makes the HybridClock of the server use these values for wall clock time and error,
 // for testing purposes.
-// Requires that the server was started with '--use_mock_wall_clock=true'.
+// Requires that the server was started with '--time_source=mock'.
 message SetServerWallClockForTestsRequestPB {
   optional uint64 now_usec = 1;
   optional uint64 max_error_usec = 2;

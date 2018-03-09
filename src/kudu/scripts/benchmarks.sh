@@ -27,6 +27,9 @@
 # Jenkins job: http://sandbox.jenkins.cloudera.com/job/kudu-benchmarks
 ########################################################################
 
+# Fail the job if any part fails, even when piping through 'tee', etc.
+set -o pipefail
+
 ################################################################
 # Constants
 ################################################################
@@ -57,6 +60,8 @@ SCAN_ALL_COMMITTED=ScanAllCommitted
 FS_SCANINSERT_MRS=FullStackScanInsertMRSOnly
 FS_SCANINSERT_DISK=FullStackScanInsertWithDisk
 
+DENSE_NODE_ITEST=DenseNodeItest
+
 LOG_DIR_NAME=build/latest/bench-logs
 OUT_DIR_NAME=build/latest/bench-out
 HTML_FILE="benchmarks.html"
@@ -69,7 +74,7 @@ NUM_SAMPLES=${NUM_SAMPLES:-10}
 ################################################################
 
 BENCHMARK_MODE=$MODE_JENKINS # we default to "jenkins mode"
-BASE_DIR=""
+BASE_DIR=$(pwd)
 LOGDIR=""
 OUTDIR=""
 
@@ -88,7 +93,7 @@ usage_and_die() {
 }
 
 ensure_cpu_scaling() {
-  $(dirname $BASH_SOURCE)/ensure_cpu_scaling.sh "$@"
+  $BASE_DIR/src/kudu/scripts/ensure_cpu_scaling.sh "$@"
 }
 
 record_result() {
@@ -262,6 +267,19 @@ run_benchmarks() {
       --rows_per_batch=10000 \
       &> $LOGDIR/${FS_SCANINSERT_DISK}$i.log
   done
+
+  # Run dense storage node test, ~150s each.
+  #
+  # Needs to run as root for measure_startup_drop_caches.
+  for i in $(seq 1 $NUM_SAMPLES) ; do
+    sudo ./build/latest/bin/dense_node-itest \
+      --num_seconds=60 \
+      --num_tablets=1000 \
+      --measure_startup_sync \
+      --measure_startup_drop_caches \
+      --measure_startup_wait_for_bootstrap \
+      &> $LOGDIR/${DENSE_NODE_ITEST}$i.log
+  done
 }
 
 parse_and_record_all_results() {
@@ -403,6 +421,25 @@ parse_and_record_all_results() {
     record_result $BUILD_IDENTIFIER ${FS_SCANINSERT_DISK}_scan_int64 $i $scan_int64
   done
 
+  # Parse timings and thread count
+  for i in $(seq 1 $NUM_SAMPLES); do
+    local log=$LOGDIR/${DENSE_NODE_ITEST}$i.log
+    num_threads=`grep threads_running $log | cut -d ":" -f 5 | tr -d ' '`
+    num_blocks=`grep log_block_manager_blocks_under_management $log | cut -d ":" -f 5 | tr -d ' '`
+    num_bytes=`grep log_block_manager_bytes_under_management $log | cut -d ":" -f 5 | tr -d ' '`
+    num_containers=`grep log_block_manager_containers $log | cut -d ":" -f 5 | tr -d ' '`
+    num_full_containers=`grep log_block_manager_full_containers $log | cut -d ":" -f 5 | tr -d ' '`
+    time_restarting_tserver=`grep "Time spent restarting tserver" $log | ./parse_real_out.sh`
+    time_bootstrapping_tablets=`grep "Time spent bootstrapping tablets" $log | ./parse_real_out.sh`
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_num_threads $i $num_threads
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_num_blocks $i $num_blocks
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_num_bytes $i $num_bytes
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_num_containers $i $num_containers
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_num_full_containers $i $num_full_containers
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_time_restarting_tserver $i $time_restarting_tserver
+    record_result $BUILD_IDENTIFIER ${DENSE_NODE_ITEST}_time_bootstrapping_tablets $i $time_bootstrapping_tablets
+  done
+
   popd
   popd
   popd
@@ -475,6 +512,12 @@ load_stats_and_generate_plots() {
   load_and_generate_plot "${FS_SCANINSERT_MRS}%_scan%" fs-mrsonly-scan
   load_and_generate_plot "${FS_SCANINSERT_DISK}%_insert" fs-withdisk-insert
   load_and_generate_plot "${FS_SCANINSERT_DISK}%_scan%" fs-withdisk-scan
+
+  load_and_generate_plot "${DENSE_NODE_ITEST}_time%" dense-node-bench-times
+  load_and_generate_plot "${DENSE_NODE_ITEST}_num%containers%" dense-node-bench-containers
+  load_and_generate_plot "${DENSE_NODE_ITEST}_num_blocks%" dense-node-bench-blocks
+  load_and_generate_plot "${DENSE_NODE_ITEST}_num_threads%" dense-node-bench-threads
+  load_and_generate_plot "${DENSE_NODE_ITEST}_num_bytes%" dense-node-bench-bytes
 
   # Generate all the pngs for all the mt-tablet tests
   for i in $(seq 0 $NUM_MT_TABLET_TESTS); do
@@ -579,7 +622,6 @@ run() {
 ################################################################
 
 # Figure out where we are, store in global variables.
-BASE_DIR=$(pwd)
 LOGDIR="$BASE_DIR/$LOG_DIR_NAME"
 OUTDIR="$BASE_DIR/$OUT_DIR_NAME"
 

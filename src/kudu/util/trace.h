@@ -32,6 +32,10 @@
 #include "kudu/util/locks.h"
 #include "kudu/util/trace_metrics.h"
 
+namespace kudu {
+class Trace;
+}
+
 // Adopt a Trace on the current thread for the duration of the current
 // scope. The old current Trace is restored when the scope is exited.
 //
@@ -135,25 +139,25 @@ class Trace : public RefCountedThreadSafe<Trace> {
   void SubstituteAndTrace(const char* filepath, int line_number,
                           StringPiece format,
                           const strings::internal::SubstituteArg& arg0 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg1 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg2 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg3 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg4 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg5 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg6 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg7 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg8 =
-                            strings::internal::SubstituteArg::NoArg,
+                            strings::internal::SubstituteArg::kNoArg,
                           const strings::internal::SubstituteArg& arg9 =
-                            strings::internal::SubstituteArg::NoArg);
+                            strings::internal::SubstituteArg::kNoArg);
 
   // Dump the trace buffer to the given output stream.
   //

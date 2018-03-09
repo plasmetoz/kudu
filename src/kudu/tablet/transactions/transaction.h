@@ -18,26 +18,40 @@
 #ifndef KUDU_TABLET_TRANSACTION_H_
 #define KUDU_TABLET_TRANSACTION_H_
 
-#include <string>
+#include <cstddef>
+#include <cstdint>
 #include <mutex>
-#include <kudu/rpc/result_tracker.h>
+#include <string>
 
+#include <glog/logging.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/consensus/consensus.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/result_tracker.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/auto_release_pool.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/status.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/status.h"
+
+namespace google {
+namespace protobuf {
+class Message;
+}
+}
 
 namespace kudu {
-
-namespace rpc {
-class ResultTracker;
-} // namespace rpc
-
 namespace tablet {
-class TabletPeer;
+class TabletReplica;
 class TransactionCompletionCallback;
 class TransactionState;
 
@@ -169,8 +183,8 @@ class TransactionState {
     return consensus_round_.get();
   }
 
-  TabletPeer* tablet_peer() const {
-    return tablet_peer_;
+  TabletReplica* tablet_replica() const {
+    return tablet_replica_;
   }
 
   // Return metrics related to this transaction.
@@ -257,13 +271,13 @@ class TransactionState {
   }
 
  protected:
-  explicit TransactionState(TabletPeer* tablet_peer);
+  explicit TransactionState(TabletReplica* tablet_replica);
   virtual ~TransactionState();
 
   TransactionMetrics tx_metrics_;
 
-  // The tablet peer that is coordinating this transaction.
-  TabletPeer* const tablet_peer_;
+  // The TabletReplica that is coordinating this transaction.
+  TabletReplica* const tablet_replica_;
 
   // The result tracker that will cache the result of this transaction.
   scoped_refptr<rpc::ResultTracker> result_tracker_;
@@ -356,20 +370,6 @@ class LatchTransactionCompletionCallback : public TransactionCompletionCallback 
  private:
   CountDownLatch* latch_;
   ResponsePB* response_;
-};
-
-// A transaction completion callback that takes a StatusCallback and simply
-// calls it with the transaction status when it completes.
-class StatusTransactionCompletionCallback : public TransactionCompletionCallback {
- public:
-  explicit StatusTransactionCompletionCallback(StatusCallback callback)
-      : callback_(std::move(callback)) {}
-
-  virtual void TransactionCompleted() OVERRIDE {
-    callback_.Run(status());
-  }
- private:
-  StatusCallback callback_;
 };
 
 }  // namespace tablet

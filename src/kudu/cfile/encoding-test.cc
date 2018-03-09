@@ -15,43 +15,63 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
-#include <memory>
+#include <sys/types.h>
+
+#include <algorithm>
+#include <climits>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <functional>
 #include <limits>
-#include <stdlib.h>
+#include <memory>
+#include <ostream>
+#include <string>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/cfile/binary_plain_block.h"
+#include "kudu/cfile/binary_prefix_block.h"
 #include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/bshuf_block.h"
-#include "kudu/cfile/cfile_writer.h"
+#include "kudu/cfile/cfile_util.h"
 #include "kudu/cfile/plain_bitmap_block.h"
 #include "kudu/cfile/plain_block.h"
 #include "kudu/cfile/rle_block.h"
-#include "kudu/cfile/binary_plain_block.h"
-#include "kudu/cfile/binary_prefix_block.h"
 #include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/group_varint-inl.h"
 #include "kudu/util/hexdump.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/int128_util.h" // IWYU pragma: keep
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/random.h"
+#include "kudu/util/random_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using std::string;
 using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
-
 namespace cfile {
 
 class TestEncoding : public KuduTest {
  public:
   TestEncoding()
-    : arena_(1024, 1024*1024) {
+    : arena_(1024) {
   }
 
  protected:
@@ -70,17 +90,18 @@ class TestEncoding : public KuduTest {
     ASSERT_EQ(1, n);
   }
 
-  // Insert a given number of strings into the provided
-  // BinaryPrefixBlockBuilder.
+  // Insert a given number of strings into the provided BlockBuilder.
+  //
+  // The strings are generated using the provided 'formatter' function.
   template<class BuilderType>
   static Slice CreateBinaryBlock(BuilderType *sbb,
                                  int num_items,
-                                 const char *fmt_str) {
-    vector<unique_ptr<string>> to_insert;
-    std::vector<Slice> slices;
-    for (uint i = 0; i < num_items; i++) {
-      to_insert.emplace_back(new string(StringPrintf(fmt_str, i)));
-      slices.push_back(Slice(to_insert.back()->data()));
+                                 const std::function<string(int)>& formatter) {
+    vector<string> to_insert(num_items);
+    vector<Slice> slices;
+    for (int i = 0; i < num_items; i++) {
+      to_insert[i] = formatter(i);
+      slices.emplace_back(to_insert[i]);
     }
 
     int rem = slices.size();
@@ -109,7 +130,8 @@ class TestEncoding : public KuduTest {
     BuilderType sbb(opts.get());
     // Insert "hello 0" through "hello 9"
     const uint kCount = 10;
-    Slice s = CreateBinaryBlock(&sbb, kCount, "hello %d");
+    Slice s = CreateBinaryBlock(
+        &sbb, kCount, std::bind(StringPrintf, "hello %d", std::placeholders::_1));
     DecoderType sbd(s);
     ASSERT_OK(sbd.ParseHeader());
 
@@ -158,12 +180,13 @@ class TestEncoding : public KuduTest {
 
   template<class BuilderType, class DecoderType>
   void TestStringSeekByValueLargeBlock() {
-    Arena arena(1024, 1024*1024); // TODO: move to fixture?
+    Arena arena(1024); // TODO(todd): move to fixture?
     gscoped_ptr<WriterOptions> opts(NewWriterOptions());
     BinaryPrefixBlockBuilder sbb(opts.get());
     const uint kCount = 1000;
     // Insert 'hello 000' through 'hello 999'
-    Slice s = CreateBinaryBlock(&sbb, kCount, "hello %03d");
+    Slice s = CreateBinaryBlock(
+        &sbb, kCount, std::bind(StringPrintf, "hello %03d", std::placeholders::_1));
     BinaryPrefixBlockDecoder sbd(s);
     ASSERT_OK(sbd.ParseHeader());
 
@@ -238,20 +261,37 @@ class TestEncoding : public KuduTest {
   void TestBinaryBlockRoundTrip() {
     gscoped_ptr<WriterOptions> opts(NewWriterOptions());
     BuilderType sbb(opts.get());
-    const uint kCount = 10;
-    Slice s = CreateBinaryBlock(&sbb, kCount, "hello %d");
+
+    auto seed = SeedRandom();
+    Random r(seed);
+
+    // For each row, generate random data based on this run's seed.
+    // Using random data helps the ability to trigger bugs like KUDU-2085.
+    const auto& GenTestString = [seed](int i) {
+      Random local_rng(seed + i);
+      int len = local_rng.Uniform(8);
+      return RandomString(len, &local_rng);
+    };
+
+    // Use a random number of elements (but at least 1).
+    //
+    // This is necessary to trigger bugs like KUDU-2085 that only occur in specific cases
+    // such as when the number of elements is a multiple of the 'restart interval' in
+    // prefix-encoded blocks.
+    const uint kCount = r.Uniform(1000) + 1;
+    Slice s = CreateBinaryBlock(&sbb, kCount, GenTestString);
 
     LOG(INFO) << "Block: " << HexDump(s);
 
-    // the slice should take at least a few bytes per entry
-    ASSERT_GT(s.size(), kCount * 2u);
+    // The encoded data should take at least 1 byte per entry.
+    ASSERT_GT(s.size(), kCount);
 
     // Check first/last keys
     Slice key;
     ASSERT_OK(sbb.GetFirstKey(&key));
-    ASSERT_EQ("hello 0", key);
+    ASSERT_EQ(GenTestString(0), key);
     ASSERT_OK(sbb.GetLastKey(&key));
-    ASSERT_EQ(StringPrintf("hello %d", kCount - 1), key);
+    ASSERT_EQ(GenTestString(kCount - 1), key);
 
     DecoderType sbd(s);
     ASSERT_OK(sbd.ParseHeader());
@@ -266,7 +306,7 @@ class TestEncoding : public KuduTest {
       ASSERT_TRUE(sbd.HasNext()) << "Failed on iter " << i;
       Slice s;
       CopyOne<STRING>(&sbd, &s);
-      string expected = StringPrintf("hello %d", i);
+      string expected = GenTestString(i);
       ASSERT_EQ(expected, s.ToString()) << "failed at iter " << i;
     }
     ASSERT_FALSE(sbd.HasNext());
@@ -276,6 +316,11 @@ class TestEncoding : public KuduTest {
       sbd.SeekToPositionInBlock(i);
       ASSERT_EQ(i, sbd.GetCurrentIndex());
     }
+
+    // Test the special case of seeking to the end of the block.
+    sbd.SeekToPositionInBlock(kCount);
+    ASSERT_EQ(kCount, sbd.GetCurrentIndex());
+    ASSERT_FALSE(sbd.HasNext());
 
     // Try to request a bunch of data in one go
     ScopedColumnBlock<STRING> cb(kCount + 10);
@@ -287,7 +332,7 @@ class TestEncoding : public KuduTest {
     ASSERT_FALSE(sbd.HasNext());
 
     for (uint i = 0; i < kCount; i++) {
-      string expected = StringPrintf("hello %d", i);
+      string expected = GenTestString(i);
       ASSERT_EQ(expected, cb[i].ToString());
     }
   }
@@ -384,7 +429,7 @@ class TestEncoding : public KuduTest {
     ASSERT_EQ(kOrdinalPosBase, pbd.GetFirstRowId());
     ASSERT_EQ(0, pbd.GetCurrentIndex());
 
-    std::vector<CppType> decoded;
+    vector<CppType> decoded;
     decoded.resize(size);
 
     ColumnBlock dst_block(GetTypeInfo(Type), nullptr, &decoded[0], size, &arena_);
@@ -431,7 +476,8 @@ class TestEncoding : public KuduTest {
     const uint kCount = 10;
     size_t sbsize;
 
-    Slice s = CreateBinaryBlock(&sbb, kCount, "hello %d");
+    Slice s = CreateBinaryBlock(
+        &sbb, kCount, std::bind(StringPrintf, "hello %d", std::placeholders::_1));
     do {
       sbsize = s.size();
 
@@ -464,7 +510,7 @@ class TestEncoding : public KuduTest {
 
     srand(123);
 
-    std::vector<CppType> to_insert;
+    vector<CppType> to_insert;
     Random rd(SeedRandom());
     for (int i = 0; i < 10003; i++) {
       int64_t val = rd.Next64() % std::numeric_limits<CppType>::max();
@@ -500,7 +546,7 @@ class TestEncoding : public KuduTest {
 
     ASSERT_EQ(kOrdinalPosBase, ibd.GetFirstRowId());
 
-    std::vector<CppType> decoded;
+    vector<CppType> decoded;
     decoded.resize(to_insert.size());
 
     ColumnBlock dst_block(GetTypeInfo(IntType), nullptr,
@@ -566,7 +612,7 @@ class TestEncoding : public KuduTest {
 
     srand(123);
 
-    std::vector<uint8_t> to_insert;
+    vector<uint8_t> to_insert;
     for (int i = 0; i < 10003; ) {
       int run_size = random() % 100;
       bool val = random() % 2;
@@ -587,7 +633,7 @@ class TestEncoding : public KuduTest {
 
     ASSERT_EQ(kOrdinalPosBase, bd.GetFirstRowId());
 
-    std::vector<uint8_t> decoded;
+    vector<uint8_t> decoded;
     decoded.resize(to_insert.size());
 
     ColumnBlock dst_block(GetTypeInfo(BOOL), nullptr,
@@ -646,8 +692,8 @@ TEST_F(TestEncoding, TestPlainBlockEncoder) {
                                     PlainBlockDecoder<INT32> >(ints.get(), kSize);
 }
 
-// Test for bitshuffle block, for INT32, FLOAT, DOUBLE
-TEST_F(TestEncoding, TestBShufIntBlockEncoder) {
+// Test for bitshuffle block, for INT32, INT64, INT128, FLOAT, DOUBLE
+TEST_F(TestEncoding, TestBShufInt32BlockEncoder) {
   const uint32_t kSize = 10000;
 
   gscoped_ptr<int32_t[]> ints(new int32_t[kSize]);
@@ -657,6 +703,30 @@ TEST_F(TestEncoding, TestBShufIntBlockEncoder) {
 
   TestEncodeDecodeTemplateBlockEncoder<INT32, BShufBlockBuilder<INT32>,
                                     BShufBlockDecoder<INT32> >(ints.get(), kSize);
+}
+
+TEST_F(TestEncoding, TestBShufInt64BlockEncoder) {
+  const uint32_t kSize = 10000;
+
+  gscoped_ptr<int64_t[]> ints(new int64_t[kSize]);
+  for (int i = 0; i < kSize; i++) {
+    ints.get()[i] = random();
+  }
+
+  TestEncodeDecodeTemplateBlockEncoder<INT64, BShufBlockBuilder<INT64>,
+      BShufBlockDecoder<INT64> >(ints.get(), kSize);
+}
+
+TEST_F(TestEncoding, TestBShufInt128BlockEncoder) {
+  const uint32_t kSize = 10000;
+
+  gscoped_ptr<int128_t[]> ints(new int128_t[kSize]);
+  for (int i = 0; i < kSize; i++) {
+    ints.get()[i] = random();
+  }
+
+  TestEncodeDecodeTemplateBlockEncoder<INT128, BShufBlockBuilder<INT128>,
+      BShufBlockDecoder<INT128> >(ints.get(), kSize);
 }
 
 TEST_F(TestEncoding, TestBShufFloatBlockEncoder) {
@@ -833,6 +903,8 @@ TYPED_TEST(IntEncodingTest, TestSeekAllTypes) {
   this->template DoIntSeekTest<INT32>(10000, 1000, true);
   this->template DoIntSeekTest<UINT64>(10000, 1000, true);
   this->template DoIntSeekTest<INT64>(10000, 1000, true);
+  // TODO: Uncomment when adding 128 bit support to RLE (KUDU-2284)
+  // this->template DoIntSeekTest<INT128>();
 }
 
 TYPED_TEST(IntEncodingTest, IntSeekTestTinyBlockAllTypes) {
@@ -844,6 +916,8 @@ TYPED_TEST(IntEncodingTest, IntSeekTestTinyBlockAllTypes) {
   this->template DoIntSeekTestTinyBlock<INT32>();
   this->template DoIntSeekTestTinyBlock<UINT64>();
   this->template DoIntSeekTestTinyBlock<INT64>();
+  // TODO: Uncomment when adding 128 bit support to RLE (KUDU-2284)
+  // this->template DoIntSeekTestTinyBlock<INT128>();
 }
 
 TYPED_TEST(IntEncodingTest, TestRoundTrip) {
@@ -855,6 +929,8 @@ TYPED_TEST(IntEncodingTest, TestRoundTrip) {
   this->template DoIntRoundTripTest<INT32>();
   this->template DoIntRoundTripTest<UINT64>();
   this->template DoIntRoundTripTest<INT64>();
+  // TODO: Uncomment when adding 128 bit support to RLE (KUDU-2284)
+  // this->template DoIntRoundTripTest<INT128>();
 }
 
 #ifdef NDEBUG

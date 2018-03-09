@@ -15,25 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <gtest/gtest.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/common/wire_protocol.pb.h"
-#include "kudu/integration-tests/mini_cluster.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/mini_master.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+using kudu::cluster::InternalMiniCluster;
+using kudu::cluster::InternalMiniClusterOptions;
+using kudu::pb_util::SecureDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
@@ -57,17 +67,17 @@ class TableLocationsTest : public KuduTest {
   void SetUp() override {
     KuduTest::SetUp();
 
-    MiniClusterOptions opts;
+    InternalMiniClusterOptions opts;
     opts.num_tablet_servers = kNumTabletServers;
 
-    cluster_.reset(new MiniCluster(env_, opts));
+    cluster_.reset(new InternalMiniCluster(env_, opts));
     ASSERT_OK(cluster_->Start());
 
     // Create a client proxy to the master.
     MessengerBuilder bld("Client");
     ASSERT_OK(bld.Build(&client_messenger_));
-    proxy_.reset(new MasterServiceProxy(client_messenger_,
-                                        cluster_->mini_master()->bound_rpc_addr()));
+    const auto& addr = cluster_->mini_master()->bound_rpc_addr();
+    proxy_.reset(new MasterServiceProxy(client_messenger_, addr, addr.host()));
   }
 
   void TearDown() override {
@@ -84,7 +94,7 @@ class TableLocationsTest : public KuduTest {
                      const vector<pair<KuduPartialRow, KuduPartialRow>>& bounds);
 
   shared_ptr<Messenger> client_messenger_;
-  unique_ptr<MiniCluster> cluster_;
+  unique_ptr<InternalMiniCluster> cluster_;
   unique_ptr<MasterServiceProxy> proxy_;
 };
 
@@ -228,7 +238,6 @@ TEST_F(TableLocationsTest, TestGetTableLocations) {
     EXPECT_EQ("cc", resp.tablet_locations(0).partition().partition_key_start());
   }
 }
-
 
 } // namespace master
 } // namespace kudu

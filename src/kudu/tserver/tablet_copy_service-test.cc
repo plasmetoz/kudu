@@ -16,46 +16,65 @@
 // under the License.
 #include "kudu/tserver/tablet_copy-test-base.h"
 
-#include <gflags/gflags.h>
+#include <atomic>
+#include <cstdint>
 #include <limits>
+#include <memory>
+#include <ostream>
+#include <string>
 #include <thread>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/log.h"
-#include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/log.pb.h"
+#include "kudu/consensus/log_reader.h"
 #include "kudu/consensus/log_util.h"
-#include "kudu/consensus/metadata.pb.h"
-#include "kudu/consensus/opid_util.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/fs.pb.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/transfer.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet_replica.h"
+#include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_copy.pb.h"
-#include "kudu/tserver/tserver_service.pb.h"
-#include "kudu/tserver/tserver_service.proxy.h"
-#include "kudu/util/crc.h"
-#include "kudu/util/env_util.h"
+#include "kudu/tserver/tablet_copy.proxy.h"
+#include "kudu/tserver/tablet_server.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/stopwatch.h"
-#include "kudu/util/test_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 
-#define ASSERT_REMOTE_ERROR(status, err, code, str) \
-    ASSERT_NO_FATAL_FAILURE(AssertRemoteError(status, err, code, str))
-
-DECLARE_uint64(tablet_copy_idle_timeout_ms);
+DECLARE_bool(crash_on_eio);
+DECLARE_double(env_inject_eio);
+DECLARE_uint64(tablet_copy_idle_timeout_sec);
 DECLARE_uint64(tablet_copy_timeout_poll_period_ms);
+
+using kudu::log::ReadableLogSegment;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::ErrorStatusPB;
+using kudu::rpc::RpcController;
+using std::atomic;
+using std::string;
+using std::thread;
+using std::vector;
 
 namespace kudu {
 namespace tserver {
-
-using consensus::MaximumOpId;
-using consensus::MinimumOpId;
-using consensus::OpIdEquals;
-using env_util::ReadFully;
-using log::ReadableLogSegment;
-using rpc::ErrorStatusPB;
-using rpc::RpcController;
-using std::thread;
-using std::vector;
 
 class TabletCopyServiceTest : public TabletCopyTest {
  public:
@@ -68,7 +87,9 @@ class TabletCopyServiceTest : public TabletCopyTest {
   void SetUp() OVERRIDE {
     TabletCopyTest::SetUp();
     tablet_copy_proxy_.reset(
-        new TabletCopyServiceProxy(client_messenger_, mini_server_->bound_rpc_addr()));
+        new TabletCopyServiceProxy(
+            client_messenger_, mini_server_->bound_rpc_addr(),
+            mini_server_->bound_rpc_addr().host()));
   }
 
   Status DoBeginTabletCopySession(const string& tablet_id,
@@ -201,7 +222,7 @@ TEST_F(TabletCopyServiceTest, TestSimpleBeginEndSession) {
                                                &segment_seqnos));
   // Basic validation of returned params.
   ASSERT_FALSE(session_id.empty());
-  ASSERT_EQ(FLAGS_tablet_copy_idle_timeout_ms, idle_timeout_millis);
+  ASSERT_EQ(FLAGS_tablet_copy_idle_timeout_sec * 1000, idle_timeout_millis);
   ASSERT_TRUE(superblock.IsInitialized());
   // We should have number of segments = number of rolls + 1 (due to the active segment).
   ASSERT_EQ(kNumLogRolls + 1, segment_seqnos.size());
@@ -228,17 +249,25 @@ TEST_F(TabletCopyServiceTest, TestBeginConcurrently) {
   const int kNumThreads = 5;
   vector<thread> threads;
   vector<tablet::TabletSuperBlockPB> sblocks(kNumThreads);
+  atomic<int> num_successful(0);
   for (int i = 0 ; i < kNumThreads; i++) {
-    threads.emplace_back([this, &sblocks, i]{
+    threads.emplace_back([this, &num_successful, &sblocks, i] {
+      while (true) {
         string session_id;
-        CHECK_OK(DoBeginValidTabletCopySession(&session_id, &sblocks[i]));
-        CHECK(!session_id.empty());
-      });
+        Status s = DoBeginValidTabletCopySession(&session_id, &sblocks[i]);
+        if (s.ok()) {
+          ++num_successful;
+          CHECK(!session_id.empty());
+          return;
+        }
+      }
+    });
   }
   for (auto& t : threads) {
     t.join();
   }
-  // Verify that all threads got the same result.
+  // Verify that all threads eventually got the same result.
+  ASSERT_EQ(kNumThreads, num_successful);
   for (int i = 1; i < threads.size(); i++) {
     ASSERT_EQ(SecureDebugString(sblocks[i]), SecureDebugString(sblocks[0]));
   }
@@ -246,9 +275,7 @@ TEST_F(TabletCopyServiceTest, TestBeginConcurrently) {
 
 // Test bad session id error condition.
 TEST_F(TabletCopyServiceTest, TestInvalidSessionId) {
-  vector<string> bad_session_ids;
-  bad_session_ids.push_back("hodor");
-  bad_session_ids.push_back(GetLocalUUID());
+  const vector<string> bad_session_ids = { "hodor", GetLocalUUID() };
 
   // Fetch a block for a non-existent session.
   for (const string& session_id : bad_session_ids) {
@@ -258,8 +285,9 @@ TEST_F(TabletCopyServiceTest, TestInvalidSessionId) {
     data_id.set_type(DataIdPB::BLOCK);
     data_id.mutable_block_id()->set_id(1);
     Status status = DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller);
-    ASSERT_REMOTE_ERROR(status, controller.error_response(), TabletCopyErrorPB::NO_SESSION,
-                        Status::NotFound("").CodeAsString());
+    NO_FATALS(AssertRemoteError(
+        status, controller.error_response(), TabletCopyErrorPB::NO_SESSION,
+        Status::NotFound("").CodeAsString()));
   }
 
   // End a non-existent session.
@@ -267,8 +295,8 @@ TEST_F(TabletCopyServiceTest, TestInvalidSessionId) {
     EndTabletCopySessionResponsePB resp;
     RpcController controller;
     Status status = DoEndTabletCopySession(session_id, true, nullptr, &resp, &controller);
-    ASSERT_REMOTE_ERROR(status, controller.error_response(), TabletCopyErrorPB::NO_SESSION,
-                        Status::NotFound("").CodeAsString());
+    NO_FATALS(AssertRemoteError(status, controller.error_response(),
+        TabletCopyErrorPB::NO_SESSION, Status::NotFound("").CodeAsString()));
   }
 }
 
@@ -276,10 +304,10 @@ TEST_F(TabletCopyServiceTest, TestInvalidSessionId) {
 TEST_F(TabletCopyServiceTest, TestInvalidTabletId) {
   BeginTabletCopySessionResponsePB resp;
   RpcController controller;
-  Status status =
-      DoBeginTabletCopySession("some-unknown-tablet", GetLocalUUID(), &resp, &controller);
-  ASSERT_REMOTE_ERROR(status, controller.error_response(), TabletCopyErrorPB::TABLET_NOT_FOUND,
-                      Status::NotFound("").CodeAsString());
+  Status status = DoBeginTabletCopySession(
+      "some-unknown-tablet", GetLocalUUID(), &resp, &controller);
+  NO_FATALS(AssertRemoteError(status, controller.error_response(),
+      TabletCopyErrorPB::TABLET_NOT_FOUND, Status::NotFound("").CodeAsString()));
 }
 
 // Test DataIdPB validation.
@@ -295,9 +323,8 @@ TEST_F(TabletCopyServiceTest, TestInvalidBlockOrOpId) {
     data_id.set_type(DataIdPB::BLOCK);
     data_id.mutable_block_id()->set_id(1);
     Status status = DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller);
-    ASSERT_REMOTE_ERROR(status, controller.error_response(),
-                        TabletCopyErrorPB::BLOCK_NOT_FOUND,
-                        Status::NotFound("").CodeAsString());
+    NO_FATALS(AssertRemoteError(status, controller.error_response(),
+        TabletCopyErrorPB::BLOCK_NOT_FOUND, Status::NotFound("").CodeAsString()));
   }
 
   // Invalid Segment Sequence Number for log fetch.
@@ -308,9 +335,8 @@ TEST_F(TabletCopyServiceTest, TestInvalidBlockOrOpId) {
     data_id.set_type(DataIdPB::LOG_SEGMENT);
     data_id.set_wal_segment_seqno(31337);
     Status status = DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller);
-    ASSERT_REMOTE_ERROR(status, controller.error_response(),
-                        TabletCopyErrorPB::WAL_SEGMENT_NOT_FOUND,
-                        Status::NotFound("").CodeAsString());
+    NO_FATALS(AssertRemoteError(status, controller.error_response(),
+        TabletCopyErrorPB::WAL_SEGMENT_NOT_FOUND, Status::NotFound("").CodeAsString()));
   }
 
   // Empty data type with BlockId.
@@ -335,9 +361,9 @@ TEST_F(TabletCopyServiceTest, TestInvalidBlockOrOpId) {
     DataIdPB data_id;
     data_id.set_type(DataIdPB::LOG_SEGMENT);
     Status status = DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller);
-    ASSERT_REMOTE_ERROR(status, controller.error_response(),
-                        TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST,
-                        Status::InvalidArgument("").CodeAsString());
+    NO_FATALS(AssertRemoteError(status, controller.error_response(),
+        TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST,
+        Status::InvalidArgument("").CodeAsString()));
   }
 
   // Both BlockId and Segment Sequence Number in the same "union" PB (illegal).
@@ -349,9 +375,9 @@ TEST_F(TabletCopyServiceTest, TestInvalidBlockOrOpId) {
     data_id.mutable_block_id()->set_id(1);
     data_id.set_wal_segment_seqno(0);
     Status status = DoFetchData(session_id, data_id, nullptr, nullptr, &resp, &controller);
-    ASSERT_REMOTE_ERROR(status, controller.error_response(),
-                        TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST,
-                        Status::InvalidArgument("").CodeAsString());
+    NO_FATALS(AssertRemoteError(status, controller.error_response(),
+        TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST,
+        Status::InvalidArgument("").CodeAsString()));
   }
 }
 
@@ -365,11 +391,11 @@ TEST_F(TabletCopyServiceTest, TestFetchInvalidBlockOffset) {
   RpcController controller;
   // Impossible offset.
   uint64_t offset = std::numeric_limits<uint64_t>::max();
-  Status status = DoFetchData(session_id, AsDataTypeId(FirstColumnBlockId(&superblock)),
+  Status status = DoFetchData(session_id, AsDataTypeId(FirstColumnBlockId(superblock)),
                               &offset, nullptr, &resp, &controller);
-  ASSERT_REMOTE_ERROR(status, controller.error_response(),
-                      TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST,
-                      Status::InvalidArgument("").CodeAsString());
+  NO_FATALS(AssertRemoteError(status, controller.error_response(),
+      TabletCopyErrorPB::INVALID_TABLET_COPY_REQUEST,
+      Status::InvalidArgument("").CodeAsString()));
 }
 
 // Test that we are able to fetch an entire block.
@@ -379,7 +405,7 @@ TEST_F(TabletCopyServiceTest, TestFetchBlockAtOnce) {
   ASSERT_OK(DoBeginValidTabletCopySession(&session_id, &superblock));
 
   // Local.
-  BlockId block_id = FirstColumnBlockId(&superblock);
+  BlockId block_id = FirstColumnBlockId(superblock);
   Slice local_data;
   faststring scratch;
   ASSERT_OK(ReadLocalBlockFile(mini_server_->server()->fs_manager(), block_id,
@@ -399,7 +425,7 @@ TEST_F(TabletCopyServiceTest, TestFetchBlockIncrementally) {
   tablet::TabletSuperBlockPB superblock;
   ASSERT_OK(DoBeginValidTabletCopySession(&session_id, &superblock));
 
-  BlockId block_id = FirstColumnBlockId(&superblock);
+  BlockId block_id = FirstColumnBlockId(superblock);
   Slice local_data;
   faststring scratch;
   ASSERT_OK(ReadLocalBlockFile(mini_server_->server()->fs_manager(), block_id,
@@ -445,7 +471,7 @@ TEST_F(TabletCopyServiceTest, TestFetchLog) {
 
   // Fetch the local data.
   log::SegmentSequence local_segments;
-  ASSERT_OK(tablet_peer_->log()->reader()->GetSegmentsSnapshot(&local_segments));
+  ASSERT_OK(tablet_replica_->log()->reader()->GetSegmentsSnapshot(&local_segments));
 
   uint64_t first_seg_seqno = (*local_segments.begin())->header().sequence_number();
 
@@ -457,8 +483,8 @@ TEST_F(TabletCopyServiceTest, TestFetchLog) {
   faststring scratch;
   int64_t size = segment->file_size();
   scratch.resize(size);
-  Slice slice;
-  ASSERT_OK(ReadFully(segment->readable_file().get(), 0, size, &slice, scratch.data()));
+  Slice slice(scratch.data(), size);
+  ASSERT_OK(segment->readable_file()->Read(0, slice));
 
   AssertDataEqual(slice.data(), slice.size(), resp.chunk());
 }
@@ -467,7 +493,7 @@ TEST_F(TabletCopyServiceTest, TestFetchLog) {
 TEST_F(TabletCopyServiceTest, TestSessionTimeout) {
   // This flag should be seen by the service due to TSO.
   // We have also reduced the timeout polling frequency in SetUp().
-  FLAGS_tablet_copy_idle_timeout_ms = 1; // Expire the session almost immediately.
+  FLAGS_tablet_copy_idle_timeout_sec = 0; // Expire the session immediately.
 
   // Start session.
   string session_id;
@@ -486,6 +512,41 @@ TEST_F(TabletCopyServiceTest, TestSessionTimeout) {
   } while (MonoTime::Now().GetDeltaSince(start_time).ToSeconds() < 10);
 
   ASSERT_FALSE(resp.session_is_active()) << "Tablet Copy session did not time out!";
+}
+
+// Test that the tablet copy session will terminate on disk failures.
+TEST_F(TabletCopyServiceTest, TestDiskFailureDuringSession) {
+  string session_id;
+  tablet::TabletSuperBlockPB superblock;
+  ASSERT_OK(DoBeginValidTabletCopySession(&session_id, &superblock));
+
+  // Get a block id locally that we'll copy.
+  BlockId block_id = FirstColumnBlockId(superblock);
+  Slice local_data;
+  faststring scratch;
+  ASSERT_OK(ReadLocalBlockFile(mini_server_->server()->fs_manager(), block_id,
+                               &scratch, &local_data));
+
+  // Copy over the block while one of the directories is failed.
+  FetchDataResponsePB resp;
+  RpcController controller;
+  ASSERT_OK(mini_server_->server()->fs_manager()->dd_manager()->MarkDataDirFailed(1));
+  Status s = DoFetchData(session_id, AsDataTypeId(block_id), nullptr, nullptr, &resp, &controller);
+  LOG(INFO) << "Fetch data request responded with: " << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "Unable to get piece of data block");
+  ASSERT_TRUE(s.IsRemoteError());
+
+  // Now close the copy session.
+  RpcController end_copy_controller;
+  EndTabletCopySessionResponsePB end_session_resp;
+  ASSERT_OK(DoEndTabletCopySession(
+      session_id, true, nullptr, &end_session_resp, &end_copy_controller));
+
+  // Starting a new session should fail.
+  s = DoBeginValidTabletCopySession(&session_id, &superblock);
+  LOG(INFO) << "Begin copy session request responded with: " << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "Error beginning tablet copy session");
+  ASSERT_TRUE(s.IsRemoteError());
 }
 
 } // namespace tserver

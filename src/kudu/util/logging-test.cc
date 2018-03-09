@@ -15,20 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gmock/gmock.h>
+#include <atomic>
+#include <cstdint>
+#include <ctime>
+#include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
+#include <gmock/gmock-matchers.h>
+#include <gtest/gtest.h>
 
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/async_logger.h"
 #include "kudu/util/barrier.h"
-#include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/logging_test_util.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"  // IWYU pragma: keep
+#include "kudu/util/test_util.h"
 
 using std::string;
 using std::vector;
@@ -111,12 +119,12 @@ class CountingLogger : public google::base::Logger {
     flush_count_++;
   }
 
-  uint32 LogSize() override {
+  uint32_t LogSize() override {
     return 0;
   }
 
-  int flush_count_ = 0;
-  int message_count_ = 0;
+  std::atomic<int> flush_count_ = {0};
+  std::atomic<int> message_count_ = {0};
 };
 
 TEST(LoggingTest, TestAsyncLogger) {
@@ -160,6 +168,28 @@ TEST(LoggingTest, TestAsyncLogger) {
   ASSERT_GT(async.app_threads_blocked_count_for_tests(), 0);
 }
 
+TEST(LoggingTest, TestAsyncLoggerAutoFlush) {
+  const int kBuffer = 10000;
+  CountingLogger base;
+  AsyncLogger async(&base, kBuffer);
+
+  FLAGS_logbufsecs = 1;
+  async.Start();
+
+  // Write some log messages with non-force_flush types.
+  async.Write(false, 0, "test-x", 1);
+  async.Write(false, 1, "test-y", 1);
+
+  // The flush wait timeout might take a little bit of time to run.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_EQ(base.message_count_, 2);
+    // The AsyncLogger should have flushed at least once by the timer automatically
+    // so there should be no more messages in the buffer.
+    ASSERT_GT(base.flush_count_, 0);
+  });
+  async.Stop();
+}
+
 // Basic test that the redaction utilities work as expected.
 TEST(LoggingTest, TestRedactionBasic) {
   ASSERT_STREQ("<redacted>", KUDU_REDACT("hello"));
@@ -195,4 +225,25 @@ TEST(LoggingTest, TestRedactionIllustrateUsage) {
   });
 }
 
+
+TEST(LoggingTest, TestLogTiming) {
+  LOG_TIMING(INFO, "foo") {
+  }
+  {
+    SCOPED_LOG_TIMING(INFO, "bar");
+  }
+  LOG_SLOW_EXECUTION(INFO, 1, "baz") {
+  }
+
+  // Previous implementations of the above macro confused clang-tidy's use-after-move
+  // check and generated false positives.
+  string s1 = "hello";
+  string s2;
+  LOG_SLOW_EXECUTION(INFO, 1, "baz") {
+    LOG(INFO) << s1;
+    s2 = std::move(s1);
+  }
+
+  ASSERT_EQ("hello", s2);
+}
 } // namespace kudu

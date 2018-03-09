@@ -16,7 +16,7 @@
 // under the License.
 
 [[kudu_impala]]
-= Using Apache Kudu with Apache Impala (incubating)
+= Using Apache Kudu with Apache Impala
 :author: Kudu Team
 :imagesdir: ./images
 :icons: font
@@ -27,7 +27,7 @@
 :sectlinks:
 :experimental:
 
-Kudu has tight integration with Apache Impala (incubating), allowing you to use Impala
+Kudu has tight integration with Apache Impala, allowing you to use Impala
 to insert, query, update, and delete data from Kudu tablets using Impala's SQL
 syntax, as an alternative to using the link:installation.html#view_api[Kudu APIs]
 to build a custom Kudu application. In addition, you can use JDBC or ODBC to connect
@@ -501,8 +501,8 @@ stored in the dropped partition.
 
 - For large tables, such as fact tables, aim for as many tablets as you have
   cores in the cluster.
-- For small tables, such as dimension tables, aim for a large enough number of tablets
-  that each tablet is at least 1 GB in size.
+- For small tables, such as dimension tables, ensure that each tablet is at
+  least 1 GB in size.
 
 In general, be mindful the number of tablets limits the parallelism of reads,
 in the current implementation. Increasing the number of tablets significantly
@@ -731,15 +731,18 @@ The examples above have only explored a fraction of what you can do with Impala 
 - Kudu tables with a name containing upper case or non-ascii characters must be
   assigned an alternate name when used as an external table in Impala.
 - Kudu tables with a column name containing upper case or non-ascii characters
-  may not be used as an external table in Impala. Non-primary key columns may be
-  renamed in Kudu to work around this issue.
+  may not be used as an external table in Impala. Columns may be renamed in Kudu
+  to work around this issue.
 - When creating a Kudu table, the `CREATE TABLE` statement must include the
   primary key columns before other columns, in primary key order.
-- Kudu tables containing `UNIXTIME_MICROS`-typed columns may not be used as an
-  external table in Impala.
-- Impala can not create Kudu tables with `TIMESTAMP`, `DECIMAL`, `VARCHAR`,
+- Impala can not create Kudu tables with `DECIMAL`, `VARCHAR`,
   or nested-typed columns.
-- Impala can not update values in primary key columns.
-- `NULL`, `NOT NULL`, `!=`, and `LIKE` predicates are not pushed to Kudu, and
+- Impala cannot update values in primary key columns.
+- `!=` and `LIKE` predicates are not pushed to Kudu, and
   instead will be evaluated by the Impala scan node. This may decrease performance
   relative to other types of predicates.
+- Updates, inserts, and deletes via Impala are non-transactional. If a query
+  fails part of the way through, its partial effects will not be rolled back.
+- The maximum parallelism of a single query is limited to the number of tablets
+  in a table. For good analytic performance, aim for 10 or more tablets per host
+  for large tables.

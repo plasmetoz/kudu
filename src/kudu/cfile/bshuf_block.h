@@ -23,18 +23,31 @@
 #ifndef KUDU_CFILE_BSHUF_BLOCK_H
 #define KUDU_CFILE_BSHUF_BLOCK_H
 
+#include <sys/types.h>
+
 #include <algorithm>
-#include <stdint.h>
+#include <cstring>
+#include <cstdint>
+#include <ostream>
+
+#include <glog/logging.h>
 
 #include "kudu/cfile/bitshuffle_arch_wrapper.h"
 #include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/cfile_util.h"
 #include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/rowid.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/alignment.h"
 #include "kudu/util/coding.h"
 #include "kudu/util/coding-inl.h"
-#include "kudu/util/hexdump.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 namespace cfile {
@@ -218,7 +231,7 @@ template<DataType Type>
 class BShufBlockDecoder final : public BlockDecoder {
  public:
   explicit BShufBlockDecoder(Slice slice)
-      : data_(std::move(slice)),
+      : data_(slice),
         parsed_(false),
         ordinal_pos_base_(0),
         num_elems_(0),
@@ -252,6 +265,7 @@ class BShufBlockDecoder final : public BlockDecoder {
       case 2:
       case 4:
       case 8:
+      case 16:
         break;
       default:
         return Status::Corruption(strings::Substitute("invalid size_of_elem: $0", size_of_elem_));

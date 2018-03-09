@@ -14,13 +14,39 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+#include <algorithm>
+#include <cinttypes>
+#include <cstddef>
+#include <cstdint>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include <kudu/util/flags.h>
-
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/iterator.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
-#include "kudu/tablet/tablet-test-base.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/tablet/local_tablet_writer.h"
+#include "kudu/tablet/tablet-test-util.h"
+#include "kudu/util/auto_release_pool.h"
+#include "kudu/util/compression/compression.pb.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+
+using strings::Substitute;
 
 namespace kudu {
 namespace tablet {
@@ -66,7 +92,7 @@ struct RowOpsBase {
 
 template<typename KeyTypeWrapper>
 struct SliceTypeRowOps : public RowOpsBase {
-  SliceTypeRowOps() : RowOpsBase(KeyTypeWrapper::type, KeyTypeWrapper::encoding),
+  SliceTypeRowOps() : RowOpsBase(KeyTypeWrapper::kType, KeyTypeWrapper::kEncoding),
     strs_(kNumAllocatedElements), slices_(kNumAllocatedElements), cur(0) {}
 
   // Assumes the string representation of n is under strlen characters.
@@ -88,10 +114,10 @@ struct SliceTypeRowOps : public RowOpsBase {
       Slice slice_a(string_a);
       Slice slice_b(string_b);
       Slice slice_c(string_c);
-      CHECK_OK(row->SetSliceCopy<TypeTraits<KeyTypeWrapper::type>>(kColA, slice_a));
-      CHECK_OK(row->SetSliceCopy<TypeTraits<KeyTypeWrapper::type>>(kColB, slice_b));
+      CHECK_OK(row->SetSliceCopy<TypeTraits<KeyTypeWrapper::kType>>(kColA, slice_a));
+      CHECK_OK(row->SetSliceCopy<TypeTraits<KeyTypeWrapper::kType>>(kColB, slice_b));
       if (altered) {
-        CHECK_OK(row->SetSliceCopy<TypeTraits<KeyTypeWrapper::type>>(kColC, slice_c));
+        CHECK_OK(row->SetSliceCopy<TypeTraits<KeyTypeWrapper::kType>>(kColC, slice_c));
       }
     }
   }
@@ -122,10 +148,10 @@ struct SliceTypeRowOps : public RowOpsBase {
 
 template<typename KeyTypeWrapper>
 struct NumTypeRowOps : public RowOpsBase {
-  NumTypeRowOps() : RowOpsBase(KeyTypeWrapper::type, KeyTypeWrapper::encoding),
+  NumTypeRowOps() : RowOpsBase(KeyTypeWrapper::kType, KeyTypeWrapper::kEncoding),
     nums_(kNumAllocatedElements), cur(0) {}
 
-  typedef typename TypeTraits<KeyTypeWrapper::type>::cpp_type CppType;
+  typedef typename TypeTraits<KeyTypeWrapper::kType>::cpp_type CppType;
 
   void GenerateRow(int value, bool altered, KuduPartialRow* row) {
     if (value < 0) {
@@ -135,10 +161,10 @@ struct NumTypeRowOps : public RowOpsBase {
         CHECK_OK(row->SetNull(kColC));
       }
     } else {
-      row->Set<TypeTraits<KeyTypeWrapper::type>>(kColA, value);
-      row->Set<TypeTraits<KeyTypeWrapper::type>>(kColB, value);
+      row->Set<TypeTraits<KeyTypeWrapper::kType>>(kColA, value);
+      row->Set<TypeTraits<KeyTypeWrapper::kType>>(kColB, value);
       if (altered) {
-        row->Set<TypeTraits<KeyTypeWrapper::type>>(kColC, value);
+        row->Set<TypeTraits<KeyTypeWrapper::kType>>(kColC, value);
       }
     }
   }
@@ -275,7 +301,7 @@ public:
   // Scan the results of a query. Set "count" to the number of results satisfying the predicates.
   // ScanSpec must have all desired predicates already added to it.
   void ScanWithSpec(const Schema& schema, ScanSpec spec, int* count) {
-    Arena arena(1028, 1028);
+    Arena arena(1024);
     AutoReleasePool pool;
     *count = 0;
     spec.OptimizeScan(schema, &arena, &pool, true);
@@ -537,8 +563,8 @@ protected:
 
 template<DataType KeyType, EncodingType Encoding>
 struct KeyTypeWrapper {
-  static const DataType type = KeyType;
-  static const EncodingType encoding = Encoding;
+  static const DataType kType = KeyType;
+  static const EncodingType kEncoding = Encoding;
 };
 
 typedef ::testing::Types<NumTypeRowOps<KeyTypeWrapper<INT8, BIT_SHUFFLE>>,
@@ -552,6 +578,12 @@ typedef ::testing::Types<NumTypeRowOps<KeyTypeWrapper<INT8, BIT_SHUFFLE>>,
                          NumTypeRowOps<KeyTypeWrapper<INT32, RLE>>,
                          NumTypeRowOps<KeyTypeWrapper<INT64, BIT_SHUFFLE>>,
                          NumTypeRowOps<KeyTypeWrapper<INT64, PLAIN_ENCODING>>,
+                         NumTypeRowOps<KeyTypeWrapper<INT64, BIT_SHUFFLE>>,
+                         NumTypeRowOps<KeyTypeWrapper<INT64, RLE>>,
+                         NumTypeRowOps<KeyTypeWrapper<INT128, BIT_SHUFFLE>>,
+                         NumTypeRowOps<KeyTypeWrapper<INT128, PLAIN_ENCODING>>,
+                         // TODO: Uncomment when adding 128 bit support to RLE (KUDU-2284)
+                         // NumTypeRowOps<KeyTypeWrapper<INT128, RLE>>,
                          NumTypeRowOps<KeyTypeWrapper<FLOAT, BIT_SHUFFLE>>,
                          NumTypeRowOps<KeyTypeWrapper<FLOAT, PLAIN_ENCODING>>,
                          NumTypeRowOps<KeyTypeWrapper<DOUBLE, BIT_SHUFFLE>>,

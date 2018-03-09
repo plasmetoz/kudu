@@ -15,29 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 #include <thread>
 #include <unordered_set>
+#include <vector>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/tablet/concurrent_btree.h"
 #include "kudu/util/barrier.h"
 #include "kudu/util/debug/sanitizer_scopes.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/hexdump.h"
-#include "kudu/util/memory/memory.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/memory/overwrite.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/stopwatch.h"
-#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+
+using std::string;
+using std::thread;
+using std::unordered_set;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
 namespace btree {
-
-using std::thread;
-using std::unordered_set;
-using std::vector;
 
 class TestCBTree : public KuduTest {
  protected:
@@ -58,7 +67,7 @@ class TestCBTree : public KuduTest {
   }
 
   void DoBigKVTest(size_t key_size, size_t val_size) {
-    ThreadSafeArena arena(1024, 1024);
+    ThreadSafeArena arena(1024);
 
     char kbuf[key_size];
     char vbuf[val_size];
@@ -82,19 +91,19 @@ class TestCBTree : public KuduTest {
 // The nodes may come in slightly smaller than the requested size,
 // but should not be any larger.
 TEST_F(TestCBTree, TestNodeSizes) {
-  ThreadSafeArena arena(1024, 1024);
+  ThreadSafeArena arena(1024);
 
   LeafNode<BTreeTraits> lnode(false);
-  ASSERT_LE(sizeof(lnode), BTreeTraits::leaf_node_size);
+  ASSERT_LE(sizeof(lnode), BTreeTraits::kLeafNodeSize);
 
   InternalNode<BTreeTraits> inode(Slice("split"), &lnode, &lnode, &arena);
-  ASSERT_LE(sizeof(inode), BTreeTraits::internal_node_size);
+  ASSERT_LE(sizeof(inode), BTreeTraits::kInternalNodeSize);
 
 }
 
 TEST_F(TestCBTree, TestLeafNode) {
   LeafNode<BTreeTraits> lnode(false);
-  ThreadSafeArena arena(1024, 1024);
+  ThreadSafeArena arena(1024);
 
   Slice k1("key1");
   Slice v1("val1");
@@ -157,15 +166,15 @@ TEST_F(TestCBTree, TestLeafNodeBigKVs) {
 // splitting, etc.
 struct SmallFanoutTraits : public BTreeTraits {
 
-  static const size_t internal_node_size = 84;
-  static const size_t leaf_node_size = 92;
+  static const size_t kInternalNodeSize = 84;
+  static const size_t kLeafNodeSize = 92;
 };
 
 // Enables yield() calls at interesting points of the btree
 // implementation to ensure that we are still correct even
 // with adversarial scheduling.
 struct RacyTraits : public SmallFanoutTraits {
-  static const size_t debug_raciness = 100;
+  static const size_t kDebugRaciness = 100;
 };
 
 void MakeKey(char *kbuf, size_t len, int i) {

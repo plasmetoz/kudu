@@ -21,9 +21,9 @@ import java.util.Collection;
 import java.util.List;
 
 import com.google.protobuf.Message;
+import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.kudu.Schema;
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.master.Master;
 import org.apache.kudu.util.Pair;
 
@@ -72,7 +72,10 @@ class CreateTableRequest extends KuduRpc<CreateTableResponse> {
     final Master.CreateTableResponsePB.Builder builder = Master.CreateTableResponsePB.newBuilder();
     readProtobuf(callResponse.getPBMessage(), builder);
     CreateTableResponse response =
-        new CreateTableResponse(deadlineTracker.getElapsedMillis(), tsUUID);
+        new CreateTableResponse(
+            deadlineTracker.getElapsedMillis(),
+            tsUUID,
+            builder.getTableId().toStringUtf8());
     return new Pair<CreateTableResponse, Object>(
         response, builder.hasError() ? builder.getError() : null);
   }

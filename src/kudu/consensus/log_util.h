@@ -18,21 +18,28 @@
 #ifndef KUDU_CONSENSUS_LOG_UTIL_H_
 #define KUDU_CONSENSUS_LOG_UTIL_H_
 
+#include <cstddef>
+#include <cstdint>
 #include <deque>
-#include <gtest/gtest.h>
-#include <iosfwd>
-#include <map>
 #include <memory>
 #include <string>
-#include <utility>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
 #include "kudu/consensus/log.pb.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 // Used by other classes, now part of the API.
 DECLARE_bool(log_force_fsync_all);
@@ -40,10 +47,6 @@ DECLARE_bool(log_force_fsync_all);
 namespace kudu {
 
 class CompressionCodec;
-
-namespace consensus {
-struct OpIdBiggerThanFunctor;
-} // namespace consensus
 
 namespace log {
 
@@ -72,9 +75,24 @@ struct LogOptions {
   LogOptions();
 };
 
-
 // A sequence of segments, ordered by increasing sequence number.
 typedef std::vector<scoped_refptr<ReadableLogSegment> > SegmentSequence;
+
+// Detailed error codes when decoding entry headers. Used for more fine-grained
+// error-handling.
+enum class EntryHeaderStatus {
+  OK,
+
+  // The entry was just a run of zeros. It's likely we are trying to
+  // read from pre-allocated space.
+  ALL_ZEROS,
+
+  // The entry checksum didn't match the expected value.
+  CRC_MISMATCH,
+
+  // Some other error occurred (eg an IO error while reading)
+  OTHER_ERROR
+};
 
 // LogEntryReader provides iterator-style access to read the entries
 // from an open log segment.
@@ -106,7 +124,7 @@ class LogEntryReader {
   friend class ReadableLogSegment;
 
   // Handle an error reading an entry.
-  Status HandleReadError(const Status& s) const;
+  Status HandleReadError(const Status& s, EntryHeaderStatus status_detail) const;
 
   // Format a nice error message to report on a corruption in a log file.
   Status MakeCorruptionStatus(const Status& status) const;
@@ -314,22 +332,28 @@ class ReadableLogSegment : public RefCountedThreadSafe<ReadableLogSegment> {
 
   // Read an entry header and its associated batch at the given offset.
   // If successful, updates '*offset' to point to the next batch
-  // in the file. If unsuccessful, '*offset' is not updated.
+  // in the file.
+  //
+  // If unsuccessful, '*offset' is not updated, and *status_detail will be updated
+  // to indicate the cause of the error.
   Status ReadEntryHeaderAndBatch(int64_t* offset, faststring* tmp_buf,
-                                 gscoped_ptr<LogEntryBatchPB>* batch);
+                                 gscoped_ptr<LogEntryBatchPB>* batch,
+                                 EntryHeaderStatus* status_detail);
 
   // Reads a log entry header from the segment.
-  // Also increments the passed offset* by the length of the entry.
-  Status ReadEntryHeader(int64_t *offset, EntryHeader* header);
+  //
+  // Also increments the passed offset* by the length of the entry on successful
+  // read.
+  Status ReadEntryHeader(int64_t *offset, EntryHeader* header,
+                         EntryHeaderStatus* status_detail);
 
   // Decode a log entry header from the given slice. The header length is
   // determined by 'entry_header_size()'.
   // Returns true if successful, false if corrupt.
   //
   // NOTE: this is performance-critical since it is used by ScanForValidEntryHeaders
-  // and thus returns bool instead of Status.
-  bool DecodeEntryHeader(const Slice& data, EntryHeader* header);
-
+  // and thus returns an enum instead of Status.
+  EntryHeaderStatus DecodeEntryHeader(const Slice& data, EntryHeader* header);
 
   // Reads a log entry batch from the provided readable segment, which gets decoded
   // into 'entry_batch' and increments 'offset' by the batch's length.
@@ -473,12 +497,10 @@ class WritableLogSegment {
   DISALLOW_COPY_AND_ASSIGN(WritableLogSegment);
 };
 
-// Sets 'batch' to a newly created batch that contains the pre-allocated
+// Return a newly created batch that contains the pre-allocated
 // ReplicateMsgs in 'msgs'.
-// We use C-style passing here to avoid having to allocate a vector
-// in some hot paths.
-void CreateBatchFromAllocatedOperations(const std::vector<consensus::ReplicateRefPtr>& msgs,
-                                        gscoped_ptr<LogEntryBatchPB>* batch);
+std::unique_ptr<LogEntryBatchPB> CreateBatchFromAllocatedOperations(
+    const std::vector<consensus::ReplicateRefPtr>& msgs);
 
 // Checks if 'fname' is a correctly formatted name of log segment file.
 bool IsLogFileName(const std::string& fname);

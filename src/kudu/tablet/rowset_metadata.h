@@ -14,13 +14,19 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_ROWSET_METADATA_H
-#define KUDU_TABLET_ROWSET_METADATA_H
 
+#pragma once
+
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+
+#include <boost/container/flat_map.hpp>
+#include <boost/container/vector.hpp>
+#include <glog/logging.h>
 
 #include "kudu/common/schema.h"
 #include "kudu/fs/block_id.h"
@@ -28,16 +34,15 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/tablet/tablet_metadata.h"
-#include "kudu/util/debug-util.h"
-#include "kudu/util/env.h"
 #include "kudu/util/locks.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
 namespace tablet {
 
+class RowSetDataPB;
 class RowSetMetadataUpdate;
-class TabletMetadata;
 
 // Keeps track of the RowSet data blocks.
 //
@@ -63,19 +68,30 @@ class TabletMetadata;
 //
 class RowSetMetadata {
  public:
-  typedef std::map<ColumnId, BlockId> ColumnIdToBlockIdMap;
+  // We use a flat_map to save memory, since there are lots of these metadata
+  // objects.
+  typedef boost::container::flat_map<ColumnId, BlockId> ColumnIdToBlockIdMap;
 
   // Create a new RowSetMetadata
   static Status CreateNew(TabletMetadata* tablet_metadata,
                           int64_t id,
-                          gscoped_ptr<RowSetMetadata>* metadata);
+                          std::unique_ptr<RowSetMetadata>* metadata);
 
   // Load metadata from a protobuf which was previously read from disk.
   static Status Load(TabletMetadata* tablet_metadata,
                      const RowSetDataPB& pb,
-                     gscoped_ptr<RowSetMetadata>* metadata);
+                     std::unique_ptr<RowSetMetadata>* metadata);
+
+  // Resets the in-memory state to mirror 'pb'.
+  //
+  // Should only be used to initialize a RowSetMetadata instance or to
+  // immediately roll-back an updated RowSetMetadata instance following an
+  // error after calling CommitUpdate().
+  void LoadFromPB(const RowSetDataPB& pb);
 
   Status Flush();
+
+  void AddOrphanedBlocks(const std::vector<BlockId>& blocks);
 
   const std::string ToString() const;
 
@@ -97,7 +113,7 @@ class RowSetMetadata {
     adhoc_index_block_ = block_id;
   }
 
-  void SetColumnDataBlocks(const ColumnIdToBlockIdMap& blocks_by_col_id);
+  void SetColumnDataBlocks(const std::map<ColumnId, BlockId>& blocks_by_col_id);
 
   Status CommitRedoDeltaDataBlock(int64_t dms_id, const BlockId& block_id);
 
@@ -118,7 +134,7 @@ class RowSetMetadata {
     return !adhoc_index_block_.IsNull();
   }
 
-  BlockId column_data_block_for_col_id(ColumnId col_id) {
+  BlockId column_data_block_for_col_id(const ColumnId& col_id) const {
     std::lock_guard<LockType> l(lock_);
     return FindOrDie(blocks_by_col_id_, col_id);
   }
@@ -128,12 +144,12 @@ class RowSetMetadata {
     return blocks_by_col_id_;
   }
 
-  vector<BlockId> redo_delta_blocks() const {
+  std::vector<BlockId> redo_delta_blocks() const {
     std::lock_guard<LockType> l(lock_);
     return redo_delta_blocks_;
   }
 
-  vector<BlockId> undo_delta_blocks() const {
+  std::vector<BlockId> undo_delta_blocks() const {
     std::lock_guard<LockType> l(lock_);
     return undo_delta_blocks_;
   }
@@ -166,8 +182,10 @@ class RowSetMetadata {
 
   // Atomically commit a set of changes to this object.
   //
-  // On success, calls TabletMetadata::AddOrphanedBlocks() on the removed blocks.
-  Status CommitUpdate(const RowSetMetadataUpdate& update);
+  // Returns the blocks removed from the rowset metadata during the update.
+  // These blocks must be added to the TabletMetadata's orphaned blocks list.
+  void CommitUpdate(const RowSetMetadataUpdate& update,
+                    std::vector<BlockId>* removed);
 
   void ToProtobuf(RowSetDataPB *pb);
 
@@ -263,4 +281,3 @@ class RowSetMetadataUpdate {
 
 } // namespace tablet
 } // namespace kudu
-#endif /* KUDU_TABLET_ROWSET_METADATA_H */

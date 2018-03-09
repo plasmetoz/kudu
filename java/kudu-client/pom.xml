@@ -23,7 +23,7 @@
     <parent>
         <groupId>org.apache.kudu</groupId>
         <artifactId>kudu-parent</artifactId>
-        <version>1.4.0-SNAPSHOT</version>
+        <version>1.7.0-SNAPSHOT</version>
     </parent>
 
     <artifactId>kudu-client</artifactId>
@@ -31,9 +31,25 @@
 
     <dependencies>
         <dependency>
-            <groupId>org.apache.kudu</groupId>
-            <artifactId>interface-annotations</artifactId>
-            <version>${project.version}</version>
+            <!-- Not shaded or included in the client JAR because it's part
+                 of the public API. -->
+            <groupId>com.stumbleupon</groupId>
+            <artifactId>async</artifactId>
+            <version>${async.version}</version>
+            <exclusions>
+                <!-- Explicitly exclude slf4j because async uses version ranges
+                     for the dependency -->
+                <exclusion>
+                    <groupId>org.slf4j</groupId>
+                    <artifactId>slf4j-api</artifactId>
+                </exclusion>
+            </exclusions>
+        </dependency>
+
+        <dependency>
+            <groupId>com.google.guava</groupId>
+            <artifactId>guava</artifactId>
+            <version>${guava.version}</version>
         </dependency>
         <dependency>
             <groupId>com.google.protobuf</groupId>
@@ -41,15 +57,9 @@
             <version>${protobuf.version}</version>
         </dependency>
         <dependency>
-            <groupId>com.google.guava</groupId>
-            <artifactId>guava</artifactId>
-            <version>${guava.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>com.google.code.findbugs</groupId>
-            <artifactId>jsr305</artifactId>
-            <version>${jsr305.version}</version>
-            <optional>true</optional>
+            <groupId>com.sangupta</groupId>
+            <artifactId>murmur</artifactId>
+            <version>${murmur.version}</version>
         </dependency>
         <dependency>
             <groupId>io.netty</groupId>
@@ -57,21 +67,27 @@
             <version>${netty.version}</version>
         </dependency>
         <dependency>
-            <groupId>log4j</groupId>
-            <artifactId>log4j</artifactId>
-            <version>${log4j.version}</version>
-            <scope>provided</scope>
+            <groupId>org.apache.yetus</groupId>
+            <artifactId>audience-annotations</artifactId>
+            <version>${yetus.version}</version>
         </dependency>
         <dependency>
-            <groupId>org.mockito</groupId>
-            <artifactId>mockito-core</artifactId>
-            <version>${mockito-core.version}</version>
-            <scope>test</scope>
+            <groupId>org.slf4j</groupId>
+            <artifactId>slf4j-api</artifactId>
+            <version>${slf4j.version}</version>
         </dependency>
+
         <dependency>
-            <groupId>org.hamcrest</groupId>
-            <artifactId>hamcrest-core</artifactId>
-            <version>${hamcrest-core.version}</version>
+            <groupId>com.google.code.findbugs</groupId>
+            <artifactId>jsr305</artifactId>
+            <version>${jsr305.version}</version>
+            <optional>true</optional>
+        </dependency>
+
+        <dependency>
+            <groupId>commons-io</groupId>
+            <artifactId>commons-io</artifactId>
+            <version>${commons-io.version}</version>
             <scope>test</scope>
         </dependency>
         <dependency>
@@ -81,50 +97,56 @@
             <scope>test</scope>
         </dependency>
         <dependency>
-            <!-- Not shaded or included in the client JAR because it's part
-                 of the public API. -->
-            <groupId>com.stumbleupon</groupId>
-            <artifactId>async</artifactId>
-            <version>${async.version}</version>
+            <groupId>log4j</groupId>
+            <artifactId>log4j</artifactId>
+            <version>${log4j.version}</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
-            <groupId>com.sangupta</groupId>
-            <artifactId>murmur</artifactId>
-            <version>${murmur.version}</version>
+            <groupId>org.hamcrest</groupId>
+            <artifactId>hamcrest-core</artifactId>
+            <version>${hamcrest-core.version}</version>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.mockito</groupId>
+            <artifactId>mockito-core</artifactId>
+            <version>${mockito-core.version}</version>
+            <scope>test</scope>
         </dependency>
         <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-log4j12</artifactId>
             <version>${slf4j.version}</version>
-            <scope>provided</scope>
-        </dependency>
-        <dependency>
-            <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-api</artifactId>
-            <version>${slf4j.version}</version>
-        </dependency>
-        <dependency>
-            <groupId>commons-io</groupId>
-            <artifactId>commons-io</artifactId>
-            <version>${commons-io.version}</version>
             <scope>test</scope>
         </dependency>
     </dependencies>
 
     <build>
+        <extensions>
+            <!-- Used in the protobuf plugin to find the right protoc artifact
+                 with the property os.detected.classifier -->
+            <extension>
+              <groupId>kr.motd.maven</groupId>
+              <artifactId>os-maven-plugin</artifactId>
+              <version>${maven-os-plugin.version}</version>
+            </extension>
+        </extensions>
         <plugins>
             <plugin>
-                <groupId>com.google.protobuf.tools</groupId>
-                <artifactId>maven-protoc-plugin</artifactId>
+                <groupId>org.xolstice.maven.plugins</groupId>
+                <artifactId>protobuf-maven-plugin</artifactId>
                 <version>${maven-protoc-plugin.version}</version>
+                <extensions>true</extensions>
                 <configuration>
                     <!-- Documented at:
-                         http://sergei-ivanov.github.io/maven-protoc-plugin/compile-mojo.html -->
+                         https://www.xolstice.org/protobuf-maven-plugin/usage.html -->
                     <checkStaleness>true</checkStaleness>
                     <protoSourceRoot>${project.basedir}/../../src</protoSourceRoot>
                     <excludes>
                       <exclude>**/*test*.proto</exclude>
                     </excludes>
+                    <protocArtifact>com.google.protobuf:protoc:${protobuf.version}:exe:${os.detected.classifier}</protocArtifact>
                 </configuration>
                 <executions>
                     <execution>
@@ -134,36 +156,6 @@
                         <phase>generate-sources</phase>
                     </execution>
                 </executions>
-            </plugin>
-            <plugin>
-              <groupId>org.apache.maven.plugins</groupId>
-              <artifactId>maven-clean-plugin</artifactId>
-              <version>2.5</version>
-              <executions>
-                <execution>
-                  <id>delete-test-protos</id>
-                  <!-- maven-protoc-plugin copies proto files as part of the
-                       default-resources execution in the process-resources
-                       phase. -->
-                  <phase>process-resources</phase>
-                  <goals>
-                    <goal>clean</goal>
-                  </goals>
-                  <configuration>
-                    <!-- Additional configuration (e.g. the location of protoc)
-                         is done via maven profiles later in the file. -->
-                    <excludeDefaultDirectories>true</excludeDefaultDirectories>
-                    <filesets>
-                      <fileset>
-                        <directory>${project.build.directory}/classes</directory>
-                        <includes>
-                          <include>**/*test*.proto</include>
-                        </includes>
-                      </fileset>
-                    </filesets>
-                  </configuration>
-                </execution>
-              </executions>
             </plugin>
             <plugin>
               <groupId>org.apache.maven.plugins</groupId>
@@ -181,35 +173,26 @@
                 <relocations>
                   <relocation>
                     <pattern>com.google.common</pattern>
-                    <shadedPattern>org.apache.kudu.client.shaded.com.google.common</shadedPattern>
-                  </relocation>
-                  <relocation>
-                    <pattern>com.google.protobuf</pattern>
-                    <shadedPattern>org.apache.kudu.client.shaded.com.google.protobuf</shadedPattern>
+                    <shadedPattern>org.apache.kudu.shaded.com.google.common</shadedPattern>
                   </relocation>
                   <relocation>
                     <pattern>com.google.thirdparty</pattern>
-                    <shadedPattern>org.apache.kudu.client.shaded.com.google.thirdparty</shadedPattern>
+                    <shadedPattern>org.apache.kudu.shaded.com.google.thirdparty</shadedPattern>
+                  </relocation>
+                  <relocation>
+                    <pattern>com.google.protobuf</pattern>
+                    <shadedPattern>org.apache.kudu.shaded.com.google.protobuf</shadedPattern>
                   </relocation>
                   <relocation>
                     <pattern>com.sangupta</pattern>
-                    <shadedPattern>org.apache.kudu.client.shaded.com.sangupta</shadedPattern>
+                    <shadedPattern>org.apache.kudu.shaded.com.sangupta</shadedPattern>
                   </relocation>
                   <relocation>
                     <pattern>org.jboss.netty</pattern>
-                    <shadedPattern>org.apache.kudu.client.shaded.org.jboss.netty</shadedPattern>
+                    <shadedPattern>org.apache.kudu.shaded.org.jboss.netty</shadedPattern>
                   </relocation>
                 </relocations>
-                <shadeTestJar>true</shadeTestJar>
               </configuration>
-              <executions>
-                <execution>
-                  <phase>package</phase>
-                  <goals>
-                    <goal>shade</goal>
-                  </goals>
-                </execution>
-              </executions>
             </plugin>
             <!-- Attach source and javadoc to packaged jar -->
             <plugin>
@@ -296,8 +279,8 @@
                     </pluginExecution>
                     <pluginExecution>
                       <pluginExecutionFilter>
-                        <groupId>com.google.protobuf.tools</groupId>
-                        <artifactId>maven-protoc-plugin</artifactId>
+                        <groupId>org.xolstice.maven.plugins</groupId>
+                        <artifactId>protobuf-maven-plugin</artifactId>
                         <versionRange>[${maven-protoc-plugin.version},)</versionRange>
                         <goals>
                           <goal>compile</goal>
@@ -316,93 +299,4 @@
           </plugins>
         </pluginManagement>
     </build>
-
-    <!-- Find a protoc with which to compile the .proto files.
-
-         This is done via maven profiles. The order of activation:
-         1. Use TSAN protoc if it exists.
-         2. Use uninstrumented protoc if it exists.
-         3. Use system protoc if no other profile was activated.
-
-         If both TSAN and uninstrumented protoc exist, the latter will override
-         the former by virtue of being activated after it, which is why the
-         profile declaration order is important. -->
-    <profiles>
-      <profile>
-        <id>protoc-tsan</id>
-        <activation>
-          <file>
-            <exists>${basedir}/../../thirdparty/installed/tsan/bin/protoc</exists>
-          </file>
-        </activation>
-        <build>
-          <plugins>
-            <plugin>
-              <groupId>com.google.protobuf.tools</groupId>
-              <artifactId>maven-protoc-plugin</artifactId>
-              <version>${maven-protoc-plugin.version}</version>
-              <configuration>
-                <protocExecutable>
-                  ${project.basedir}/../../thirdparty/installed/tsan/bin/protoc
-                </protocExecutable>
-                <additionalProtoPathElements>
-                  <additionalProtoPathElement>
-                    ${project.basedir}/../../thirdparty/installed/tsan/include
-                  </additionalProtoPathElement>
-                </additionalProtoPathElements>
-              </configuration>
-            </plugin>
-          </plugins>
-        </build>
-      </profile>
-      <profile>
-        <id>protoc-uninstrumented</id>
-        <activation>
-          <file>
-            <exists>${basedir}/../../thirdparty/installed/uninstrumented/bin/protoc</exists>
-          </file>
-        </activation>
-        <build>
-          <plugins>
-            <plugin>
-              <groupId>com.google.protobuf.tools</groupId>
-              <artifactId>maven-protoc-plugin</artifactId>
-              <version>${maven-protoc-plugin.version}</version>
-              <configuration>
-                <protocExecutable>
-                  ${project.basedir}/../../thirdparty/installed/uninstrumented/bin/protoc
-                </protocExecutable>
-                <additionalProtoPathElements>
-                  <additionalProtoPathElement>
-                    ${project.basedir}/../../thirdparty/installed/uninstrumented/include
-                  </additionalProtoPathElement>
-                </additionalProtoPathElements>
-              </configuration>
-            </plugin>
-          </plugins>
-        </build>
-      </profile>
-      <profile>
-        <id>protoc-system</id>
-        <activation>
-          <activeByDefault>true</activeByDefault>
-        </activation>
-        <build>
-          <plugins>
-            <plugin>
-              <groupId>com.google.protobuf.tools</groupId>
-              <artifactId>maven-protoc-plugin</artifactId>
-              <version>${maven-protoc-plugin.version}</version>
-              <configuration>
-                <protocExecutable>protoc</protocExecutable>
-                <additionalProtoPathElements>
-                  <additionalProtoPathElement>/usr/include</additionalProtoPathElement>
-                  <additionalProtoPathElement>/usr/local/include</additionalProtoPathElement>
-                </additionalProtoPathElements>
-              </configuration>
-            </plugin>
-          </plugins>
-        </build>
-      </profile>
-    </profiles>
 </project>

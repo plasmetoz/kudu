@@ -24,7 +24,6 @@
 
 #include "kudu/gutil/macros.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -36,7 +35,7 @@ namespace master {
 
 class TSDescriptor;
 
-typedef std::vector<std::shared_ptr<TSDescriptor> > TSDescriptorVector;
+typedef std::vector<std::shared_ptr<TSDescriptor>> TSDescriptorVector;
 
 // Tracks the servers that the master has heard from, along with their
 // last heartbeat, etc.
@@ -75,11 +74,11 @@ class TSManager {
 
   // Return all of the currently registered TS descriptors into the provided
   // list.
-  void GetAllDescriptors(std::vector<std::shared_ptr<TSDescriptor> >* descs) const;
+  void GetAllDescriptors(std::vector<std::shared_ptr<TSDescriptor>>* descs) const;
 
   // Return all of the currently registered TS descriptors that have sent a
   // heartbeat recently, indicating that they're alive and well.
-  void GetAllLiveDescriptors(std::vector<std::shared_ptr<TSDescriptor> >* descs) const;
+  void GetAllLiveDescriptors(std::vector<std::shared_ptr<TSDescriptor>>* descs) const;
 
   // Get the TS count.
   int GetCount() const;
@@ -88,7 +87,7 @@ class TSManager {
   mutable rw_spinlock lock_;
 
   typedef std::unordered_map<
-    std::string, std::shared_ptr<TSDescriptor> > TSDescriptorMap;
+    std::string, std::shared_ptr<TSDescriptor>> TSDescriptorMap;
   TSDescriptorMap servers_by_id_;
 
   DISALLOW_COPY_AND_ASSIGN(TSManager);

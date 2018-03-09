@@ -17,21 +17,22 @@
 
 #include "kudu/rpc/blocking_ops.h"
 
-#include <stdint.h>
-#include <string.h>
+#include <cstdint>
+#include <cstring>
+#include <ostream>
 
 #include <glog/logging.h>
 #include <google/protobuf/message_lite.h>
 
 #include "kudu/gutil/endian.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/constants.h"
 #include "kudu/rpc/serialization.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/faststring.h"
-#include "kudu/util/monotime.h"
-#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -41,11 +42,13 @@ using google::protobuf::MessageLite;
 
 const char kHTTPHeader[] = "HTTP";
 
-Status EnsureBlockingMode(const Socket* sock) {
+Status CheckInBlockingMode(const Socket* sock) {
   bool is_nonblocking;
   RETURN_NOT_OK(sock->IsNonBlocking(&is_nonblocking));
   if (is_nonblocking) {
-    return Status::IllegalState("Underlying socket is not set to blocking mode!");
+    static const char* const kErrMsg = "socket is not in blocking mode";
+    LOG(DFATAL) << kErrMsg;
+    return Status::IllegalState(kErrMsg);
   }
   return Status::OK();
 }
@@ -56,13 +59,9 @@ Status SendFramedMessageBlocking(Socket* sock, const MessageLite& header, const 
   DCHECK(header.IsInitialized()) << "header protobuf must be initialized";
   DCHECK(msg.IsInitialized()) << "msg protobuf must be initialized";
 
-  RETURN_NOT_OK(EnsureBlockingMode(sock));
-
   // Ensure we are in blocking mode.
   // These blocking calls are typically not in the fast path, so doing this for all build types.
-  bool is_non_blocking = false;
-  RETURN_NOT_OK(sock->IsNonBlocking(&is_non_blocking));
-  DCHECK(!is_non_blocking) << "Socket must be in blocking mode to use SendFramedMessage";
+  RETURN_NOT_OK(CheckInBlockingMode(sock));
 
   // Serialize message
   faststring param_buf;
@@ -87,7 +86,7 @@ Status ReceiveFramedMessageBlocking(Socket* sock, faststring* recv_buf,
   DCHECK(header != nullptr);
   DCHECK(param_buf != nullptr);
 
-  RETURN_NOT_OK(EnsureBlockingMode(sock));
+  RETURN_NOT_OK(CheckInBlockingMode(sock));
 
   // Read the message prefix, which specifies the length of the payload.
   recv_buf->clear();

@@ -17,11 +17,16 @@
 #ifndef KUDU_RPC_RPC_CONTEXT_H
 #define KUDU_RPC_RPC_CONTEXT_H
 
+#include <memory>
+#include <stddef.h>
 #include <string>
 
+#include <glog/logging.h>
+
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/service_if.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
 
 namespace google {
@@ -32,6 +37,7 @@ class Message;
 
 namespace kudu {
 
+class Slice;
 class Sockaddr;
 class Trace;
 
@@ -101,8 +107,8 @@ class RpcContext {
 
   // Respond with an RPC-level error. This typically manifests to the client as
   // a remote error, one whose handling is agnostic to the particulars of the
-  // sent RPC. For example, ERROR_SERVER_TOO_BUSY usually causes the client to
-  // retry the RPC at a later time.
+  // sent RPC. For example, both ERROR_SERVER_TOO_BUSY and ERROR_UNAVAILABLE
+  // usually cause the client to retry the RPC at a later time.
   //
   // After this method returns, this RpcContext object is destroyed. The request
   // and response protobufs are also destroyed.
@@ -162,6 +168,13 @@ class RpcContext {
   // Return the identity of remote user who made this call.
   const RemoteUser& remote_user() const;
 
+  // Whether it's OK to pass confidential information between the client and the
+  // server in the context of the RPC call being handled.  In real world, this
+  // translates into properties of the connection between the client and the
+  // server. For example, this methods returns 'true' for a call over an
+  // encrypted connection.
+  bool is_confidential() const;
+
   // Discards the memory associated with the inbound call's payload. All previously
   // obtained sidecar slices will be invalidated by this call. It is an error to call
   // GetInboundSidecar() after this method. request_pb() remains valid.
@@ -202,6 +215,11 @@ class RpcContext {
 
   // Returns this call's request id, if it is set.
   const rpc::RequestIdPB* request_id() const;
+
+  // Returns the size of the transfer buffer that backs 'call_'. If the
+  // transfer buffer no longer exists (e.g. GetTransferSize() is called after
+  // DiscardTransfer()), returns 0.
+  size_t GetTransferSize() const;
 
   // Panic the server. This logs a fatal error with the given message, and
   // also includes the current RPC request, requestor, trace information, etc,

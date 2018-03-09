@@ -25,7 +25,7 @@ cmake_minimum_required(VERSION 3.4.3)
 # Prevent builds from the top-level source directory. This ensures that build
 # output is well isolated from the source tree.
 #
-# May be overridden by setting KUDU_ALLOW_IN_SOURCE_BUILDS; this is only
+# May be overridden by setting KUDU_ALLOW_IN_SOURCE_BUILD; this is only
 # recommended for experts!
 if("${CMAKE_CURRENT_SOURCE_DIR}" STREQUAL "${CMAKE_CURRENT_BINARY_DIR}" AND
     NOT "${KUDU_ALLOW_IN_SOURCE_BUILD}")
@@ -54,17 +54,13 @@ string(REPLACE "${CMAKE_CURRENT_SOURCE_DIR}/build/" ""
   BLESSED_BUILD_SUBDIR "${CMAKE_CURRENT_BINARY_DIR}")
 string(FIND "${BLESSED_BUILD_SUBDIR}" "/" SLASH_POS)
 if (SLASH_POS EQUAL -1)
-  if (NOT APPLE)
-    set(MORE_ARGS "-T")
-  endif()
-
   # Create the symlink both during cmake invocation and when the default target
   # ('all') is built. The former is useful for scripts that, after running
   # cmake, only build a single target (i.e. "make lint").
-  execute_process(COMMAND ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+  execute_process(COMMAND ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest)
   add_custom_target(latest_symlink ALL
-    ln ${MORE_ARGS} -sf ${CMAKE_CURRENT_BINARY_DIR}
+    ln ${MORE_ARGS} -nsf ${CMAKE_CURRENT_BINARY_DIR}
     ${CMAKE_CURRENT_SOURCE_DIR}/build/latest
     COMMENT "Recreating ../build/latest symlink")
 
@@ -104,6 +100,11 @@ set(CMAKE_SKIP_INSTALL_ALL_DEPENDENCY true)
 # just do it once here for all Kudu executables.
 set(CMAKE_ENABLE_EXPORTS true)
 
+# Always generate the compilation database file (compile_commands.json) for use
+# with various development tools, such as IWYU and Vim's YouCompleteMe plugin.
+# See http://clang.llvm.org/docs/JSONCompilationDatabase.html
+set(CMAKE_EXPORT_COMPILE_COMMANDS TRUE)
+
 # Make sure thirdparty stuff is up-to-date.
 if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
   if (${KUDU_USE_TSAN})
@@ -117,28 +118,26 @@ if ("$ENV{NO_REBUILD_THIRDPARTY}" STREQUAL "")
   endif()
 endif()
 
-# Generate a Clang compile_commands.json "compilation database" file for use
-# with various development tools, such as Vim's YouCompleteMe plugin.
-# See http://clang.llvm.org/docs/JSONCompilationDatabase.html
-if ("$ENV{CMAKE_EXPORT_COMPILE_COMMANDS}" STREQUAL "1")
-  set(CMAKE_EXPORT_COMPILE_COMMANDS 1)
-endif()
-
 ############################################################
 # Compiler flags
 ############################################################
 
 # compiler flags that are common across debug/release builds
-#  - msse4.2: Enable sse4.2 compiler intrinsics.
+#  -msse4.2: Enable sse4.2 compiler intrinsics.
 set(CXX_COMMON_FLAGS "-msse4.2")
-#  - Wall: Enable all warnings.
+#  -Wall: Enable all warnings.
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wall")
-#  - Wno-sign-compare: suppress warnings for comparison between signed and unsigned
-#    integers
+#  -Wno-sign-compare: suppress warnings for comparison between signed and unsigned
+#     integers
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-sign-compare")
-#  -Wno-deprecated: some of the gutil code includes old things like ext/hash_set, ignore that
+#  -Wno-comment: suppress warnings about backslash-newline in "//" comments,
+#     which appear in the Kudu source code due to the use of ASCII art and
+#     multi-line command line examples in comments.
+set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-comment")
+#  -Wno-deprecated: we currently have a number of places using deprecated functions
+#     (mostly our own functions). TODO(todd) remove or individually suppress call sites.
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -Wno-deprecated")
-#  - pthread: enable multithreaded malloc
+#  -pthread: enable multithreaded malloc
 set(CXX_COMMON_FLAGS "${CXX_COMMON_FLAGS} -pthread")
 #  -fno-strict-aliasing
 #     Assume programs do not follow strict aliasing rules.
@@ -246,15 +245,24 @@ if ("${COMPILER_FAMILY}" STREQUAL "clang")
   # ATTRIBUTE_DEPRECATED in its signature.
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wdocumentation-deprecated-sync")
 
+  # Avoid 'taking address of packed member' warnings, which pollute macOs/clang 4.0 builds.
+  # This is also done in chromium. See:
+  # https://bugs.chromium.org/p/chromium/issues/detail?id=619640
+  # Unfortunately older versions of clang complain about not knowing the warning, so
+  # this also disables the warning about unknown warnings.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unknown-warning-option -Wno-address-of-packed-member")
+
   # Only hardcode -fcolor-diagnostics if stderr is opened on a terminal. Otherwise
   # the color codes show up as noisy artifacts.
   #
   # This test is imperfect because 'cmake' and 'make' can be run independently
   # (with different terminal options), and we're testing during the former.
   #
-  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1.
+  # We also provide a manual override as -DKUDU_FORCE_COLOR_DIAGNOSTICS=1 or
+  # by setting an environment variable of the same name.
   execute_process(COMMAND test -t 2 RESULT_VARIABLE KUDU_IS_TTY)
   if ((NOT "${KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
+      (NOT "$ENV{KUDU_FORCE_COLOR_DIAGNOSTICS}" STREQUAL "") OR
       ((${KUDU_IS_TTY} EQUAL 0) AND (NOT ("$ENV{TERM}" STREQUAL "dumb"))))
     message("Running in a controlling terminal")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fcolor-diagnostics")
@@ -326,21 +334,27 @@ if (${KUDU_USE_ASAN})
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=address -DADDRESS_SANITIZER")
 endif()
 
+if (${KUDU_USE_XRAY})
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fxray-instrument")
+endif()
+
 # For any C code, use the same flags.
 set(CMAKE_C_FLAGS "${CMAKE_CXX_FLAGS}")
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -std=c++11")
 
-# Flag to enable clang undefined behavior sanitizer
-# We explicitly don't enable all of the sanitizer flags:
-# - disable 'vptr' because it currently crashes somewhere in boost::intrusive::list code
-# - disable 'alignment' because unaligned access is really OK on Nehalem and we do it
-#   all over the place.
+# Enable the Clang undefined behavior (UB) sanitizer.
 if (${KUDU_USE_UBSAN})
   if(NOT (("${COMPILER_FAMILY}" STREQUAL "clang") OR
           ("${COMPILER_FAMILY}" STREQUAL "gcc" AND "${COMPILER_VERSION}" VERSION_GREATER "4.9")))
     message(SEND_ERROR "Cannot use UBSAN without clang or gcc >= 4.9")
   endif()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined -fno-sanitize=alignment,vptr -fno-sanitize-recover")
+  # Enable UB and unsigned integer overflow detection.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize=undefined,integer")
+  # Disable 'alignment' because unaligned access is really OK on Nehalem and we do it all over the place.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize=alignment")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsanitize-blacklist=${CMAKE_CURRENT_SOURCE_DIR}/build-support/ubsan-blacklist.txt")
+  # Stop execution after UB or overflow is detected.
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-sanitize-recover")
 endif ()
 
 # Flag to enable thread sanitizer (clang or gcc 4.8)
@@ -595,6 +609,13 @@ endif()
   # Exported variants may not use tcmalloc.
   set(EXPORTED_FLAGS "${EXPORTED_FLAGS} -UTCMALLOC_ENABLED")
 
+  # Exported variants should conform to the C++03 ABI, which doesn't
+  # include sized deallocation (new in C++14). This reverses the setting from
+  # non-exported (default) flags.
+  if(COMPILER_SUPPORTS_SIZED_DEALLOCATION)
+    set(EXPORTED_FLAGS "${EXPORTED_FLAGS} -fno-sized-deallocation")
+  endif()
+
   set_target_properties(${EXPORTED_LIB_NAME}
     PROPERTIES COMPILE_FLAGS "${ARG_COMPILE_FLAGS} ${EXPORTED_FLAGS}")
 
@@ -647,8 +668,69 @@ endfunction()
 # net/net_util-test). Either way, the last component must be a globally
 # unique name.
 #
-# Arguments after the test name will be passed to set_tests_properties().
+# Additional optional arguments:
+#
+#   TIMEOUT <secs>
+#       Sets a timeout for running this test.
+#
+#       NOTE: this only affects the test timeout when run via 'ctest'.
+#       Jenkins builds typically execute tests using dist-test, and that
+#       does not respect these timeouts. If a test suite is long enough
+#       to require a bumped timeout, consider enabling sharding of the
+#       test (see below).
+#
+#   NUM_SHARDS <num shards>
+#       Sets the number of shards used for running this test.
+#
+#       This configuration splits up the test cases within the binary
+#       into several separate shards. Each shard becomes a separate
+#       test case when run by ctest or when submitted for distributed testing.
+#       This should be used whenever a test binary is long-running and
+#       consists of many separate test cases.
+#
+#       NOTE: sharding is still recommended even for tests with RUN_SERIAL
+#       or RESOURCE_LOCK properties. Even though the shards cannot run in
+#       parallel on a single machine using ctest, they will still run in
+#       parallel across separate machines using dist-test.
+#
+#   PROCESSORS <num processors>
+#   RUN_SERIAL true
+#       These built-in CMake properties should be used when a test is
+#       a heavy consumer of CPU.
+#
+#       The PROCESSORS flag allows ctest to ensure that tests are only
+#       scheduled in parallel when an appropriate number of cores are
+#       available. The default is to assume that a test uses a single core
+#       (i.e. equivalent to PROCESSORS 1).
+#
+#       RUN_SERIAL ensures that the test does not run in parallel with any
+#       other test. This should be used for stress tests which start many
+#       threads and attempt to monopolize the machine.
+#
+#       In order to determine an appropriate setting, you can run the test
+#       with the KUDU_MEASURE_TEST_CPU_CONSUMPTION environment variable
+#       set. See build-support/run-test.sh for more details.
+#
+# Any other arguments will be passed to set_tests_properties().
 function(ADD_KUDU_TEST REL_TEST_NAME)
+  # Parse out properties for which we have special handling.
+  set(options)
+  set(one_value_args TIMEOUT NUM_SHARDS)
+  set(multi_value_args)
+  cmake_parse_arguments(ARG "${options}" "${one_value_args}" "${multi_value_args}" ${ARGN})
+  if(NOT ARG_TIMEOUT)
+    # Default to 15 minutes.
+    # NOTE: this should be kept in sync with the default value of KUDU_TEST_TIMEOUT
+    # in build-support/run-test.sh
+    set(ARG_TIMEOUT 900)
+  endif()
+  if(NOT ARG_NUM_SHARDS)
+    set(ARG_NUM_SHARDS 1)
+  endif()
+
+  # Any unrecognized arguments go into ${ARG_UNPARSED_ARGUMENTS}, which we forward
+  # along as properties down below.
+
   if(NO_TESTS)
     return()
   endif()
@@ -673,11 +755,32 @@ function(ADD_KUDU_TEST REL_TEST_NAME)
     message(FATAL_ERROR "Neither ${REL_TEST_NAME} nor ${REL_TEST_NAME}.cc were found in ${CMAKE_CURRENT_SOURCE_DIR}/")
   endif()
 
-  add_test(${TEST_NAME}
-    ${BUILD_SUPPORT_DIR}/run-test.sh ${TEST_PATH})
-  if(ARGN)
-    set_tests_properties(${TEST_NAME} PROPERTIES ${ARGN})
-  endif()
+  math(EXPR MAX_SHARD "${ARG_NUM_SHARDS} - 1")
+  foreach(SHARD_NUM RANGE ${MAX_SHARD})
+    set(TARGET ${TEST_NAME}.${SHARD_NUM})
+
+    add_test(${TARGET}
+      ${BUILD_SUPPORT_DIR}/run-test.sh ${TEST_PATH})
+    if(ARG_UNPARSED_ARGUMENTS)
+      set_tests_properties(${TARGET} PROPERTIES ${ARG_UNPARSED_ARGUMENTS})
+    endif()
+    # Set the ctest timeout to be a bit longer than the timeout we pass to
+    # our test wrapper. This gives the test wrapper some opportunity to do
+    # things like dump stacks, compress the log, etc.
+    math(EXPR EXTENDED_TIMEOUT "${ARG_TIMEOUT} + 30")
+
+    # Add the configured timeout to the environment for the test wrapper.
+    get_test_property(${TARGET} ENVIRONMENT CUR_TEST_ENV)
+    if(NOT CUR_TEST_ENV)
+      set(CUR_TEST_ENV "")
+    endif()
+    list(APPEND CUR_TEST_ENV "KUDU_TEST_TIMEOUT=${ARG_TIMEOUT}")
+    list(APPEND CUR_TEST_ENV "GTEST_TOTAL_SHARDS=${ARG_NUM_SHARDS}")
+    list(APPEND CUR_TEST_ENV "GTEST_SHARD_INDEX=${SHARD_NUM}")
+    set_tests_properties(${TARGET} PROPERTIES
+      TIMEOUT ${EXTENDED_TIMEOUT}
+      ENVIRONMENT "${CUR_TEST_ENV}")
+  endforeach(SHARD_NUM)
 endfunction()
 
 # A wrapper for add_dependencies() that is compatible with NO_TESTS.
@@ -748,13 +851,17 @@ function(ADD_THIRDPARTY_LIB LIB_NAME)
   endif()
 endfunction()
 
-# Look in thirdparty prefix paths before anywhere else for system dependencies.
-set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_COMMON_DIR} ${CMAKE_PREFIX_PATH})
 if (${KUDU_USE_TSAN})
-  set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_TSAN_DIR} ${CMAKE_PREFIX_PATH})
+  set(THIRDPARTY_INSTALL_CURRENT_DIR ${THIRDPARTY_INSTALL_DIR}/tsan)
 else()
-  set(CMAKE_PREFIX_PATH ${THIRDPARTY_INSTALL_UNINSTRUMENTED_DIR} ${CMAKE_PREFIX_PATH})
+  set(THIRDPARTY_INSTALL_CURRENT_DIR ${THIRDPARTY_INSTALL_DIR}/uninstrumented)
 endif()
+
+# Look in thirdparty prefix paths before anywhere else for system dependencies.
+set(CMAKE_PREFIX_PATH
+    ${THIRDPARTY_INSTALL_COMMON_DIR}
+    ${THIRDPARTY_INSTALL_CURRENT_DIR}
+    ${CMAKE_PREFIX_PATH})
 
 ## Cyrus SASL
 find_package(CyrusSASL REQUIRED)
@@ -762,6 +869,13 @@ include_directories(SYSTEM ${CYRUS_SASL_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(cyrus_sasl
   SHARED_LIB "${CYRUS_SASL_SHARED_LIB}"
   DEPS ${CYRUS_SASL_LIB_DEPS})
+
+## GSSAPI
+find_package(GSSAPI REQUIRED)
+include_directories(SYSTEM ${GSSAPI_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(gssapi_krb5
+  SHARED_LIB "${GSSAPI_SHARED_LIB}"
+  DEPS ${GSSAPI_LIB_DEPS})
 
 ## GLog
 find_package(GLog REQUIRED)
@@ -805,9 +919,23 @@ ADD_THIRDPARTY_LIB(protobuf
   SHARED_LIB "${PROTOBUF_SHARED_LIBRARY}")
 ADD_THIRDPARTY_LIB(protoc
   STATIC_LIB "${PROTOBUF_PROTOC_STATIC_LIBRARY}"
-  SHARED_LIB "${PROTOBUF_PROTOC_LIBRARY}"
+  SHARED_LIB "${PROTOBUF_PROTOC_SHARED_LIBRARY}"
   DEPS protobuf)
 find_package(KRPC REQUIRED)
+
+## Thrift
+find_package(Thrift REQUIRED)
+include_directories(SYSTEM ${THRIFT_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(thrift
+  STATIC_LIB "${THRIFT_STATIC_LIBRARY}"
+  SHARED_LIB "${THRIFT_SHARED_LIBRARY}")
+
+# The mini-HMS relies on JAVA_HOME being set in order to run the HMS, and
+# JDK 1.7 or later for compiling the Kudu metastore plugin.
+find_package(JavaHome REQUIRED)
+find_package(Java 1.7 REQUIRED)
+# Defines the add_jar() CMake command.
+include(UseJava)
 
 ## Snappy
 find_package(Snappy REQUIRED)
@@ -846,6 +974,12 @@ include_directories(SYSTEM ${SQUEASEL_INCLUDE_DIR})
 ADD_THIRDPARTY_LIB(squeasel
   STATIC_LIB "${SQUEASEL_STATIC_LIB}")
 
+## Mustache
+find_package(Mustache REQUIRED)
+include_directories(SYSTEM ${MUSTACHE_INCLUDE_DIR})
+ADD_THIRDPARTY_LIB(mustache
+  STATIC_LIB "${MUSTACHE_STATIC_LIB}")
+
 ## OpenSSL
 ##
 ## Version 1.0.0 or higher is required because we are using the following
@@ -863,8 +997,7 @@ ADD_THIRDPARTY_LIB(squeasel
 ## binary in thirdparty (deposited there by thirdparty/install-openssl-el6-workaround.sh)
 ## then we'll use that one. See that script for more information.
 set(CENTOS_6_4_OPENSSL_DIR "${THIRDPARTY_INSTALL_DIR}/openssl-el6-workaround/usr/")
-if (NOT "${OPENSSL_ROOT_DIR}" AND
-    EXISTS "${CENTOS_6_4_OPENSSL_DIR}")
+if (NOT OPENSSL_ROOT_DIR AND EXISTS "${CENTOS_6_4_OPENSSL_DIR}")
   set(OPENSSL_ROOT_DIR "${CENTOS_6_4_OPENSSL_DIR}")
 endif()
 find_package(OpenSSL 1.0.0 REQUIRED)
@@ -989,10 +1122,58 @@ ADD_THIRDPARTY_LIB(boost_date_time
     SHARED_LIB "${BOOST_DATE_TIME_SHARED_LIB}")
 
 ############################################################
+# Enable sized deallocation where supported.
+# This happens down here instead of up with the rest of the
+# compiler options since we only do this when tcmalloc was
+# found and enabled.
+############################################################
+
+# On OS X 10.12 (El Capitan), sized-deallocation symbols are missing
+# in the libc++ library for some reason.
+if (APPLE)
+  get_filename_component(SIZED_DEALLOCATION_TEST_TCMALLOC_LIBDIR
+    ${TCMALLOC_STATIC_LIB} DIRECTORY)
+  execute_process(
+    COMMAND printf
+      "#include <new>\nint main(){(::operator delete)(0,256);return 0;}\n"
+    COMMAND ${CMAKE_CXX_COMPILER}
+      -x c++ -fsized-deallocation -O0 -fno-builtin
+      -L${SIZED_DEALLOCATION_TEST_TCMALLOC_LIBDIR} -ltcmalloc -o /dev/null -
+    RESULT_VARIABLE SIZED_DEALLOCATION_TEST_RESULT OUTPUT_QUIET ERROR_QUIET)
+  if (${SIZED_DEALLOCATION_TEST_RESULT} EQUAL 0)
+    set(COMPILER_SUPPORTS_SIZED_DEALLOCATION TRUE)
+  endif()
+else()
+  if (KUDU_TCMALLOC_AVAILABLE AND
+      (("${COMPILER_FAMILY}" STREQUAL "clang" AND
+        "${COMPILER_VERSION}" VERSION_GREATER "3.7") OR
+       ("${COMPILER_FAMILY}" STREQUAL "gcc" AND
+        "${COMPILER_VERSION}" VERSION_GREATER "5.0")))
+    set(COMPILER_SUPPORTS_SIZED_DEALLOCATION TRUE)
+  endif()
+endif()
+
+if(COMPILER_SUPPORTS_SIZED_DEALLOCATION)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fsized-deallocation")
+  message("sized-deallocation is ENABLED")
+else()
+  message("sized-deallocation is DISABLED")
+endif()
+
+############################################################
 # Linker setup
 ############################################################
 set(KUDU_MIN_TEST_LIBS kudu_test_main kudu_test_util ${KUDU_BASE_LIBS})
 set(KUDU_TEST_LINK_LIBS ${KUDU_MIN_TEST_LIBS})
+
+# Use "thin archives" for our static libraries. We only use static libraries
+# internal to our own build, so thin ones are just as good and much smaller.
+if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+  set(CMAKE_CXX_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  set(CMAKE_C_ARCHIVE_CREATE "<CMAKE_AR> qcT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  set(CMAKE_CXX_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+  set(CMAKE_C_ARCHIVE_APPEND "<CMAKE_AR> qT <TARGET> <LINK_FLAGS> <OBJECTS>")
+endif()
 
 ############################################################
 # "make ctags" target
@@ -1037,6 +1218,36 @@ if (UNIX)
   # Incremental lint - only checks files changed since the last
   # merged upstream commit
   add_custom_target(ilint ${BUILD_SUPPORT_DIR}/lint.sh -c)
+endif (UNIX)
+
+############################################################
+# "make pb-gen": generate all protobuf source/header files
+############################################################
+if (UNIX)
+  add_custom_target(pb-gen)
+endif (UNIX)
+
+############################################################
+# "make krpc-gen": generate all KRPC source/header files
+############################################################
+if (UNIX)
+  add_custom_target(krpc-gen)
+endif (UNIX)
+
+############################################################
+# "make iwyu" target
+############################################################
+if (UNIX)
+  add_custom_target(iwyu ${BUILD_SUPPORT_DIR}/iwyu/iwyu.sh)
+  add_dependencies(iwyu pb-gen krpc-gen)
+endif (UNIX)
+
+############################################################
+# "make tidy" target
+############################################################
+if (UNIX)
+  add_custom_target(tidy ${BUILD_SUPPORT_DIR}/tidy.sh)
+  add_dependencies(tidy pb-gen krpc-gen)
 endif (UNIX)
 
 ############################################################
@@ -1095,10 +1306,10 @@ endif (UNIX)
 if (UNIX)
   if (NOT DOXYGEN_FOUND)
     add_custom_target(site
-      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh --no-doxygen)
   else ()
     add_custom_target(site
-      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh doxygen)
+      ${CMAKE_CURRENT_SOURCE_DIR}/docs/support/scripts/make_site.sh)
   endif ()
 endif (UNIX)
 
@@ -1109,6 +1320,7 @@ endif (UNIX)
 add_subdirectory(src/kudu/benchmarks)
 add_subdirectory(src/kudu/cfile)
 add_subdirectory(src/kudu/client)
+add_subdirectory(src/kudu/clock)
 add_subdirectory(src/kudu/codegen)
 add_subdirectory(src/kudu/common)
 add_subdirectory(src/kudu/consensus)
@@ -1116,13 +1328,15 @@ add_subdirectory(src/kudu/experiments)
 add_subdirectory(src/kudu/fs)
 # Google util libraries borrowed from supersonic, tcmalloc, Chromium, etc.
 add_subdirectory(src/kudu/gutil)
+add_subdirectory(src/kudu/hms)
 add_subdirectory(src/kudu/integration-tests)
+add_subdirectory(src/kudu/kserver)
 add_subdirectory(src/kudu/master)
+add_subdirectory(src/kudu/mini-cluster)
 add_subdirectory(src/kudu/rpc)
 add_subdirectory(src/kudu/security)
 add_subdirectory(src/kudu/server)
 add_subdirectory(src/kudu/tablet)
 add_subdirectory(src/kudu/tools)
 add_subdirectory(src/kudu/tserver)
-add_subdirectory(src/kudu/twitter-demo)
 add_subdirectory(src/kudu/util)

@@ -17,11 +17,16 @@
 #ifndef KUDU_UTIL_MONOTIME_H
 #define KUDU_UTIL_MONOTIME_H
 
+// NOTE: using stdint.h instead of cstdint because this file is supposed
+//       to be processed by a compiler lacking C++11 support.
 #include <stdint.h>
+
 #include <string>
 
 #ifdef KUDU_HEADERS_NO_STUBS
 #include <gtest/gtest_prod.h>
+
+#include "kudu/gutil/port.h"
 #else
 // This is a poor module interdependency, but the stubs are header-only and
 // it's only for exported header builds, so we'll make an exception.
@@ -30,11 +35,9 @@
 
 #include "kudu/util/kudu_export.h"
 
-struct timeval;
-struct timespec;
+struct timeval;   // IWYU pragma: keep
 
 namespace kudu {
-class MonoTime;
 
 /// @brief A representation of a time interval.
 ///
@@ -173,7 +176,8 @@ class KUDU_EXPORT MonoTime {
   /// @param [in] b
   ///   The second MonoTime object to select from.
   /// @return The earliest (minimum) of the two monotimes.
-  static const MonoTime& Earliest(const MonoTime& a, const MonoTime& b);
+  static const MonoTime& Earliest(const MonoTime& a, const MonoTime& b)
+      ATTRIBUTE_DEPRECATED("use std::min() instead");
 
   /// Build a MonoTime object. The resulting object is not initialized
   /// and not ready to use.

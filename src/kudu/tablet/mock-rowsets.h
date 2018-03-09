@@ -22,6 +22,7 @@
 #include <string>
 #include <vector>
 
+#include "kudu/common/timestamp.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/rowset.h"
 #include "kudu/tablet/rowset_metadata.h"
@@ -67,7 +68,7 @@ class MockRowSet : public RowSet {
     LOG(FATAL) << "Unimplemented";
     return "";
   }
-  virtual Status DebugDump(vector<std::string> *lines = NULL) OVERRIDE {
+  virtual Status DebugDump(std::vector<std::string> *lines = NULL) OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }
@@ -75,13 +76,28 @@ class MockRowSet : public RowSet {
     LOG(FATAL) << "Unimplemented";
     return Status::OK();
   }
-  virtual uint64_t EstimateOnDiskSize() const OVERRIDE {
+  virtual uint64_t OnDiskSize() const OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return 0;
+  }
+  virtual uint64_t OnDiskBaseDataSize() const OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return 0;
+  }
+  virtual uint64_t OnDiskBaseDataSizeWithRedos() const OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return 0;
   }
   virtual std::mutex *compact_flush_lock() OVERRIDE {
     LOG(FATAL) << "Unimplemented";
     return NULL;
+  }
+  virtual bool has_been_compacted() const OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
+    return false;
+  }
+  virtual void set_has_been_compacted() OVERRIDE {
+    LOG(FATAL) << "Unimplemented";
   }
   virtual std::shared_ptr<RowSetMetadata> metadata() OVERRIDE {
     return NULL;
@@ -148,7 +164,7 @@ class MockRowSet : public RowSet {
 class MockDiskRowSet : public MockRowSet {
  public:
   MockDiskRowSet(std::string first_key, std::string last_key,
-                 int size = 1000000)
+                 uint64_t size = 1000000)
       : first_key_(std::move(first_key)),
         last_key_(std::move(last_key)),
         size_(size) {}
@@ -160,7 +176,15 @@ class MockDiskRowSet : public MockRowSet {
     return Status::OK();
   }
 
-  virtual uint64_t EstimateOnDiskSize() const OVERRIDE {
+  virtual uint64_t OnDiskSize() const OVERRIDE {
+    return size_;
+  }
+
+  virtual uint64_t OnDiskBaseDataSize() const OVERRIDE {
+    return size_;
+  }
+
+  virtual uint64_t OnDiskBaseDataSizeWithRedos() const OVERRIDE {
     return size_;
   }
 

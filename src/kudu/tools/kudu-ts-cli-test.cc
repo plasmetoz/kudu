@@ -15,24 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <memory>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/tools/tool_test_util.h"
-#include "kudu/util/path_util.h"
-#include "kudu/util/subprocess.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 
 using kudu::itest::TabletServerMap;
 using kudu::itest::TServerDetails;
 using strings::Split;
 using strings::Substitute;
+using std::string;
+using std::vector;
 
 namespace kudu {
 namespace tools {
@@ -62,19 +73,18 @@ TEST_F(KuduTsCliTest, TestDeleteTablet) {
                                             tablet_id, timeout));
   }
   string out;
-  ASSERT_OK(Subprocess::Call({
-    GetKuduCtlAbsolutePath(),
+  ASSERT_OK(RunKuduTool({
     "remote_replica",
     "delete",
     cluster_->tablet_server(0)->bound_rpc_addr().ToString(),
     tablet_id,
     "Deleting for kudu-ts-cli-test"
-  }, "", &out));
+  }, &out));
   ASSERT_EQ("", out);
 
   ASSERT_OK(inspect_->WaitForTabletDataStateOnTS(0, tablet_id, { tablet::TABLET_DATA_TOMBSTONED }));
   TServerDetails* ts = ts_map_[cluster_->tablet_server(0)->uuid()];
-  ASSERT_OK(itest::WaitUntilTabletInState(ts, tablet_id, tablet::SHUTDOWN, timeout));
+  ASSERT_OK(itest::WaitUntilTabletInState(ts, tablet_id, tablet::STOPPED, timeout));
 }
 
 // Test dumping a tablet using kudu-ts-cli tool.
@@ -101,13 +111,12 @@ TEST_F(KuduTsCliTest, TestDumpTablet) {
 
   string out;
   // Test for dump_tablet when there is no data in tablet.
-  ASSERT_OK(Subprocess::Call({
-    GetKuduCtlAbsolutePath(),
+  ASSERT_OK(RunKuduTool({
     "remote_replica",
     "dump",
     cluster_->tablet_server(0)->bound_rpc_addr().ToString(),
     tablet_id
-  }, "", &out));
+  }, &out));
   ASSERT_EQ("", out);
 
   // Insert very little data and dump_tablet again.
@@ -117,13 +126,12 @@ TEST_F(KuduTsCliTest, TestDumpTablet) {
   }
   workload.StopAndJoin();
   ASSERT_OK(WaitForServersToAgree(timeout, ts_map_, tablet_id, workload.batches_completed()));
-  ASSERT_OK(Subprocess::Call({
-    GetKuduCtlAbsolutePath(),
+  ASSERT_OK(RunKuduTool({
     "remote_replica",
     "dump",
     cluster_->tablet_server(0)->bound_rpc_addr().ToString(),
     tablet_id
-  }, "", &out));
+  }, &out));
 
   // Split the output into multiple rows and check format of each row,
   // and also check total number of rows are at least kNumRows.
@@ -132,7 +140,7 @@ TEST_F(KuduTsCliTest, TestDumpTablet) {
   for (const auto& row : rows) {
     ASSERT_STR_MATCHES(row, "int32 key=");
     ASSERT_STR_MATCHES(row, "int32 int_val=");
-    ASSERT_STR_MATCHES(row, R"(string string_val="hello world")");
+    ASSERT_STR_MATCHES(row, "string string_val=");
     nrows++;
   }
   ASSERT_GE(nrows, kNumRows);

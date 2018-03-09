@@ -25,16 +25,19 @@
 
 #include <glog/logging.h>
 
-#include "kudu/client/client.h"
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
 #include "kudu/client/row_result.h"
+#include "kudu/client/value.h"
+#include "kudu/client/write_op.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
-#include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
-#include "kudu/server/hybrid_clock.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/blocking_queue.h"
@@ -56,7 +59,7 @@ static const int64_t kSnapshotAtNow = -1;
 static const int64_t kNoParticularCountExpected = -1;
 
 // Vector of snapshot timestamp, count pairs.
-typedef vector<pair<uint64_t, int64_t> > SnapsAndCounts;
+typedef std::vector<std::pair<uint64_t, int64_t> > SnapsAndCounts;
 
 // Provides methods for writing data and reading it back in such a way that
 // facilitates checking for data integrity.
@@ -204,6 +207,7 @@ class LinkedListChainGenerator {
   // 'chain_idx' is a unique ID for this chain. Chains with different indexes
   // will always generate distinct sets of keys (thus avoiding the possibility of
   // a collision even in a longer run).
+  ATTRIBUTE_NO_SANITIZE_INTEGER
   explicit LinkedListChainGenerator(int chain_idx)
     : chain_idx_(chain_idx),
       rand_(chain_idx * 0xDEADBEEF),
@@ -302,27 +306,30 @@ class ScopedRowUpdater {
 // linked list test.
 class PeriodicWebUIChecker {
  public:
-  PeriodicWebUIChecker(const ExternalMiniCluster& cluster,
+  PeriodicWebUIChecker(const cluster::ExternalMiniCluster& cluster,
                        const std::string& tablet_id, MonoDelta period)
-      : period_(std::move(period)), is_running_(true) {
+      : period_(period), is_running_(true) {
     // List of master and ts web pages to fetch
-    vector<std::string> master_pages, ts_pages;
+    std::vector<std::string> master_pages, ts_pages;
 
-    master_pages.push_back("/metrics");
-    master_pages.push_back("/masters");
-    master_pages.push_back("/tables");
-    master_pages.push_back("/dump-entities");
-    master_pages.push_back("/tablet-servers");
-    master_pages.push_back("/mem-trackers");
+    master_pages.emplace_back("/dump-entities");
+    master_pages.emplace_back("/masters");
+    master_pages.emplace_back("/mem-trackers");
+    master_pages.emplace_back("/metrics");
+    master_pages.emplace_back("/stacks");
+    master_pages.emplace_back("/tables");
+    master_pages.emplace_back("/tablet-servers");
 
-    ts_pages.push_back("/metrics");
-    ts_pages.push_back("/tablets");
+    ts_pages.emplace_back("/maintenance-manager");
+    ts_pages.emplace_back("/mem-trackers");
+    ts_pages.emplace_back("/metrics");
+    ts_pages.emplace_back("/scans");
+    ts_pages.emplace_back("/stacks");
+    ts_pages.emplace_back("/tablets");
     if (!tablet_id.empty()) {
       ts_pages.push_back(strings::Substitute("/transactions?tablet_id=$0",
                                              tablet_id));
     }
-    ts_pages.push_back("/maintenance-manager");
-    ts_pages.push_back("/mem-trackers");
 
     // Generate list of urls for each master and tablet server
     for (int i = 0; i < cluster.num_masters(); i++) {
@@ -356,6 +363,8 @@ class PeriodicWebUIChecker {
  private:
   void CheckThread() {
     EasyCurl curl;
+    // Set some timeout so that if the page deadlocks, we fail the test.
+    curl.set_timeout(MonoDelta::FromSeconds(120));
     faststring dst;
     LOG(INFO) << "Curl thread will poll the following URLs every " << period_.ToMilliseconds()
         << " ms: ";
@@ -366,9 +375,11 @@ class PeriodicWebUIChecker {
       // Poll all of the URLs.
       const MonoTime start = MonoTime::Now();
       for (const auto& url : urls_) {
-        if (curl.FetchURL(url, &dst).ok()) {
+        Status s = curl.FetchURL(url, &dst);
+        if (s.ok()) {
           CHECK_GT(dst.length(), 0);
         }
+        CHECK(!s.IsTimedOut()) << "timed out fetching url " << url;
       }
       // Sleep until the next period
       const MonoDelta elapsed = MonoTime::Now() - start;
@@ -382,7 +393,7 @@ class PeriodicWebUIChecker {
   const MonoDelta period_;
   AtomicBool is_running_;
   scoped_refptr<Thread> checker_;
-  vector<std::string> urls_;
+  std::vector<std::string> urls_;
 };
 
 // Helper class to hold results from a linked list scan and perform the
@@ -433,7 +444,7 @@ std::vector<const KuduPartialRow*> LinkedListTester::GenerateSplitRows(
 }
 
 std::vector<int64_t> LinkedListTester::GenerateSplitInts() {
-  vector<int64_t> ret;
+  std::vector<int64_t> ret;
   ret.reserve(num_tablets_ - 1);
   int64_t increment = kint64max / num_tablets_;
   for (int64_t i = 1; i < num_tablets_; i++) {
@@ -495,8 +506,7 @@ Status LinkedListTester::LoadLinkedList(
     MonoTime now = MonoTime::Now();
     if (next_sample < now) {
       Timestamp now(client_->GetLatestObservedTimestamp());
-      sampled_timestamps_and_counts_.push_back(
-          pair<uint64_t,int64_t>(now.ToUint64() + 1, *written_count));
+      sampled_timestamps_and_counts_.emplace_back(now.ToUint64() + 1, *written_count);
       next_sample += sample_interval;
       LOG(INFO) << "Sample at HT timestamp: " << now.ToString()
                 << " Inserted count: " << *written_count;
@@ -566,7 +576,7 @@ void LinkedListTester::DumpInsertHistogram(bool print_flags) {
 // If it does, *errors will be incremented once per duplicate and the given message
 // will be logged.
 static void VerifyNoDuplicateEntries(const std::vector<int64_t>& ints, int* errors,
-                                     const string& message) {
+                                     const std::string& message) {
   for (int i = 1; i < ints.size(); i++) {
     if (ints[i] == ints[i - 1]) {
       LOG(ERROR) << message << ": " << ints[i];
@@ -582,11 +592,11 @@ Status LinkedListTester::VerifyLinkedListRemote(
   client::sp::shared_ptr<client::KuduTable> table;
   RETURN_NOT_OK(client_->OpenTable(table_name_, &table));
 
-  string snapshot_str;
+  std::string snapshot_str;
   if (snapshot_timestamp == kSnapshotAtNow) {
     snapshot_str = "NOW";
   } else {
-    snapshot_str = server::HybridClock::StringifyTimestamp(Timestamp(snapshot_timestamp));
+    snapshot_str = clock::HybridClock::StringifyTimestamp(Timestamp(snapshot_timestamp));
   }
 
   client::KuduScanner scanner(table.get());
@@ -671,7 +681,7 @@ Status LinkedListTester::VerifyLinkedListLocal(const tablet::Tablet* tablet,
                         "Cannot create new row iterator");
   RETURN_NOT_OK_PREPEND(iter->Init(NULL), "Cannot initialize row iterator");
 
-  Arena arena(1024, 1024);
+  Arena arena(1024);
   RowBlock block(projection, 100, &arena);
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
@@ -697,8 +707,9 @@ Status LinkedListTester::WaitAndVerify(int seconds_to_run,
                                        const boost::function<Status(const std::string&)>& cb,
                                        WaitAndVerifyMode mode) {
 
-  std::list<pair<int64_t, int64_t> > samples_as_list(sampled_timestamps_and_counts_.begin(),
-                                                     sampled_timestamps_and_counts_.end());
+  std::list<std::pair<int64_t, int64_t>> samples_as_list(
+      sampled_timestamps_and_counts_.begin(),
+      sampled_timestamps_and_counts_.end());
 
   int64_t seen = 0;
   bool called = false;

@@ -20,6 +20,7 @@ package org.apache.kudu.client;
 import static org.apache.kudu.client.ExternalConsistencyMode.CLIENT_PROPAGATED;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -38,13 +39,13 @@ import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Range;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.jboss.netty.util.Timeout;
 import org.jboss.netty.util.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.util.AsyncUtil;
 import org.apache.kudu.util.Slice;
 
@@ -342,7 +343,9 @@ public class AsyncKuduSession implements SessionConfiguration {
       // Group the operations by tablet.
       Map<Slice, Batch> batches = new HashMap<>();
       List<OperationResponse> opsFailedInLookup = new ArrayList<>();
+      List<Integer> opsFailedIndexesList = new ArrayList<>();
 
+      int currentIndex = 0;
       for (BufferedOperation bufferedOp : buffer.getOperations()) {
         Operation operation = bufferedOp.getOperation();
         if (bufferedOp.tabletLookupFailed()) {
@@ -366,6 +369,7 @@ public class AsyncKuduSession implements SessionConfiguration {
           }
           operation.callback(response);
           opsFailedInLookup.add(response);
+          opsFailedIndexesList.add(currentIndex++);
           continue;
         }
         LocatedTablet tablet = bufferedOp.getTablet();
@@ -376,12 +380,13 @@ public class AsyncKuduSession implements SessionConfiguration {
           batch = new Batch(operation.getTable(), tablet, ignoreAllDuplicateRows);
           batches.put(tabletId, batch);
         }
-        batch.add(operation);
+        batch.add(operation, currentIndex++);
       }
 
       List<Deferred<BatchResponse>> batchResponses = new ArrayList<>(batches.size() + 1);
       if (!opsFailedInLookup.isEmpty()) {
-        batchResponses.add(Deferred.fromResult(new BatchResponse(opsFailedInLookup)));
+        batchResponses.add(
+            Deferred.fromResult(new BatchResponse(opsFailedInLookup, opsFailedIndexesList)));
       }
 
       for (Batch batch : batches.values()) {
@@ -479,12 +484,18 @@ public class AsyncKuduSession implements SessionConfiguration {
         size += batchResponse.getIndividualResponses().size();
       }
 
-      ArrayList<OperationResponse> responses = new ArrayList<>(size);
+      OperationResponse[] responses = new OperationResponse[size];
       for (BatchResponse batchResponse : batchResponses) {
-        responses.addAll(batchResponse.getIndividualResponses());
+        List<OperationResponse> responseList = batchResponse.getIndividualResponses();
+        List<Integer> indexList = batchResponse.getResponseIndexes();
+        for (int i = 0; i < indexList.size(); i++) {
+          int index = indexList.get(i);
+          assert responses[index] == null;
+          responses[index] = responseList.get(i);
+        }
       }
 
-      return responses;
+      return Arrays.asList(responses);
     }
 
     @Override
@@ -530,7 +541,18 @@ public class AsyncKuduSession implements SessionConfiguration {
       }
       operation.setExternalConsistencyMode(this.consistencyMode);
       operation.setIgnoreAllDuplicateRows(ignoreAllDuplicateRows);
+
+      // Add a callback to update the propagated timestamp returned from the server.
+      Callback<Deferred<OperationResponse>, OperationResponse> cb =
+        new Callback<Deferred<OperationResponse>, OperationResponse>() {
+          @Override
+          public Deferred<OperationResponse> call(OperationResponse resp) throws Exception {
+            client.updateLastPropagatedTimestamp(resp.getWriteTimestampRaw());
+            return Deferred.fromResult(resp);
+          }
+        };
       return client.sendRpcToTablet(operation)
+          .addCallbackDeferring(cb)
           .addErrback(new SingleOperationErrCallback(operation));
     }
 
@@ -543,6 +565,7 @@ public class AsyncKuduSession implements SessionConfiguration {
     Buffer fullBuffer = null;
     try {
       synchronized (monitor) {
+        Deferred<Void> notification = flushNotification.get();
         if (activeBuffer == null) {
           // If the active buffer is null then we recently flushed. Check if there
           // is an inactive buffer available to replace as the active.
@@ -554,7 +577,7 @@ public class AsyncKuduSession implements SessionConfiguration {
             // This can happen if the user writes into a buffer, flushes it, writes
             // into the second, flushes it, and immediately tries to write again.
             throw new PleaseThrottleException(statusServiceUnavailable,
-                                              null, operation, flushNotification.get());
+                                              null, operation, notification);
           }
         }
 
@@ -582,7 +605,7 @@ public class AsyncKuduSession implements SessionConfiguration {
               Status statusServiceUnavailable =
                   Status.ServiceUnavailable("All buffers are currently flushing");
               throw new PleaseThrottleException(statusServiceUnavailable,
-                                                null, operation, flushNotification.get());
+                                                null, operation, notification);
             }
           }
 
@@ -600,7 +623,7 @@ public class AsyncKuduSession implements SessionConfiguration {
                   Status.ServiceUnavailable("The previous buffer hasn't been flushed and the " +
                       "current buffer is over the low watermark, please retry later");
               throw new PleaseThrottleException(statusServiceUnavailable,
-                                                null, operation, flushNotification.get());
+                                                null, operation, notification);
             }
           }
 
@@ -678,6 +701,7 @@ public class AsyncKuduSession implements SessionConfiguration {
    */
   private void addBatchCallbacks(final Batch request) {
     final class BatchCallback implements Callback<BatchResponse, BatchResponse> {
+      @Override
       public BatchResponse call(final BatchResponse response) {
         LOG.trace("Got a Batch response for {} rows", request.operations.size());
         if (response.getWriteTimestamp() != 0) {
@@ -734,7 +758,7 @@ public class AsyncKuduSession implements SessionConfiguration {
         // Note that returning an object that's not an exception will make us leave the
         // errback chain. Effectively, the BatchResponse below will end up as part of the list
         // passed to ConvertBatchToListOfResponsesCB.
-        return handleKuduException ? new BatchResponse(responses) : e;
+        return handleKuduException ? new BatchResponse(responses, request.operationIndexes) : e;
       }
 
       @Override
@@ -774,6 +798,7 @@ public class AsyncKuduSession implements SessionConfiguration {
    * {@link FlushMode#AUTO_FLUSH_BACKGROUND}.
    */
   private final class FlusherTask implements TimerTask {
+    @Override
     public void run(final Timeout timeout) {
       Buffer buffer = null;
       synchronized (monitor) {

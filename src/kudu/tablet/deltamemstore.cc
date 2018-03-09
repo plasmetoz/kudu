@@ -15,24 +15,38 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstring>
+#include <ostream>
 #include <utility>
 
-#include "kudu/consensus/consensus.pb.h"
+#include <glog/logging.h>
+
+#include "kudu/common/columnblock.h"
+#include "kudu/common/row.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/types.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/deltafile.h"
 #include "kudu/tablet/deltamemstore.h"
-#include "kudu/tablet/delta_tracker.h"
+#include "kudu/tablet/mutation.h"
 #include "kudu/tablet/mvcc.h"
-#include "kudu/tablet/tablet.h"
-#include "kudu/util/hexdump.h"
-#include "kudu/util/mem_tracker.h"
+#include "kudu/util/debug-util.h"
+#include "kudu/util/memcmpable_varint.h"
+#include "kudu/util/memory/memory.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 namespace tablet {
 
 using log::LogAnchorRegistry;
+using std::string;
 using std::shared_ptr;
+using std::vector;
 using strings::Substitute;
 
 ////////////////////////////////////////////////////////////
@@ -40,7 +54,6 @@ using strings::Substitute;
 ////////////////////////////////////////////////////////////
 
 static const int kInitialArenaSize = 16;
-static const int kMaxArenaBufferSize = 5*1024*1024;
 
 Status DeltaMemStore::Create(int64_t id,
                              int64_t rs_id,
@@ -63,8 +76,7 @@ DeltaMemStore::DeltaMemStore(int64_t id,
     rs_id_(rs_id),
     allocator_(new MemoryTrackingBufferAllocator(
         HeapBufferAllocator::Get(), std::move(parent_tracker))),
-    arena_(new ThreadSafeMemoryTrackingArena(
-        kInitialArenaSize, kMaxArenaBufferSize, allocator_)),
+    arena_(new ThreadSafeMemoryTrackingArena(kInitialArenaSize, allocator_)),
     tree_(arena_),
     anchorer_(log_anchor_registry,
               Substitute("Rowset-$0/DeltaMemStore-$1", rs_id_, id_)),
@@ -278,7 +290,7 @@ Status DMSIterator::PrepareBatch(size_t nrows, PrepareFlag flag) {
           // just overwrite that one.
           if (updates_by_col_[col_idx].empty() ||
               updates_by_col_[col_idx].back().row_id != key.row_idx()) {
-            updates_by_col_[col_idx].push_back(ColumnUpdate());
+            updates_by_col_[col_idx].emplace_back();
           }
 
           ColumnUpdate& cu = updates_by_col_[col_idx].back();

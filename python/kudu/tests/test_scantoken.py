@@ -53,8 +53,10 @@ class TestScanToken(TestScanBase):
         # Begin process pool
         pool = Pool(len(input))
         results = pool.map(_get_scan_token_results, input)
+        pool.close()
+        pool.join()
 
-        #Validate results
+        # Validate results
         actual_tuples = []
         for result in results:
             actual_tuples += result
@@ -239,6 +241,10 @@ class TestScanToken(TestScanBase):
     def test_unixtime_micros_pred(self):
         # Test unixtime_micros value predicate
         self._test_unixtime_micros_pred()
+
+    def test_decimal_pred(self):
+        # Test decimal value predicate
+        self._test_decimal_pred()
 
     def test_bool_pred(self):
         # Test a boolean value predicate

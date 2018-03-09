@@ -18,22 +18,26 @@
 #include "kudu/util/env_util.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <cerrno>
+#include <ctime>
 #include <memory>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/strings/numbers.h"
-#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
-#include "kudu/util/debug-util.h"
 #include "kudu/util/env.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 
@@ -66,9 +70,11 @@ TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, unsafe);
 TAG_FLAG(disk_reserved_override_prefix_1_bytes_free_for_testing, runtime);
 TAG_FLAG(disk_reserved_override_prefix_2_bytes_free_for_testing, runtime);
 
+using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
@@ -153,42 +159,6 @@ Status VerifySufficientDiskSpace(Env *env, const std::string& path,
   return Status::OK();
 }
 
-Status ReadFully(RandomAccessFile* file, uint64_t offset, size_t n,
-                 Slice* result, uint8_t* scratch) {
-
-  bool first_read = true;
-
-  int rem = n;
-  uint8_t* dst = scratch;
-  while (rem > 0) {
-    Slice this_result;
-    RETURN_NOT_OK(file->Read(offset, rem, &this_result, dst));
-    DCHECK_LE(this_result.size(), rem);
-    if (this_result.size() == 0) {
-      // EOF
-      return Status::IOError(Substitute("EOF trying to read $0 bytes at offset $1",
-                                        n, offset));
-    }
-
-    if (first_read && this_result.size() == n) {
-      // If it's the first read, we can return a zero-copy array.
-      *result = this_result;
-      return Status::OK();
-    }
-    first_read = false;
-
-    // Otherwise, we're going to have to do more reads and stitch
-    // each read together.
-    this_result.relocate(dst);
-    dst += this_result.size();
-    rem -= this_result.size();
-    offset += this_result.size();
-  }
-  DCHECK_EQ(0, rem);
-  *result = Slice(scratch, n);
-  return Status::OK();
-}
-
 Status CreateDirIfMissing(Env* env, const string& path, bool* created) {
   Status s = env->CreateDir(path);
   if (created != nullptr) {
@@ -235,8 +205,8 @@ Status CopyFile(Env* env, const string& source_path, const string& dest_path,
   uint64_t bytes_read = 0;
   while (bytes_read < size) {
     uint64_t max_bytes_to_read = std::min<uint64_t>(size - bytes_read, kBufferSize);
-    Slice data;
-    RETURN_NOT_OK(source->Read(max_bytes_to_read, &data, scratch.get()));
+    Slice data(scratch.get(), max_bytes_to_read);
+    RETURN_NOT_OK(source->Read(&data));
     RETURN_NOT_OK(dest->Append(data));
     bytes_read += data.size();
   }
@@ -274,26 +244,76 @@ Status DeleteExcessFilesByPattern(Env* env, const string& pattern, int max_match
   return Status::OK();
 }
 
-ScopedFileDeleter::ScopedFileDeleter(Env* env, std::string path)
-    : env_(DCHECK_NOTNULL(env)), path_(std::move(path)), should_delete_(true) {}
-
-ScopedFileDeleter::~ScopedFileDeleter() {
-  if (should_delete_) {
-    bool is_dir;
-    Status s = env_->IsDirectory(path_, &is_dir);
-    WARN_NOT_OK(s, Substitute(
-        "Failed to determine if path is a directory: $0", path_));
-    if (!s.ok()) {
-      return;
-    }
-    if (is_dir) {
-      WARN_NOT_OK(env_->DeleteDir(path_),
-                  Substitute("Failed to remove directory: $0", path_));
-    } else {
-      WARN_NOT_OK(env_->DeleteFile(path_),
-          Substitute("Failed to remove file: $0", path_));
-    }
+// Callback for DeleteTmpFilesRecursively().
+//
+// Tests 'basename' for the Kudu-specific tmp file infix, and if found,
+// deletes the file.
+static Status DeleteTmpFilesRecursivelyCb(Env* env,
+                                          Env::FileType file_type,
+                                          const string& dirname,
+                                          const string& basename) {
+  if (file_type != Env::FILE_TYPE) {
+    // Skip directories.
+    return Status::OK();
   }
+
+  if (basename.find(kTmpInfix) != string::npos) {
+    string filename = JoinPathSegments(dirname, basename);
+    WARN_NOT_OK(env->DeleteFile(filename),
+                Substitute("Failed to remove temporary file $0", filename));
+  }
+  return Status::OK();
+}
+
+Status DeleteTmpFilesRecursively(Env* env, const string& path) {
+  return env->Walk(path, Env::PRE_ORDER, Bind(&DeleteTmpFilesRecursivelyCb, env));
+}
+
+Status IsDirectoryEmpty(Env* env, const string& path, bool* is_empty) {
+  vector<string> children;
+  RETURN_NOT_OK(env->GetChildren(path, &children));
+  for (const auto& c : children) {
+    if (c == "." || c == "..") {
+      continue;
+    }
+    *is_empty = false;
+    return Status::OK();
+  }
+  *is_empty = true;
+  return Status::OK();
+}
+
+Status SyncAllParentDirs(Env* env,
+                         const vector<string>& dirs,
+                         const vector<string>& files) {
+  // An unordered_set is used to deduplicate the set of directories.
+  unordered_set<string> to_sync;
+  for (const auto& d : dirs) {
+    to_sync.insert(DirName(d));
+  }
+  for (const auto& f : files) {
+    to_sync.insert(DirName(f));
+  }
+  for (const auto& d : to_sync) {
+    RETURN_NOT_OK_PREPEND(env->SyncDir(d),
+                          Substitute("unable to synchronize directory $0", d));
+  }
+  return Status::OK();
+}
+
+Status ListFilesInDir(Env* env,
+                      const string& path,
+                      vector<string>* entries) {
+  RETURN_NOT_OK(env->GetChildren(path, entries));
+  auto iter = entries->begin();
+  while (iter != entries->end()) {
+    if (*iter == "." || *iter == ".." || iter->find(kTmpInfix) != string::npos) {
+      iter = entries->erase(iter);
+      continue;
+    }
+    ++iter;
+  }
+  return Status::OK();
 }
 
 } // namespace env_util

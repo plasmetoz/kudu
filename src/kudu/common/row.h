@@ -17,13 +17,15 @@
 #ifndef KUDU_COMMON_ROW_H
 #define KUDU_COMMON_ROW_H
 
-#include <glog/logging.h>
+#include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
 
-#include "kudu/common/types.h"
+#include <glog/logging.h>
+
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/util/memory/arena.h"
@@ -186,20 +188,23 @@ class RowProjector {
 
   // Returns the mapping between base schema and projection schema columns
   // first: is the projection column index, second: is the base_schema  index
-  const vector<ProjectionIdxMapping>& base_cols_mapping() const { return base_cols_mapping_; }
-
+  const std::vector<ProjectionIdxMapping>& base_cols_mapping() const {
+    return base_cols_mapping_;
+  }
 
   // Returns the projection indexes of the columns to add with a default value.
   //
   // These are columns which are present in 'projection_' but not in 'base_schema',
   // and for which 'projection' has a default.
-  const vector<size_t>& projection_defaults() const { return projection_defaults_; }
+  const std::vector<size_t>& projection_defaults() const {
+    return projection_defaults_;
+  }
 
  private:
   friend class Schema;
 
   Status ProjectBaseColumn(size_t proj_col_idx, size_t base_col_idx) {
-    base_cols_mapping_.push_back(ProjectionIdxMapping(proj_col_idx, base_col_idx));
+    base_cols_mapping_.emplace_back(proj_col_idx, base_col_idx);
     return Status::OK();
   }
 
@@ -246,8 +251,8 @@ class RowProjector {
  private:
   DISALLOW_COPY_AND_ASSIGN(RowProjector);
 
-  vector<ProjectionIdxMapping> base_cols_mapping_;
-  vector<size_t> projection_defaults_;
+  std::vector<ProjectionIdxMapping> base_cols_mapping_;
+  std::vector<size_t> projection_defaults_;
 
   const Schema* base_schema_;
   const Schema* projection_;
@@ -338,8 +343,27 @@ class DeltaProjector {
 template <class RowType, class ArenaType>
 inline Status RelocateIndirectDataToArena(RowType *row, ArenaType *dst_arena) {
   const Schema* schema = row->schema();
-  // For any Slice columns, copy the sliced data into the arena
-  // and update the pointers
+  // First calculate the total size we'll need to allocate in the arena.
+  int size = 0;
+  for (int i = 0; i < schema->num_columns(); i++) {
+    typename RowType::Cell cell = row->cell(i);
+    if (cell.typeinfo()->physical_type() == BINARY) {
+      if (cell.is_nullable() && cell.is_null()) {
+        continue;
+      }
+
+      const Slice *slice = reinterpret_cast<const Slice *>(cell.ptr());
+      size += slice->size();
+    }
+  }
+  if (size == 0) return Status::OK();
+
+  // Then allocate it in one shot and copy the actual data.
+  // Even though Arena allocation is cheap, a row may have hundreds of
+  // small string columns and each operation is at least one CAS. With
+  // many concurrent threads copying into a single arena, this avoids
+  // a lot of contention.
+  uint8_t* dst = static_cast<uint8_t*>(dst_arena->AllocateBytes(size));
   for (int i = 0; i < schema->num_columns(); i++) {
     typename RowType::Cell cell = row->cell(i);
     if (cell.typeinfo()->physical_type() == BINARY) {
@@ -348,9 +372,8 @@ inline Status RelocateIndirectDataToArena(RowType *row, ArenaType *dst_arena) {
       }
 
       Slice *slice = reinterpret_cast<Slice *>(cell.mutable_ptr());
-      if (!dst_arena->RelocateSlice(*slice, slice)) {
-        return Status::IOError("Unable to relocate slice");
-      }
+      slice->relocate(dst);
+      dst += slice->size();
     }
   }
   return Status::OK();
@@ -542,7 +565,7 @@ class RowBuilder {
  public:
   explicit RowBuilder(const Schema& schema)
     : schema_(schema),
-      arena_(1024, 1024*1024),
+      arena_(1024),
       bitmap_size_(ContiguousRowHelper::null_bitmap_size(schema)) {
     Reset();
   }
@@ -569,7 +592,7 @@ class RowBuilder {
     AddSlice(slice);
   }
 
-  void AddString(const string &str) {
+  void AddString(const std::string &str) {
     CheckNextType(STRING);
     AddSlice(str);
   }
@@ -579,7 +602,7 @@ class RowBuilder {
     AddSlice(slice);
   }
 
-  void AddBinary(const string &str) {
+  void AddBinary(const std::string &str) {
     CheckNextType(BINARY);
     AddSlice(str);
   }
@@ -690,7 +713,7 @@ class RowBuilder {
     Advance();
   }
 
-  void AddSlice(const string &str) {
+  void AddSlice(const std::string &str) {
     uint8_t *in_arena = arena_.AddSlice(str);
     CHECK(in_arena) << "could not allocate space in arena";
 

@@ -18,14 +18,18 @@
 
 #include "kudu/gutil/macros.h"
 
+#include <cstdint>
+#include <ctime>
 #include <memory>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include <glog/logging.h>
 
-#include "kudu/util/locks.h"
+#include "kudu/util/condition_variable.h"
+#include "kudu/util/mutex.h"
 
 namespace kudu {
 
@@ -90,7 +94,7 @@ class AsyncLogger : public google::base::Logger {
   // Get the current LOG file size.
   // The returned value is approximate since some
   // logged data may not have been flushed to disk yet.
-  uint32 LogSize() override;
+  uint32_t LogSize() override;
 
   // Return a count of how many times an application thread was
   // blocked due to the buffers being full and the writer thread

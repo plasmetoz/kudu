@@ -17,11 +17,10 @@
 
 #include "kudu/util/async_logger.h"
 
-#include <algorithm>
 #include <string>
 #include <thread>
 
-#include "kudu/util/locks.h"
+#include "kudu/util/monotime.h"
 
 using std::string;
 
@@ -107,7 +106,7 @@ void AsyncLogger::Flush() {
   }
 }
 
-uint32 AsyncLogger::LogSize() {
+uint32_t AsyncLogger::LogSize() {
   return wrapped_->LogSize();
 }
 
@@ -115,7 +114,10 @@ void AsyncLogger::RunThread() {
   MutexLock l(lock_);
   while (state_ == RUNNING || active_buf_->needs_flush_or_write()) {
     while (!active_buf_->needs_flush_or_write() && state_ == RUNNING) {
-      wake_flusher_cond_.Wait();
+      if (!wake_flusher_cond_.TimedWait(MonoDelta::FromSeconds(FLAGS_logbufsecs))) {
+        // In case of wait timeout, force it to flush regardless whether there is anything enqueued.
+        active_buf_->flush = true;
+      }
     }
 
     active_buf_.swap(flushing_buf_);

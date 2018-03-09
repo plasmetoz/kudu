@@ -15,9 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/cfile/cfile_writer.h"
 #include "kudu/cfile/index_block.h"
+
+#include <cstdint>
+#include <ostream>
+#include <string>
+
+#include <glog/logging.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/coding-inl.h"
+#include "kudu/util/coding.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/protobuf_util.h"
 
@@ -146,7 +155,8 @@ Status IndexBlockReader::Parse(const Slice &data) {
   size_t max_size = trailer_size_ptr - data_.data();
   if (trailer_size <= 0 ||
       trailer_size > max_size) {
-    string err = strings::Substitute("invalid index block trailer size: $0", trailer_size);
+    std::string err = strings::Substitute(
+        "invalid index block trailer size: $0", trailer_size);
     return Status::Corruption(err);
   }
 
@@ -162,7 +172,7 @@ Status IndexBlockReader::Parse(const Slice &data) {
   key_offsets_ = trailer_ptr - sizeof(uint32_t) * trailer_.num_entries();
   CHECK(trailer_ptr >= data_.data());
 
-  VLOG(2) << "Parsed index trailer: " << SecureDebugString(trailer_);
+  VLOG(2) << "Parsed index trailer: " << pb_util::SecureDebugString(trailer_);
 
   parsed_ = true;
   return Status::OK();

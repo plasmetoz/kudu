@@ -24,10 +24,10 @@ import java.util.List;
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.protobuf.Message;
-import com.google.protobuf.ZeroCopyLiteralByteString;
+import com.google.protobuf.UnsafeByteOperations;
+import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.kudu.WireProtocol;
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.client.Statistics.Statistic;
 import org.apache.kudu.client.Statistics.TabletStatistics;
 import org.apache.kudu.tserver.Tserver;
@@ -43,6 +43,8 @@ class Batch extends KuduRpc<BatchResponse> {
 
   /** Holds batched operations. */
   final List<Operation> operations = new ArrayList<>();
+  /** Holds indexes of operations in the original user's batch. */
+  final List<Integer> operationIndexes = new ArrayList<>();
 
   /** The tablet this batch will be routed to. */
   private final LocatedTablet tablet;
@@ -75,7 +77,7 @@ class Batch extends KuduRpc<BatchResponse> {
     return this.rowOperationsSizeBytes;
   }
 
-  public void add(Operation operation) {
+  public void add(Operation operation, int index) {
     assert Bytes.memcmp(operation.partitionKey(),
                         tablet.getPartition().getPartitionKeyStart()) >= 0 &&
            (tablet.getPartition().getPartitionKeyEnd().length == 0 ||
@@ -83,6 +85,7 @@ class Batch extends KuduRpc<BatchResponse> {
                          tablet.getPartition().getPartitionKeyEnd()) < 0);
 
     operations.add(operation);
+    operationIndexes.add(index);
   }
 
   @Override
@@ -91,7 +94,7 @@ class Batch extends KuduRpc<BatchResponse> {
         Operation.createAndFillWriteRequestPB(operations);
     rowOperationsSizeBytes = builder.getRowOperations().getRows().size() +
                              builder.getRowOperations().getIndirectData().size();
-    builder.setTabletId(ZeroCopyLiteralByteString.wrap(getTablet().getTabletIdAsBytes()));
+    builder.setTabletId(UnsafeByteOperations.unsafeWrap(getTablet().getTabletIdAsBytes()));
     builder.setExternalConsistencyMode(externalConsistencyMode.pbVersion());
     return builder.build();
   }
@@ -127,7 +130,8 @@ class Batch extends KuduRpc<BatchResponse> {
     }
 
     BatchResponse response = new BatchResponse(deadlineTracker.getElapsedMillis(), tsUUID,
-                                               builder.getTimestamp(), errorsPB, operations);
+                                               builder.getTimestamp(), errorsPB, operations,
+                                               operationIndexes);
 
     if (injectedError != null) {
       if (injectedlatencyMs > 0) {

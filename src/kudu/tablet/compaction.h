@@ -17,20 +17,34 @@
 #ifndef KUDU_TABLET_COMPACTION_H
 #define KUDU_TABLET_COMPACTION_H
 
+#include <cstddef>
 #include <memory>
 #include <mutex>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include "kudu/common/generic_iterators.h"
-#include "kudu/common/iterator.h"
-#include "kudu/tablet/diskrowset.h"
-#include "kudu/tablet/memrowset.h"
+#include <glog/logging.h>
+
+#include "kudu/common/rowblock.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
+
+class Arena;
+class Schema;
+
 namespace tablet {
+
+class DiskRowSet;
+class MemRowSet;
+class Mutation;
+class MvccSnapshot;
+class RollingDiskRowSetWriter;
 struct CompactionInputRow;
-class WriteTransactionState;
 
 // Options related to tablet history garbage collection.
 class HistoryGcOpts {
@@ -100,11 +114,11 @@ class CompactionInput {
 
   // Create an input which merges several other compaction inputs. The inputs are merged
   // in key-order according to the given schema. All inputs must have matching schemas.
-  static CompactionInput *Merge(const vector<std::shared_ptr<CompactionInput> > &inputs,
+  static CompactionInput *Merge(const std::vector<std::shared_ptr<CompactionInput> > &inputs,
                                 const Schema *schema);
 
   virtual Status Init() = 0;
-  virtual Status PrepareBlock(vector<CompactionInputRow> *block) = 0;
+  virtual Status PrepareBlock(std::vector<CompactionInputRow> *block) = 0;
 
   // Returns the arena for this compaction input corresponding to the last
   // prepared block. This must be called *after* PrepareBlock() as if this
@@ -150,7 +164,7 @@ class RowSetsInCompaction {
 
  private:
   RowSetVector rowsets_;
-  vector<std::unique_lock<std::mutex>> locks_;
+  std::vector<std::unique_lock<std::mutex>> locks_;
 };
 
 // One row yielded by CompactionInput::PrepareBlock.
@@ -223,7 +237,7 @@ Status FlushCompactionInput(CompactionInput *input,
 //
 // After return of this function, this CompactionInput object is "used up" and will
 // yield no further rows.
-Status ReupdateMissedDeltas(const string &tablet_name,
+Status ReupdateMissedDeltas(const std::string &tablet_name,
                             CompactionInput *input,
                             const HistoryGcOpts& history_gc_opts,
                             const MvccSnapshot &snap_to_exclude,
@@ -232,11 +246,13 @@ Status ReupdateMissedDeltas(const string &tablet_name,
 
 // Dump the given compaction input to 'lines' or LOG(INFO) if it is NULL.
 // This consumes all of the input in the compaction input.
-Status DebugDumpCompactionInput(CompactionInput *input, vector<string> *lines);
+Status DebugDumpCompactionInput(CompactionInput *input, std::vector<std::string> *lines);
 
 // Helper methods to print a row with full history.
-string RowToString(const RowBlockRow& row, const Mutation* redo_head, const Mutation* undo_head);
-string CompactionInputRowToString(const CompactionInputRow& input_row);
+std::string RowToString(const RowBlockRow& row,
+                        const Mutation* redo_head,
+                        const Mutation* undo_head);
+std::string CompactionInputRowToString(const CompactionInputRow& input_row);
 
 } // namespace tablet
 } // namespace kudu

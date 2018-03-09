@@ -18,17 +18,27 @@
 #ifndef KUDU_COMMON_TYPES_H
 #define KUDU_COMMON_TYPES_H
 
-#include <glog/logging.h>
 
 #include <cmath>
-#include <stdint.h>
+#include <cstdio>
+#include <cstdint>
+#include <cstring>
+#include <ctime>
+#include <cstdlib>
+#include <ostream>
 #include <string>
 
+#include <glog/logging.h>
+
 #include "kudu/common/common.pb.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/mathlimits.h"
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/numbers.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/make_shared.h"
 #include "kudu/util/slice.h"
+// IWYU pragma: no_include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -36,7 +46,6 @@ namespace kudu {
 // type we support.
 const int kLargestTypeSize = sizeof(Slice);
 
-using std::string;
 class TypeInfo;
 
 // This is the important bit of this header:
@@ -51,9 +60,9 @@ class TypeInfo {
   DataType type() const { return type_; }
   // Returns the type used to actually store the data.
   DataType physical_type() const { return physical_type_; }
-  const string& name() const { return name_; }
+  const std::string& name() const { return name_; }
   const size_t size() const { return size_; }
-  void AppendDebugStringForValue(const void *ptr, string *str) const;
+  void AppendDebugStringForValue(const void *ptr, std::string *str) const;
   int Compare(const void *lhs, const void *rhs) const;
   // Returns true if increment(a) is equal to b.
   bool AreConsecutive(const void* a, const void* b) const;
@@ -68,18 +77,19 @@ class TypeInfo {
   }
 
  private:
+  ALLOW_MAKE_SHARED(TypeInfo);
   friend class TypeInfoResolver;
   template<typename Type> TypeInfo(Type t);
 
   const DataType type_;
   const DataType physical_type_;
-  const string name_;
+  const std::string name_;
   const size_t size_;
   const void* const min_value_;
   // The maximum value of the type, or null if the type has no max value.
   const void* const max_value_;
 
-  typedef void (*AppendDebugFunc)(const void *, string *);
+  typedef void (*AppendDebugFunc)(const void *, std::string *);
   const AppendDebugFunc append_func_;
 
   typedef int (*CompareFunc)(const void *, const void *);
@@ -129,7 +139,7 @@ struct DataTypeTraits<UINT8> {
   static const char *name() {
     return "uint8";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const uint8_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -153,7 +163,7 @@ struct DataTypeTraits<INT8> {
   static const char *name() {
     return "int8";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const int8_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -177,7 +187,7 @@ struct DataTypeTraits<UINT16> {
   static const char *name() {
     return "uint16";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const uint16_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -201,7 +211,7 @@ struct DataTypeTraits<INT16> {
   static const char *name() {
     return "int16";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const int16_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -225,7 +235,7 @@ struct DataTypeTraits<UINT32> {
   static const char *name() {
     return "uint32";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const uint32_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -249,7 +259,7 @@ struct DataTypeTraits<INT32> {
   static const char *name() {
     return "int32";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const int32_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -273,7 +283,7 @@ struct DataTypeTraits<UINT64> {
   static const char *name() {
     return "uint64";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const uint64_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -297,7 +307,7 @@ struct DataTypeTraits<INT64> {
   static const char *name() {
     return "int64";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleItoa(*reinterpret_cast<const int64_t *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -315,13 +325,37 @@ struct DataTypeTraits<INT64> {
 };
 
 template<>
+struct DataTypeTraits<INT128> {
+  static const DataType physical_type = INT128;
+  typedef int128_t cpp_type;
+  static const char *name() {
+    return "int128";
+  }
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
+    str->append(SimpleItoa(*reinterpret_cast<const int128_t *>(val)));
+  }
+  static int Compare(const void *lhs, const void *rhs) {
+    return GenericCompare<INT128>(lhs, rhs);
+  }
+  static bool AreConsecutive(const void* a, const void* b) {
+    return AreIntegersConsecutive<INT128>(a, b);
+  }
+  static const cpp_type* min_value() {
+    return &INT128_MIN;
+  }
+  static const cpp_type* max_value() {
+    return &INT128_MAX;
+  }
+};
+
+template<>
 struct DataTypeTraits<FLOAT> {
   static const DataType physical_type = FLOAT;
   typedef float cpp_type;
   static const char *name() {
     return "float";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleFtoa(*reinterpret_cast<const float *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -345,7 +379,7 @@ struct DataTypeTraits<DOUBLE> {
   static const char *name() {
     return "double";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     str->append(SimpleDtoa(*reinterpret_cast<const double *>(val)));
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -369,7 +403,7 @@ struct DataTypeTraits<BINARY> {
   static const char *name() {
     return "binary";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     const Slice *s = reinterpret_cast<const Slice *>(val);
     str->push_back('"');
     str->append(strings::CHexEscape(s->ToString()));
@@ -409,7 +443,7 @@ struct DataTypeTraits<BOOL> {
   static const char* name() {
     return "bool";
   }
-  static void AppendDebugStringForValue(const void* val, string* str) {
+  static void AppendDebugStringForValue(const void* val, std::string* str) {
     str->append(*reinterpret_cast<const bool *>(val) ? "true" : "false");
   }
   static int Compare(const void *lhs, const void *rhs) {
@@ -435,7 +469,7 @@ struct DerivedTypeTraits {
   typedef typename DataTypeTraits<PhysicalType>::cpp_type cpp_type;
   static const DataType physical_type = PhysicalType;
 
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     DataTypeTraits<PhysicalType>::AppendDebugStringForValue(val, str);
   }
 
@@ -461,7 +495,7 @@ struct DataTypeTraits<STRING> : public DerivedTypeTraits<BINARY>{
   static const char* name() {
     return "string";
   }
-  static void AppendDebugStringForValue(const void *val, string *str) {
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
     const Slice *s = reinterpret_cast<const Slice *>(val);
     str->push_back('"');
     str->append(strings::Utf8SafeCEscape(s->ToString()));
@@ -480,7 +514,7 @@ struct DataTypeTraits<UNIXTIME_MICROS> : public DerivedTypeTraits<INT64>{
     return "unixtime_micros";
   }
 
-  static void AppendDebugStringForValue(const void* val, string* str) {
+  static void AppendDebugStringForValue(const void* val, std::string* str) {
     int64_t timestamp_micros = *reinterpret_cast<const int64_t *>(val);
     time_t secs_since_epoch = timestamp_micros / US_TO_S;
     // If the time is negative we need to take into account that any microseconds
@@ -497,6 +531,48 @@ struct DataTypeTraits<UNIXTIME_MICROS> : public DerivedTypeTraits<INT64>{
     char time[34];
     snprintf(time, sizeof(time), kDateMicrosAndTzFormat, time_up_to_secs, remaining_micros);
     str->append(time);
+  }
+};
+
+template<>
+struct DataTypeTraits<DECIMAL32> : public DerivedTypeTraits<INT32>{
+  static const char* name() {
+    return "decimal";
+  }
+  // AppendDebugStringForValue appends the (string representation of) the
+  // underlying integer value with the "_D32" suffix as there's no "full"
+  // type information available to format it.
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
+    DataTypeTraits<physical_type>::AppendDebugStringForValue(val, str);
+    str->append("_D32");
+  }
+};
+
+template<>
+struct DataTypeTraits<DECIMAL64> : public DerivedTypeTraits<INT64>{
+  static const char* name() {
+    return "decimal";
+  }
+  // AppendDebugStringForValue appends the (string representation of) the
+  // underlying integer value with the "_D64" suffix as there's no "full"
+  // type information available to format it.
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
+    DataTypeTraits<physical_type>::AppendDebugStringForValue(val, str);
+    str->append("_D64");
+  }
+};
+
+template<>
+struct DataTypeTraits<DECIMAL128> : public DerivedTypeTraits<INT128>{
+  static const char* name() {
+    return "decimal";
+  }
+  // AppendDebugStringForValue appends the (string representation of) the
+  // underlying integer value with the "_D128" suffix as there's no "full"
+  // type information available to format it.
+  static void AppendDebugStringForValue(const void *val, std::string *str) {
+    DataTypeTraits<physical_type>::AppendDebugStringForValue(val, str);
+    str->append("_D128");
   }
 };
 
@@ -556,18 +632,24 @@ class Variant {
       case UINT16:
         numeric_.u16 = *static_cast<const uint16_t *>(value);
         break;
+      case DECIMAL32:
       case INT32:
         numeric_.i32 = *static_cast<const int32_t *>(value);
         break;
       case UINT32:
         numeric_.u32 = *static_cast<const uint32_t *>(value);
         break;
+      case DECIMAL64:
       case UNIXTIME_MICROS:
       case INT64:
         numeric_.i64 = *static_cast<const int64_t *>(value);
         break;
       case UINT64:
         numeric_.u64 = *static_cast<const uint64_t *>(value);
+        break;
+      case DECIMAL128:
+      case INT128:
+        numeric_.i128 = *static_cast<const int128_t *>(value);
         break;
       case FLOAT:
         numeric_.float_val = *static_cast<const float *>(value);
@@ -596,7 +678,7 @@ class Variant {
   // Set the variant to a STRING type.
   // The specified data block will be copied, and released by the variant
   // on the next set/clear call.
-  void Reset(const string& data) {
+  void Reset(const std::string& data) {
     Slice slice(data);
     Reset(STRING, &slice);
   }
@@ -629,11 +711,15 @@ class Variant {
       case UINT8:        return &(numeric_.u8);
       case INT16:        return &(numeric_.i16);
       case UINT16:       return &(numeric_.u16);
+      case DECIMAL32:
       case INT32:        return &(numeric_.i32);
       case UINT32:       return &(numeric_.u32);
+      case DECIMAL64:
+      case UNIXTIME_MICROS:
       case INT64:        return &(numeric_.i64);
-      case UNIXTIME_MICROS:    return &(numeric_.i64);
       case UINT64:       return &(numeric_.u64);
+      case DECIMAL128:
+      case INT128:       return &(numeric_.i128);
       case FLOAT:        return (&numeric_.float_val);
       case DOUBLE:       return (&numeric_.double_val);
       case STRING:
@@ -673,6 +759,7 @@ class Variant {
     uint32_t u32;
     int64_t  i64;
     uint64_t u64;
+    int128_t i128;
     float    float_val;
     double   double_val;
   };

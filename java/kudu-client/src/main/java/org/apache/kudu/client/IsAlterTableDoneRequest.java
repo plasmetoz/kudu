@@ -22,8 +22,8 @@ import static org.apache.kudu.master.Master.IsAlterTableDoneResponsePB;
 import static org.apache.kudu.master.Master.TableIdentifierPB;
 
 import com.google.protobuf.Message;
+import org.apache.yetus.audience.InterfaceAudience;
 
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.util.Pair;
 
 /**
@@ -31,22 +31,18 @@ import org.apache.kudu.util.Pair;
  */
 @InterfaceAudience.Private
 class IsAlterTableDoneRequest extends KuduRpc<IsAlterTableDoneResponse> {
+  private final TableIdentifierPB.Builder table;
 
-  static final String IS_ALTER_TABLE_DONE = "IsAlterTableDone";
-  private final String name;
-
-
-  IsAlterTableDoneRequest(KuduTable masterTable, String name) {
+  IsAlterTableDoneRequest(KuduTable masterTable, TableIdentifierPB.Builder table) {
     super(masterTable);
-    this.name = name;
+    this.table = table;
   }
 
   @Override
   Message createRequestPB() {
-    final IsAlterTableDoneRequestPB.Builder builder = IsAlterTableDoneRequestPB.newBuilder();
-    TableIdentifierPB tableID =
-        TableIdentifierPB.newBuilder().setTableName(name).build();
-    builder.setTable(tableID);
+    final IsAlterTableDoneRequestPB.Builder builder =
+        IsAlterTableDoneRequestPB.newBuilder();
+    builder.setTable(table);
     return builder.build();
   }
 
@@ -57,7 +53,7 @@ class IsAlterTableDoneRequest extends KuduRpc<IsAlterTableDoneResponse> {
 
   @Override
   String method() {
-    return IS_ALTER_TABLE_DONE;
+    return "IsAlterTableDone";
   }
 
   @Override

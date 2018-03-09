@@ -18,16 +18,18 @@
 #include "kudu/rpc/request_tracker.h"
 
 #include <mutex>
+#include <string>
+#include <utility>
 
 #include "kudu/gutil/map-util.h"
 
 namespace kudu {
 namespace rpc {
 
-const RequestTracker::SequenceNumber RequestTracker::NO_SEQ_NO = -1;
+const RequestTracker::SequenceNumber RequestTracker::kNoSeqNo = -1;
 
-RequestTracker::RequestTracker(const string& client_id)
-    : client_id_(client_id),
+RequestTracker::RequestTracker(std::string client_id)
+    : client_id_(std::move(client_id)),
       next_(0) {}
 
 Status RequestTracker::NewSeqNo(SequenceNumber* seq_no) {
@@ -40,7 +42,7 @@ Status RequestTracker::NewSeqNo(SequenceNumber* seq_no) {
 
 RequestTracker::SequenceNumber RequestTracker::FirstIncomplete() {
   std::lock_guard<simple_spinlock> l(lock_);
-  if (incomplete_rpcs_.empty()) return NO_SEQ_NO;
+  if (incomplete_rpcs_.empty()) return kNoSeqNo;
   return *incomplete_rpcs_.begin();
 }
 

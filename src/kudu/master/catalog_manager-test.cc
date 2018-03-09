@@ -14,17 +14,31 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
+#include <ostream>
+#include <string>
+#include <vector>
+
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/common/common.pb.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/ts_descriptor.h"
+#include "kudu/util/cow_object.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+
+using std::string;
+using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 namespace master {
-
-using strings::Substitute;
 
 // Test of the tablet assignment algo for splits done at table creation time.
 // This tests that when we define a split, the tablet lands on the expected
@@ -33,7 +47,7 @@ using strings::Substitute;
 TEST(TableInfoTest, TestAssignmentRanges) {
   const string table_id = CURRENT_TEST_NAME();
   scoped_refptr<TableInfo> table(new TableInfo(table_id));
-  vector<scoped_refptr<TabletInfo> > tablets;
+  vector<scoped_refptr<TabletInfo>> tablets;
 
   // Define & create the splits.
   const int kNumSplits = 3;
@@ -43,16 +57,19 @@ TEST(TableInfoTest, TestAssignmentRanges) {
     const string& end_key = (i == kNumSplits) ? "" : split_keys[i];
     string tablet_id = Substitute("tablet-$0-$1", start_key, end_key);
 
-    TabletInfo* tablet = new TabletInfo(table, tablet_id);
-    TabletMetadataLock meta_lock(tablet, TabletMetadataLock::WRITE);
+    scoped_refptr<TabletInfo> tablet = new TabletInfo(table, tablet_id);
+    {
+      TabletMetadataLock meta_lock(tablet.get(), LockMode::WRITE);
+      PartitionPB* partition = meta_lock.mutable_data()->pb.mutable_partition();
+      partition->set_partition_key_start(start_key);
+      partition->set_partition_key_end(end_key);
+      meta_lock.mutable_data()->pb.set_state(SysTabletsEntryPB::RUNNING);
+      meta_lock.Commit();
+    }
 
-    PartitionPB* partition = meta_lock.mutable_data()->pb.mutable_partition();
-    partition->set_partition_key_start(start_key);
-    partition->set_partition_key_end(end_key);
-    meta_lock.mutable_data()->pb.set_state(SysTabletsEntryPB::RUNNING);
-    meta_lock.Commit();
-    table->AddTablet(tablet);
-    tablets.push_back(make_scoped_refptr(tablet));
+    TabletMetadataLock meta_lock(tablet.get(), LockMode::READ);
+    table->AddRemoveTablets({ tablet }, {});
+    tablets.push_back(tablet);
   }
 
   // Ensure they give us what we are expecting.
@@ -67,19 +84,14 @@ TEST(TableInfoTest, TestAssignmentRanges) {
     req.set_max_returned_locations(1);
     req.mutable_table()->mutable_table_name()->assign(table_id);
     req.mutable_partition_key_start()->assign(start_key);
-    vector<scoped_refptr<TabletInfo> > tablets_in_range;
+    vector<scoped_refptr<TabletInfo>> tablets_in_range;
     table->GetTabletsInRange(&req, &tablets_in_range);
 
     // Only one tablet should own this key.
     ASSERT_EQ(1, tablets_in_range.size());
     // The tablet with range start key matching 'start_key' should be the owner.
-    ASSERT_EQ(tablet_id, (*tablets_in_range.begin())->tablet_id());
+    ASSERT_EQ(tablet_id, (*tablets_in_range.begin())->id());
     LOG(INFO) << "Key " << start_key << " found in tablet " << tablet_id;
-  }
-
-  for (const scoped_refptr<TabletInfo>& tablet : tablets) {
-    ASSERT_TRUE(table->RemoveTablet(
-        tablet->metadata().state().pb.partition().partition_key_start()));
   }
 }
 

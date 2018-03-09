@@ -30,7 +30,6 @@ import java.util.List;
 
 import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.Preconditions;
-import com.google.common.base.Throwables;
 import org.apache.flume.Channel;
 import org.apache.flume.Context;
 import org.apache.flume.Event;
@@ -40,11 +39,11 @@ import org.apache.flume.Transaction;
 import org.apache.flume.conf.Configurable;
 import org.apache.flume.instrumentation.SinkCounter;
 import org.apache.flume.sink.AbstractSink;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.AsyncKuduClient;
 import org.apache.kudu.client.KuduClient;
 import org.apache.kudu.client.KuduSession;
@@ -58,7 +57,7 @@ import org.apache.kudu.client.SessionConfiguration;
  *
  * <p><strong>Flume Kudu Sink configuration parameters</strong>
  *
- * <table cellpadding=3 cellspacing=0 border=1>
+ * <table cellpadding=3 cellspacing=0 border=1 summary="Flume Kudu Sink configuration parameters">
  * <tr><th>Property Name</th><th>Default</th><th>Required?</th><th>Description</th></tr>
  * <tr><td>channel</td><td></td><td>Yes</td><td>The name of the Flume channel to read.</td></tr>
  * <tr><td>type</td><td></td><td>Yes</td>
@@ -68,7 +67,7 @@ import org.apache.kudu.client.SessionConfiguration;
  *     The port is optional.</td></tr>
  * <tr><td>tableName</td><td></td><td>Yes</td>
  *     <td>The name of the Kudu table to write to.</td></tr>
- * <tr><td>batchSize</td><td>100</td><td>No</td>
+ * <tr><td>batchSize</td><td>1000</td><td>No</td>
  * <td>The maximum number of events the sink takes from the channel per transaction.</td></tr>
  * <tr><td>ignoreDuplicateRows</td><td>true</td>
  *     <td>No</td><td>Whether to ignore duplicate primary key errors caused by inserts.</td></tr>
@@ -94,7 +93,7 @@ import org.apache.kudu.client.SessionConfiguration;
 @InterfaceStability.Evolving
 public class KuduSink extends AbstractSink implements Configurable {
   private static final Logger logger = LoggerFactory.getLogger(KuduSink.class);
-  private static final Long DEFAULT_BATCH_SIZE = 100L;
+  private static final int DEFAULT_BATCH_SIZE = 1000;
   private static final Long DEFAULT_TIMEOUT_MILLIS =
           AsyncKuduClient.DEFAULT_OPERATION_TIMEOUT_MS;
   private static final String DEFAULT_KUDU_OPERATION_PRODUCER =
@@ -103,7 +102,7 @@ public class KuduSink extends AbstractSink implements Configurable {
 
   private String masterAddresses;
   private String tableName;
-  private long batchSize;
+  private int batchSize;
   private long timeoutMillis;
   private boolean ignoreDuplicateRows;
   private KuduTable table;
@@ -127,7 +126,7 @@ public class KuduSink extends AbstractSink implements Configurable {
     Preconditions.checkState(table == null && session == null,
         "Please call stop before calling start on an old instance.");
 
-    // client is not null only inside tests
+    // Client is not null only inside tests.
     if (client == null) {
       client = new KuduClient.KuduClientBuilder(masterAddresses).build();
     }
@@ -135,6 +134,7 @@ public class KuduSink extends AbstractSink implements Configurable {
     session.setFlushMode(SessionConfiguration.FlushMode.MANUAL_FLUSH);
     session.setTimeoutMillis(timeoutMillis);
     session.setIgnoreAllDuplicateRows(ignoreDuplicateRows);
+    session.setMutationBufferSpace(batchSize);
 
     try {
       table = client.openTable(tableName);
@@ -191,7 +191,7 @@ public class KuduSink extends AbstractSink implements Configurable {
         "Missing table name. Please specify property '%s'",
         TABLE_NAME);
 
-    batchSize = context.getLong(BATCH_SIZE, DEFAULT_BATCH_SIZE);
+    batchSize = context.getInteger(BATCH_SIZE, DEFAULT_BATCH_SIZE);
     timeoutMillis = context.getLong(TIMEOUT_MILLIS, DEFAULT_TIMEOUT_MILLIS);
     ignoreDuplicateRows = context.getBoolean(IGNORE_DUPLICATE_ROWS, DEFAULT_IGNORE_DUPLICATE_ROWS);
     String operationProducerType = context.getString(PRODUCER);
@@ -214,7 +214,7 @@ public class KuduSink extends AbstractSink implements Configurable {
       operationsProducer.configure(producerContext);
     } catch (Exception e) {
       logger.error("Could not instantiate Kudu operations producer" , e);
-      Throwables.propagate(e);
+      throw new RuntimeException(e);
     }
     sinkCounter = new SinkCounter(this.getName());
   }
@@ -292,7 +292,7 @@ public class KuduSink extends AbstractSink implements Configurable {
       String msg = "Failed to commit transaction. Transaction rolled back.";
       logger.error(msg, e);
       if (e instanceof Error || e instanceof RuntimeException) {
-        Throwables.propagate(e);
+        throw new RuntimeException(e);
       } else {
         logger.error(msg, e);
         throw new EventDeliveryException(msg, e);
@@ -300,7 +300,5 @@ public class KuduSink extends AbstractSink implements Configurable {
     } finally {
       txn.close();
     }
-
-    return Status.BACKOFF;
   }
 }

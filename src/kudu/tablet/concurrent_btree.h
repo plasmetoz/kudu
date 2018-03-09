@@ -77,15 +77,15 @@ namespace btree {
 struct BTreeTraits {
   enum TraitConstants {
     // Number of bytes used per internal node.
-    internal_node_size = 4 * CACHELINE_SIZE,
+    kInternalNodeSize = 4 * CACHELINE_SIZE,
 
     // Number of bytes used by a leaf node.
-    leaf_node_size = 4 * CACHELINE_SIZE,
+    kLeafNodeSize = 4 * CACHELINE_SIZE,
 
     // Tests can set this trait to a non-zero value, which inserts
     // some pause-loops in key parts of the code to try to simulate
     // races.
-    debug_raciness = 0
+    kDebugRaciness = 0
   };
   typedef ThreadSafeArena ArenaType;
 };
@@ -106,8 +106,8 @@ inline void PrefetchMemory(const T *addr) {
 // will compile away in production code.
 template<class Traits>
 void DebugRacyPoint() {
-  if (Traits::debug_raciness > 0) {
-    boost::detail::yield(Traits::debug_raciness);
+  if (Traits::kDebugRaciness > 0) {
+    boost::detail::yield(Traits::kDebugRaciness);
   }
 }
 
@@ -206,7 +206,7 @@ struct VersionField {
     return v & BTREE_INSERTING_MASK;
   }
 
-  static string Stringify(AtomicVersion v) {
+  static std::string Stringify(AtomicVersion v) {
     return StringPrintf("[flags=%c%c%c vins=%" PRIu64 " vsplit=%" PRIu64 "]",
                         (v & BTREE_LOCK_MASK) ? 'L':' ',
                         (v & BTREE_SPLITTING_MASK) ? 'S':' ',
@@ -625,8 +625,8 @@ class PACKED InternalNode : public NodeBase<Traits> {
     #endif
   }
 
-  string ToString() const {
-    string ret("[");
+  std::string ToString() const {
+    std::string ret("[");
     for (int i = 0; i < num_children_; i++) {
       if (i > 0) {
         ret.append(", ");
@@ -656,7 +656,7 @@ class PACKED InternalNode : public NodeBase<Traits> {
   enum SpaceConstants {
     constant_overhead = sizeof(NodeBase<Traits>) // base class
                       + sizeof(uint32_t), // num_children_
-    keyptr_space = Traits::internal_node_size - constant_overhead,
+    keyptr_space = Traits::kInternalNodeSize - constant_overhead,
     kFanout = keyptr_space / (sizeof(KeyInlineSlice) + sizeof(NodePtr<Traits>))
   };
 
@@ -778,8 +778,8 @@ class LeafNode : public NodeBase<Traits> {
     num_entries_ = new_num_entries;
   }
 
-  string ToString() const {
-    string ret;
+  std::string ToString() const {
+    std::string ret;
     for (int i = 0; i < num_entries_; i++) {
       if (i > 0) {
         ret.append(", ");
@@ -809,7 +809,7 @@ class LeafNode : public NodeBase<Traits> {
     constant_overhead = sizeof(NodeBase<Traits>) // base class
                         + sizeof(LeafNode<Traits>*) // next_
                         + sizeof(uint8_t), // num_entries_
-    kv_space = Traits::leaf_node_size - constant_overhead,
+    kv_space = Traits::kLeafNodeSize - constant_overhead,
     kMaxEntries = kv_space / (sizeof(KeyInlineSlice) + sizeof(ValueSlice))
   };
 
@@ -836,7 +836,7 @@ class PreparedMutation {
   // The data referred to by the 'key' Slice passed in themust remain
   // valid for the lifetime of the PreparedMutation object.
   explicit PreparedMutation(Slice key)
-      : key_(std::move(key)), tree_(NULL), leaf_(NULL), needs_unlock_(false) {}
+      : key_(key), tree_(NULL), leaf_(NULL), needs_unlock_(false) {}
 
   ~PreparedMutation() {
     UnPrepare();
@@ -952,10 +952,7 @@ class PreparedMutation {
 template<class Traits = BTreeTraits>
 class CBTree {
  public:
-  CBTree()
-    : arena_(new typename Traits::ArenaType(512*1024, 4*1024*1024)),
-      root_(NewLeaf(false)),
-      frozen_(false) {
+  CBTree() : CBTree(std::make_shared<typename Traits::ArenaType>(4 * 1024)) {
   }
 
   explicit CBTree(std::shared_ptr<typename Traits::ArenaType> arena)

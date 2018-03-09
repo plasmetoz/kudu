@@ -17,36 +17,46 @@
 #ifndef KUDU_TABLET_TABLET_METADATA_H
 #define KUDU_TABLET_TABLET_METADATA_H
 
-#include <boost/optional/optional_fwd.hpp>
+#include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
+
 #include "kudu/common/partition.h"
-#include "kudu/common/schema.h"
-#include "kudu/consensus/opid.pb.h"
 #include "kudu/fs/block_id.h"
-#include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/callback.h"
-#include "kudu/gutil/dynamic_annotations.h"
+#include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/metadata.pb.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/status.h"
 #include "kudu/util/status_callback.h"
 
 namespace kudu {
+
+class BlockIdPB;
+class FsManager;
+class Schema;
+
+namespace consensus {
+class OpId;
+}
+
 namespace tablet {
 
 class RowSetMetadata;
-class RowSetMetadataUpdate;
 
 typedef std::vector<std::shared_ptr<RowSetMetadata> > RowSetMetadataVector;
 typedef std::unordered_set<int64_t> RowSetMetadataIds;
 
-extern const int64 kNoDurableMemStore;
+extern const int64_t kNoDurableMemStore;
 
 // Manages the "blocks tracking" for the specified tablet.
 //
@@ -70,6 +80,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                           const PartitionSchema& partition_schema,
                           const Partition& partition,
                           const TabletDataState& initial_tablet_data_state,
+                          boost::optional<consensus::OpId> tombstone_last_logged_opid,
                           scoped_refptr<TabletMetadata>* metadata);
 
   // Load existing metadata from disk.
@@ -90,6 +101,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
                              const PartitionSchema& partition_schema,
                              const Partition& partition,
                              const TabletDataState& initial_tablet_data_state,
+                             boost::optional<consensus::OpId> tombstone_last_logged_opid,
                              scoped_refptr<TabletMetadata>* metadata);
 
   static std::vector<BlockIdPB> CollectBlockIdPBs(
@@ -135,6 +147,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   }
 
   // Set / get the tablet copy / tablet data state.
+  // If set to TABLET_DATA_READY, also clears 'tombstone_last_logged_opid_'.
   void set_tablet_data_state(TabletDataState state);
   TabletDataState tablet_data_state() const;
 
@@ -202,7 +215,7 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Create a new RowSetMetadata for this tablet.
   // Does not add the new rowset to the list of rowsets. Use one of the Update()
   // calls to do so.
-  Status CreateRowSet(std::shared_ptr<RowSetMetadata> *rowset, const Schema& schema);
+  Status CreateRowSet(std::shared_ptr<RowSetMetadata>* rowset);
 
   const RowSetMetadataVector& rowsets() const { return rowsets_; }
 
@@ -212,9 +225,10 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   void SetLastDurableMrsIdForTests(int64_t mrs_id) { last_durable_mrs_id_ = mrs_id; }
 
-  void SetPreFlushCallback(StatusClosure callback) { pre_flush_callback_ = callback; }
+  void SetPreFlushCallback(StatusClosure callback);
 
-  consensus::OpId tombstone_last_logged_opid() const { return tombstone_last_logged_opid_; }
+  // Return the last-logged opid of a tombstoned tablet, if known.
+  boost::optional<consensus::OpId> tombstone_last_logged_opid() const;
 
   // Loads the currently-flushed superblock from disk into the given protobuf.
   Status ReadSuperBlockFromDisk(TabletSuperBlockPB* superblock) const;
@@ -225,12 +239,23 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // Fully replace a superblock (used for bootstrap).
   Status ReplaceSuperBlock(const TabletSuperBlockPB &pb);
 
+  int64_t on_disk_size() const {
+    return on_disk_size_.load(std::memory_order_relaxed);
+  }
+
   // ==========================================================================
   // Stuff used by the tests
   // ==========================================================================
   const RowSetMetadata *GetRowSetForTests(int64_t id) const;
 
   RowSetMetadata *GetRowSetForTests(int64_t id);
+
+  // Return standard "T xxx P yyy" log prefix.
+  std::string LogPrefix() const;
+
+  int flush_count_for_tests() const {
+    return flush_count_for_tests_;
+  }
 
  private:
   friend class RefCountedThreadSafe<TabletMetadata>;
@@ -241,13 +266,14 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   // Constructor for creating a new tablet.
   //
-  // TODO: get rid of this many-arg constructor in favor of just passing in a
-  // SuperBlock, which already contains all of these fields.
+  // TODO(todd): get rid of this many-arg constructor in favor of just passing
+  // in a SuperBlock, which already contains all of these fields.
   TabletMetadata(FsManager* fs_manager, std::string tablet_id,
                  std::string table_name, std::string table_id,
                  const Schema& schema, PartitionSchema partition_schema,
                  Partition partition,
-                 const TabletDataState& tablet_data_state);
+                 const TabletDataState& tablet_data_state,
+                 boost::optional<consensus::OpId> tombstone_last_logged_opid);
 
   // Constructor for loading an existing tablet.
   TabletMetadata(FsManager* fs_manager, std::string tablet_id);
@@ -255,6 +281,9 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   void SetSchemaUnlocked(gscoped_ptr<Schema> schema, uint32_t version);
 
   Status LoadFromDisk();
+
+  // Updates the cached on-disk size of the tablet superblock.
+  Status UpdateOnDiskSize();
 
   // Update state of metadata to that of the given superblock PB.
   Status LoadFromSuperBlock(const TabletSuperBlockPB& superblock);
@@ -284,9 +313,6 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   //
   // Failures are logged, but are not fatal.
   void DeleteOrphanedBlocks(const std::vector<BlockId>& blocks);
-
-  // Return standard "T xxx P yyy" log prefix.
-  std::string LogPrefix() const;
 
   enum State {
     kNotLoadedYet,
@@ -337,7 +363,8 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
 
   // Record of the last opid logged by the tablet before it was last
   // tombstoned. Has no meaning for non-tombstoned tablets.
-  consensus::OpId tombstone_last_logged_opid_;
+  // Protected by 'data_lock_'.
+  boost::optional<consensus::OpId> tombstone_last_logged_opid_;
 
   // If this counter is > 0 then Flush() will not write any data to
   // disk.
@@ -348,9 +375,16 @@ class TabletMetadata : public RefCountedThreadSafe<TabletMetadata> {
   // metadata is persisted.
   bool needs_flush_;
 
+  // The number of times metadata has been flushed to disk
+  int flush_count_for_tests_;
+
   // A callback that, if set, is called before this metadata is flushed
-  // to disk.
+  // to disk. Protected by the 'flush_lock_'.
   StatusClosure pre_flush_callback_;
+
+  // The on-disk size of the tablet metadata, as of the last successful
+  // call to Flush() or LoadFromDisk().
+  std::atomic<int64_t> on_disk_size_;
 
   DISALLOW_COPY_AND_ASSIGN(TabletMetadata);
 };

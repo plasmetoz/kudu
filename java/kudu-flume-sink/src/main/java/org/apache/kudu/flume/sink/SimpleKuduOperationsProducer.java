@@ -25,9 +25,9 @@ import java.util.List;
 import org.apache.flume.Context;
 import org.apache.flume.Event;
 import org.apache.flume.FlumeException;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.Insert;
 import org.apache.kudu.client.KuduTable;
 import org.apache.kudu.client.Operation;
@@ -39,7 +39,7 @@ import org.apache.kudu.client.PartialRow;
  *
  * <p><strong>Simple Kudu Event Producer configuration parameters</strong>
  *
- * <table cellpadding=3 cellspacing=0 border=1>
+ * <table cellpadding=3 cellspacing=0 border=1 summary="Simple Kudu Event Producer configuration parameters">
  * <tr>
  *   <th>Property Name</th>
  *   <th>Default</th>

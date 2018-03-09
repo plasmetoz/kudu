@@ -17,24 +17,41 @@
 
 #include "kudu/tablet/deltafile.h"
 
-#include <arpa/inet.h>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <utility>
 
-#include "kudu/common/wire_protocol.h"
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+
 #include "kudu/cfile/binary_plain_block.h"
-#include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/block_handle.h"
 #include "kudu/cfile/cfile_reader.h"
+#include "kudu/cfile/cfile_util.h"
 #include "kudu/cfile/cfile_writer.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/types.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/block_manager.h"
+#include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/mathlimits.h"
+#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/mutation.h"
 #include "kudu/tablet/mvcc.h"
-#include "kudu/util/coding-inl.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/util/compression/compression_codec.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/hexdump.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/trace.h"
 
@@ -49,17 +66,23 @@ DEFINE_string(deltafile_default_compression_codec, "lz4",
 TAG_FLAG(deltafile_default_compression_codec, experimental);
 
 using std::shared_ptr;
+using std::string;
 using std::unique_ptr;
+using std::vector;
+using strings::Substitute;
 
 namespace kudu {
+
+class MemTracker;
 
 using cfile::BinaryPlainBlockDecoder;
 using cfile::BlockPointer;
 using cfile::CFileReader;
 using cfile::IndexTreeIterator;
 using cfile::ReaderOptions;
+using fs::BlockCreationTransaction;
+using fs::BlockManager;
 using fs::ReadableBlock;
-using fs::ScopedWritableBlockCloser;
 using fs::WritableBlock;
 
 namespace tablet {
@@ -70,7 +93,7 @@ namespace {
 
 } // namespace
 
-DeltaFileWriter::DeltaFileWriter(gscoped_ptr<WritableBlock> block)
+DeltaFileWriter::DeltaFileWriter(unique_ptr<WritableBlock> block)
 #ifndef NDEBUG
  : has_appended_(false)
 #endif
@@ -79,29 +102,51 @@ DeltaFileWriter::DeltaFileWriter(gscoped_ptr<WritableBlock> block)
   opts.write_validx = true;
   opts.storage_attributes.cfile_block_size = FLAGS_deltafile_default_block_size;
   opts.storage_attributes.encoding = PLAIN_ENCODING;
-  opts.storage_attributes.compression = GetCompressionCodecType(
-      FLAGS_deltafile_default_compression_codec);
-  // No optimization for deltafiles because a deltafile index key must decode into a DeltaKey
-  opts.optimize_index_keys = false;
-  writer_.reset(new cfile::CFileWriter(opts, GetTypeInfo(BINARY), false, std::move(block)));
-}
+  opts.storage_attributes.compression =
+      GetCompressionCodecType(FLAGS_deltafile_default_compression_codec);
 
+  // The CFile value index is 'compressed' by truncating delta values to only
+  // contain the delta key. The entire deltakey is required in order to support
+  // efficient seeks without deserializing the entire block. The generic value
+  // index optimization is disabled, since it could truncate portions of the
+  // deltakey.
+  //
+  // Note: The deltafile usage of the CFile value index is irregular, since it
+  // inserts values in non-sorted order (the timestamp portion of the deltakey
+  // in UNDO files is sorted in descending order). This doesn't appear to cause
+  // problems in practice.
+  opts.optimize_index_keys = false;
+  opts.validx_key_encoder = [] (const void* value, faststring* buffer) {
+    buffer->clear();
+    const Slice* s1 = static_cast<const Slice*>(value);
+    Slice s2(*s1);
+    DeltaKey key;
+    CHECK_OK(key.DecodeFrom(&s2));
+    key.EncodeTo(buffer);
+  };
+
+  writer_.reset(new cfile::CFileWriter(std::move(opts),
+                                       GetTypeInfo(BINARY),
+                                       false,
+                                       std::move(block)));
+}
 
 Status DeltaFileWriter::Start() {
   return writer_->Start();
 }
 
 Status DeltaFileWriter::Finish() {
-  ScopedWritableBlockCloser closer;
-  RETURN_NOT_OK(FinishAndReleaseBlock(&closer));
-  return closer.CloseBlocks();
+  BlockManager* bm = writer_->block()->block_manager();
+  unique_ptr<BlockCreationTransaction> transaction = bm->NewCreationTransaction();
+  RETURN_NOT_OK(FinishAndReleaseBlock(transaction.get()));
+  return transaction->CommitCreatedBlocks();
 }
 
-Status DeltaFileWriter::FinishAndReleaseBlock(ScopedWritableBlockCloser* closer) {
+Status DeltaFileWriter::FinishAndReleaseBlock(BlockCreationTransaction* transaction) {
   if (writer_->written_value_count() == 0) {
     return Status::Aborted("no deltas written");
   }
-  return writer_->FinishAndReleaseBlock(closer);
+  return writer_->FinishAndReleaseBlock(transaction);
 }
 
 Status DeltaFileWriter::DoAppendDelta(const DeltaKey &key,
@@ -170,7 +215,7 @@ void DeltaFileWriter::WriteDeltaStats(const DeltaStats& stats) {
 // Reader
 ////////////////////////////////////////////////////////////
 
-Status DeltaFileReader::Open(gscoped_ptr<ReadableBlock> block,
+Status DeltaFileReader::Open(unique_ptr<ReadableBlock> block,
                              DeltaType delta_type,
                              ReaderOptions options,
                              shared_ptr<DeltaFileReader>* reader_out) {
@@ -185,11 +230,11 @@ Status DeltaFileReader::Open(gscoped_ptr<ReadableBlock> block,
   return Status::OK();
 }
 
-Status DeltaFileReader::OpenNoInit(gscoped_ptr<ReadableBlock> block,
+Status DeltaFileReader::OpenNoInit(unique_ptr<ReadableBlock> block,
                                    DeltaType delta_type,
                                    ReaderOptions options,
                                    shared_ptr<DeltaFileReader>* reader_out) {
-  gscoped_ptr<CFileReader> cf_reader;
+  unique_ptr<CFileReader> cf_reader;
   RETURN_NOT_OK(CFileReader::OpenNoInit(std::move(block),
                                         std::move(options),
                                         &cf_reader));
@@ -204,7 +249,7 @@ Status DeltaFileReader::OpenNoInit(gscoped_ptr<ReadableBlock> block,
   return Status::OK();
 }
 
-DeltaFileReader::DeltaFileReader(gscoped_ptr<CFileReader> cf_reader,
+DeltaFileReader::DeltaFileReader(unique_ptr<CFileReader> cf_reader,
                                  DeltaType delta_type)
     : reader_(cf_reader.release()),
       delta_type_(delta_type) {}
@@ -245,7 +290,7 @@ Status DeltaFileReader::ReadDeltaStats() {
 }
 
 bool DeltaFileReader::IsRelevantForSnapshot(const MvccSnapshot& snap) const {
-  if (!init_once_.initted()) {
+  if (!init_once_.init_succeeded()) {
     // If we're not initted, it means we have no delta stats and must
     // assume that this file is relevant for every snapshot.
     return true;
@@ -263,7 +308,7 @@ bool DeltaFileReader::IsRelevantForSnapshot(const MvccSnapshot& snap) const {
 Status DeltaFileReader::CloneForDebugging(FsManager* fs_manager,
                                           const shared_ptr<MemTracker>& parent_mem_tracker,
                                           shared_ptr<DeltaFileReader>* out) const {
-  gscoped_ptr<ReadableBlock> block;
+  unique_ptr<ReadableBlock> block;
   RETURN_NOT_OK(fs_manager->OpenBlock(reader_->block_id(), &block));
   ReaderOptions options;
   options.parent_mem_tracker = parent_mem_tracker;
@@ -275,7 +320,7 @@ Status DeltaFileReader::NewDeltaIterator(const Schema *projection,
                                          DeltaIterator** iterator) const {
   if (IsRelevantForSnapshot(snap)) {
     if (VLOG_IS_ON(2)) {
-      if (!init_once_.initted()) {
+      if (!init_once_.init_succeeded()) {
         TRACE_COUNTER_INCREMENT("delta_iterators_lazy_initted", 1);
 
         VLOG(2) << (delta_type_ == REDO ? "REDO" : "UNDO") << " delta " << ToString()
@@ -441,7 +486,10 @@ Status DeltaFileIterator::ReadCurrentBlockOntoQueue() {
 
   // Decode the block.
   pdb->decoder_.reset(new BinaryPlainBlockDecoder(pdb->block_.data()));
-  RETURN_NOT_OK(pdb->decoder_->ParseHeader());
+  RETURN_NOT_OK_PREPEND(pdb->decoder_->ParseHeader(),
+                        Substitute("unable to decode data block header in delta block $0 ($1)",
+                                   dfr_->cfile_reader()->block_id().ToString(),
+                                   dblk_ptr.ToString()));
 
   RETURN_NOT_OK(GetFirstRowIndexInCurrentBlock(&pdb->first_updated_idx_));
   RETURN_NOT_OK(GetLastRowIndexInDecodedBlock(*pdb->decoder_, &pdb->last_updated_idx_));

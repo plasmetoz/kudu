@@ -15,27 +15,40 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <glog/logging.h>
-#include <gtest/gtest.h>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <ostream>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/strings/util.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/condition_variable.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/oid_generator.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 DEFINE_int32(num_create_table_threads, 4,
@@ -54,9 +67,11 @@ using client::KuduClientBuilder;
 using client::KuduColumnSchema;
 using client::KuduSchema;
 using client::KuduSchemaBuilder;
-using client::KuduTable;
 using client::KuduTableAlterer;
 using client::KuduTableCreator;
+using cluster::ExternalMaster;
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
 using master::MasterServiceProxy;
 using master::ListTablesRequestPB;
 using master::ListTablesResponsePB;
@@ -95,26 +110,26 @@ class MasterStressTest : public KuduTest {
     // Don't preallocate log segments, since we're creating many tablets here.
     // If each preallocates 64M or so, we use a ton of disk space in this
     // test, and it fails on normal sized /tmp dirs.
-    opts.extra_master_flags.push_back("--log_preallocate_segments=false");
-    opts.extra_tserver_flags.push_back("--log_preallocate_segments=false");
+    opts.extra_master_flags.emplace_back("--log_preallocate_segments=false");
+    opts.extra_tserver_flags.emplace_back("--log_preallocate_segments=false");
 
     // Reduce various timeouts below as to make the detection of leader master
     // failures (specifically, failures as result of long pauses) more rapid.
 
     // Set max missed heartbeats periods to 1.0 (down from 3.0).
-    opts.extra_master_flags.push_back("--leader_failure_max_missed_heartbeat_periods=1.0");
+    opts.extra_master_flags.emplace_back("--leader_failure_max_missed_heartbeat_periods=1.0");
 
     // Set the TS->master heartbeat timeout to 1 second (down from 15 seconds).
-    opts.extra_tserver_flags.push_back("--heartbeat_rpc_timeout_ms=1000");
+    opts.extra_tserver_flags.emplace_back("--heartbeat_rpc_timeout_ms=1000");
 
     // Allow one TS heartbeat failure before retrying with back-off (down from 3).
-    opts.extra_tserver_flags.push_back("--heartbeat_max_failures_before_backoff=1");
+    opts.extra_tserver_flags.emplace_back("--heartbeat_max_failures_before_backoff=1");
 
     // Wait for 500 ms after 'max_consecutive_failed_heartbeats' before trying
     // again (down from 1 second).
-    opts.extra_tserver_flags.push_back("--heartbeat_interval_ms=500");
+    opts.extra_tserver_flags.emplace_back("--heartbeat_interval_ms=500");
 
-    cluster_.reset(new ExternalMiniCluster(opts));
+    cluster_.reset(new ExternalMiniCluster(std::move(opts)));
     ASSERT_OK(cluster_->Start());
     KuduClientBuilder builder;
 
@@ -241,8 +256,8 @@ class MasterStressTest : public KuduTest {
 
   Status WaitForMasterUpAndRunning(const shared_ptr<Messenger>& messenger,
                                    ExternalMaster* master) {
-    unique_ptr<MasterServiceProxy> proxy(
-        new MasterServiceProxy(messenger, master->bound_rpc_addr()));
+    const auto& addr = master->bound_rpc_addr();
+    unique_ptr<MasterServiceProxy> proxy(new MasterServiceProxy(messenger, addr, addr.host()));
     while (true) {
       ListTablesRequestPB req;
       ListTablesResponsePB resp;

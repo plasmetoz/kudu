@@ -16,13 +16,19 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <map>
+#include <memory>
 #include <vector>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/rw_mutex.h"
 
 namespace kudu {
+
+class Status;
+
 namespace security {
 
 class SignedTokenPB;
@@ -93,6 +99,7 @@ class TokenVerifier {
 };
 
 // Result of a token verification.
+// Values added to this enum must also be added to VerificationResultToString().
 enum class VerificationResult {
   // The signature is valid and the token is not expired.
   VALID,

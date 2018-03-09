@@ -18,7 +18,10 @@
 
 #include <string>
 
-#include <boost/optional/optional_fwd.hpp>
+namespace boost {
+template <class T>
+class optional;
+}
 
 namespace kudu {
 
@@ -27,13 +30,28 @@ class Status;
 
 namespace security {
 
+// The default kerberos credential cache name.
+// Have the daemons use an in-memory ticket cache, so they don't accidentally
+// pick up credentials from test cases or any other daemon.
+static const std::string kKrb5CCName = "MEMORY:kudu";
+
 // Initializes Kerberos for a server. In particular, this processes
 // the '--keytab_file' command line flag.
-Status InitKerberosForServer();
+// 'raw_principal' is the principal to Kinit with after calling GetConfiguredPrincipal()
+// on it.
+// 'keytab_file' is the path to the kerberos keytab file. If it's an empty string, kerberos
+// will not be initialized.
+// 'krb5ccname' is passed into the KRB5CCNAME env var.
+// 'disable_krb5_replay_cache' if set to true, disables the kerberos replay cache by setting
+// the KRB5RCACHETYPE env var to "none".
+Status InitKerberosForServer(const std::string& raw_principal,
+                             const std::string& keytab_file,
+                             const std::string& krb5ccname = kKrb5CCName,
+                             bool disable_krb5_replay_cache = true);
 
 // Returns the process lock 'kerberos_reinit_lock'
-// This lock is acquired in write mode while the ticket is being renewed, and
-// acquired in read mode before using the SASL library which might require a ticket.
+// This lock is taken in write mode while the ticket is being reacquired, and
+// taken in read mode before using the SASL library which might require a ticket.
 RWMutex* KerberosReinitLock();
 
 // Return the full principal (user/host@REALM) that the server has used to

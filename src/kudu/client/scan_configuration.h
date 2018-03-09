@@ -17,18 +17,31 @@
 
 #pragma once
 
-#include <memory>
+#include <cstdint>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
+
 #include "kudu/client/client.h"
-#include "kudu/common/column_predicate.h"
+#include "kudu/client/schema.h"
 #include "kudu/common/scan_spec.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/auto_release_pool.h"
 #include "kudu/util/memory/arena.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
+
+class ColumnPredicate;
+class KuduPartialRow;
+class Schema;
+
 namespace client {
+
+class KuduPredicate;
 
 // A configuration object which holds Kudu scan options.
 //
@@ -69,11 +82,21 @@ class ScanConfiguration {
 
   Status SetFaultTolerant(bool fault_tolerant) WARN_UNUSED_RESULT;
 
+  // Sets the timestamp the scan must be executed at, in microseconds
+  // since the Unix epoch. Requires READ_AT_SNAPSHOT scan mode.
   void SetSnapshotMicros(uint64_t snapshot_timestamp_micros);
 
+  // Sets a previously encoded timestamp as a snapshot timestamp.
+  // Requires READ_AT_SNAPSHOT scan mode.
   void SetSnapshotRaw(uint64_t snapshot_timestamp);
 
+  // Set the lower bound of scan's propagation timestamp.
+  // It is only used in READ_YOUR_WRITES scan mode.
+  void SetScanLowerBoundTimestampRaw(uint64_t propagation_timestamp);
+
   void SetTimeoutMillis(int millis);
+
+  Status SetRowFormatFlags(uint64_t flags);
 
   void OptimizeScanSpec();
 
@@ -129,8 +152,21 @@ class ScanConfiguration {
     return snapshot_timestamp_;
   }
 
+  bool has_lower_bound_propagation_timestamp() const {
+    return lower_bound_propagation_timestamp_ != kNoTimestamp;
+  }
+
+  uint64_t lower_bound_propagation_timestamp() const {
+    CHECK(has_lower_bound_propagation_timestamp());
+    return lower_bound_propagation_timestamp_;
+  }
+
   const MonoDelta& timeout() const {
     return timeout_;
+  }
+
+  uint64_t row_format_flags() const {
+    return row_format_flags_;
   }
 
   Arena* arena() {
@@ -155,7 +191,7 @@ class ScanConfiguration {
   ScanSpec spec_;
 
   bool has_batch_size_bytes_;
-  uint32 batch_size_bytes_;
+  uint32_t batch_size_bytes_;
 
   KuduClient::ReplicaSelection selection_;
 
@@ -165,6 +201,8 @@ class ScanConfiguration {
 
   uint64_t snapshot_timestamp_;
 
+  uint64_t lower_bound_propagation_timestamp_;
+
   MonoDelta timeout_;
 
   // Manages interior allocations for the scan spec and copied bounds.
@@ -173,6 +211,8 @@ class ScanConfiguration {
   // Manages objects which need to live for the lifetime of the configuration,
   // such as schemas, predicates, and keys.
   AutoReleasePool pool_;
+
+  uint64_t row_format_flags_;
 };
 
 } // namespace client

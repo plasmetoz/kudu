@@ -17,32 +17,55 @@
 
 #include "kudu/tools/tool_action_common.h"
 
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstddef>
+#include <iomanip>
 #include <iostream>
 #include <memory>
+#include <numeric>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <google/protobuf/util/json_util.h>
 
+#include "kudu/client/client-internal.h"  // IWYU pragma: keep
+#include "kudu/client/client.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/common/common.pb.h"
-#include "kudu/common/schema.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus.pb.h"
-#include "kudu/consensus/consensus.proxy.h"
+#include "kudu/consensus/consensus.proxy.h" // IWYU pragma: keep
 #include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_util.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/gutil/endian.h"
+#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/numbers.h"
+#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/master.proxy.h" // IWYU pragma: keep
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
+#include "kudu/tools/tool.pb.h" // IWYU pragma: keep
+#include "kudu/tools/tool_action.h"
 #include "kudu/tserver/tserver.pb.h"
-#include "kudu/tserver/tserver_admin.proxy.h"
-#include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/tserver/tserver_admin.proxy.h"   // IWYU pragma: keep
+#include "kudu/tserver/tserver_service.proxy.h" // IWYU pragma: keep
+#include "kudu/util/faststring.h"
+#include "kudu/util/jsonwriter.h"
 #include "kudu/util/memory/arena.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
@@ -66,14 +89,40 @@ DEFINE_int32(truncate_data, 100,
              "Truncate the data fields to the given number of bytes "
              "before printing. Set to 0 to disable");
 
+DEFINE_string(columns, "", "Comma-separated list of column fields to include in output tables");
+DEFINE_string(format, "pretty",
+              "Format to use for printing list output tables.\n"
+              "Possible values: pretty, space, tsv, csv, and json");
+
+namespace boost {
+template <typename Signature>
+class function;
+} // namespace boost
+
 namespace kudu {
+
+namespace master {
+class ListMastersRequestPB;
+class ListMastersResponsePB;
+class ListTabletServersRequestPB;
+class ListTabletServersResponsePB;
+} // namespace master
+
 namespace tools {
 
+using client::KuduClientBuilder;
 using consensus::ConsensusServiceProxy;
 using consensus::ReplicateMsg;
 using log::LogEntryPB;
 using log::LogEntryReader;
 using log::ReadableLogSegment;
+using master::ListTabletServersRequestPB;
+using master::ListTabletServersResponsePB;
+using master::ListMastersRequestPB;
+using master::ListMastersResponsePB;
+using master::MasterServiceProxy;
+using pb_util::SecureDebugString;
+using pb_util::SecureShortDebugString;
 using rpc::Messenger;
 using rpc::MessengerBuilder;
 using rpc::RequestIdPB;
@@ -88,10 +137,14 @@ using server::SetFlagRequestPB;
 using server::SetFlagResponsePB;
 using std::cout;
 using std::endl;
+using std::ostream;
+using std::setfill;
+using std::setw;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::vector;
+using strings::Substitute;
 using tserver::TabletServerAdminServiceProxy;
 using tserver::TabletServerServiceProxy;
 using tserver::WriteRequestPB;
@@ -156,7 +209,7 @@ Status PrintDecodedWriteRequestPB(const string& indent,
   Schema request_schema;
   RETURN_NOT_OK(SchemaFromPB(write.schema(), &request_schema));
 
-  Arena arena(32 * 1024, 1024 * 1024);
+  Arena arena(32 * 1024);
   RowOperationsPBDecoder dec(&write.row_operations(), &request_schema, &tablet_schema, &arena);
   vector<DecodedRowOperation> ops;
   RETURN_NOT_OK(dec.DecodeOperations(&ops));
@@ -219,7 +272,7 @@ Status BuildProxy(const string& address,
   vector<Sockaddr> resolved;
   RETURN_NOT_OK(hp.ResolveAddresses(&resolved));
 
-  proxy->reset(new ProxyClass(messenger, resolved[0]));
+  proxy->reset(new ProxyClass(messenger, resolved[0], hp.host()));
   return Status::OK();
 }
 
@@ -236,6 +289,10 @@ template
 Status BuildProxy(const string& address,
                   uint16_t default_port,
                   unique_ptr<TabletServerAdminServiceProxy>* proxy);
+template
+Status BuildProxy(const string& address,
+                  uint16_t default_port,
+                  unique_ptr<MasterServiceProxy>* proxy);
 
 Status GetServerStatus(const string& address, uint16_t default_port,
                        ServerStatusPB* status) {
@@ -341,6 +398,367 @@ Status PrintServerTimestamp(const string& address, uint16_t default_port) {
   cout << resp.timestamp() << endl;
   return Status::OK();
 }
+
+namespace {
+
+// Pretty print a table using the psql format. For example:
+//
+//                uuid               |         rpc-addresses          |      seqno
+// ----------------------------------+--------------------------------+------------------
+//  335d132897de4bdb9b87443f2c487a42 | 126.rack1.dc1.example.com:7050 | 1492596790237811
+//  7425c65d80f54f2da0a85494a5eb3e68 | 122.rack1.dc1.example.com:7050 | 1492596755322350
+//  dd23284d3a334f1a8306c19d89c1161f | 130.rack1.dc1.example.com:7050 | 1492596704536543
+//  d8009e07d82b4e66a7ab50f85e60bc30 | 136.rack1.dc1.example.com:7050 | 1492596696557549
+//  c108a85a68504c2bb9f49e4ee683d981 | 128.rack1.dc1.example.com:7050 | 1492596646623301
+void PrettyPrintTable(const vector<string>& headers,
+                      const vector<vector<string>>& columns,
+                      ostream& out) {
+  CHECK_EQ(headers.size(), columns.size());
+  if (headers.empty()) return;
+  size_t num_columns = headers.size();
+
+  vector<size_t> widths;
+  for (int col = 0; col < num_columns; col++) {
+    size_t width = std::accumulate(columns[col].begin(), columns[col].end(), headers[col].size(),
+                                   [](size_t acc, const string& cell) {
+                                     return std::max(acc, cell.size());
+                                   });
+    widths.push_back(width);
+  }
+
+  // Print the header row.
+  for (int col = 0; col < num_columns; col++) {
+    int padding = widths[col] - headers[col].size();
+    out << setw(padding / 2) << "" << " " << headers[col];
+    if (col != num_columns - 1) out << setw((padding + 1) / 2) << "" << " |";
+  }
+  out << endl;
+
+  // Print the separator row.
+  out << setfill('-');
+  for (int col = 0; col < num_columns; col++) {
+    out << setw(widths[col] + 2) << "";
+    if (col != num_columns - 1) out << "+";
+  }
+  out << endl;
+
+  // Print the data rows.
+  out << setfill(' ');
+  int num_rows = columns.empty() ? 0 : columns[0].size();
+  for (int row = 0; row < num_rows; row++) {
+    for (int col = 0; col < num_columns; col++) {
+      const auto& value = columns[col][row];
+      out << " " << value;
+      if (col != num_columns - 1) {
+        size_t padding = widths[col] - value.size();
+        out << setw(padding) << "" << " |";
+      }
+    }
+    out << endl;
+  }
+}
+
+// Print a table using JSON formatting.
+//
+// The table is formatted as an array of objects. Each object corresponds
+// to a row whose fields are the column values.
+void JsonPrintTable(const vector<string>& headers,
+                    const vector<vector<string>>& columns,
+                    ostream& out) {
+  std::ostringstream stream;
+  JsonWriter writer(&stream, JsonWriter::COMPACT);
+
+  int num_columns = columns.size();
+  int num_rows = columns.empty() ? 0 : columns[0].size();
+
+  writer.StartArray();
+  for (int row = 0; row < num_rows; row++) {
+    writer.StartObject();
+    for (int col = 0; col < num_columns; col++) {
+      writer.String(headers[col]);
+      writer.String(columns[col][row]);
+    }
+    writer.EndObject();
+  }
+  writer.EndArray();
+
+  out << stream.str() << endl;
+}
+
+// Print the table using the provided separator. For example, with a comma
+// separator:
+//
+// 335d132897de4bdb9b87443f2c487a42,126.rack1.dc1.example.com:7050,1492596790237811
+// 7425c65d80f54f2da0a85494a5eb3e68,122.rack1.dc1.example.com:7050,1492596755322350
+// dd23284d3a334f1a8306c19d89c1161f,130.rack1.dc1.example.com:7050,1492596704536543
+// d8009e07d82b4e66a7ab50f85e60bc30,136.rack1.dc1.example.com:7050,1492596696557549
+// c108a85a68504c2bb9f49e4ee683d981,128.rack1.dc1.example.com:7050,1492596646623301
+void PrintTable(const vector<vector<string>>& columns, const string& separator, ostream& out) {
+  // TODO(dan): proper escaping of string values.
+  int num_columns = columns.size();
+  int num_rows = columns.empty() ? 0 : columns[0].size();
+  for (int row = 0; row < num_rows; row++) {
+      for (int col = 0; col < num_columns; col++) {
+        out << columns[col][row];
+        if (col != num_columns - 1) out << separator;
+      }
+      out << endl;
+  }
+}
+
+} // anonymous namespace
+
+DataTable::DataTable(std::vector<string> col_names)
+    : column_names_(std::move(col_names)),
+      columns_(column_names_.size()) {
+}
+
+void DataTable::AddRow(std::vector<string> row) {
+  CHECK_EQ(row.size(), columns_.size());
+  int i = 0;
+  for (auto& v : row) {
+    columns_[i++].emplace_back(std::move(v));
+  }
+}
+
+void DataTable::AddColumn(string name, vector<string> column) {
+  if (!columns_.empty()) {
+    CHECK_EQ(column.size(), columns_[0].size());
+  }
+  column_names_.emplace_back(std::move(name));
+  columns_.emplace_back(std::move(column));
+}
+
+Status DataTable::PrintTo(ostream& out) const {
+  if (boost::iequals(FLAGS_format, "pretty")) {
+    PrettyPrintTable(column_names_, columns_, out);
+  } else if (boost::iequals(FLAGS_format, "space")) {
+    PrintTable(columns_, " ", out);
+  } else if (boost::iequals(FLAGS_format, "tsv")) {
+    PrintTable(columns_, "	", out);
+  } else if (boost::iequals(FLAGS_format, "csv")) {
+    PrintTable(columns_, ",", out);
+  } else if (boost::iequals(FLAGS_format, "json")) {
+    JsonPrintTable(column_names_, columns_, out);
+  } else {
+    return Status::InvalidArgument("unknown format (--format)", FLAGS_format);
+  }
+  return Status::OK();
+}
+
+Status LeaderMasterProxy::Init(const RunnerContext& context) {
+  const string& master_addrs_str = FindOrDie(context.required_args, kMasterAddressesArg);
+  auto master_addrs = strings::Split(master_addrs_str, ",");
+  auto timeout = MonoDelta::FromMilliseconds(FLAGS_timeout_ms);
+
+  return KuduClientBuilder().master_server_addrs(master_addrs)
+                            .default_rpc_timeout(timeout)
+                            .default_admin_operation_timeout(timeout)
+                            .Build(&client_);
+}
+
+template<typename Req, typename Resp>
+Status LeaderMasterProxy::SyncRpc(const Req& req,
+                                  Resp* resp,
+                                  const char* func_name,
+                                  const boost::function<Status(master::MasterServiceProxy*,
+                                                               const Req&, Resp*,
+                                                               rpc::RpcController*)>& func) {
+  MonoTime deadline = MonoTime::Now() + MonoDelta::FromMilliseconds(FLAGS_timeout_ms);
+  return client_->data_->SyncLeaderMasterRpc(deadline, client_.get(), req, resp,
+                                             func_name, func, {});
+}
+
+// Explicit specialization for callers outside this compilation unit.
+template
+Status LeaderMasterProxy::SyncRpc(const ListTabletServersRequestPB& req,
+                                  ListTabletServersResponsePB* resp,
+                                  const char* func_name,
+                                  const boost::function<Status(MasterServiceProxy*,
+                                                               const ListTabletServersRequestPB&,
+                                                               ListTabletServersResponsePB*,
+                                                               RpcController*)>& func);
+template
+Status LeaderMasterProxy::SyncRpc(const ListMastersRequestPB& req,
+                                  ListMastersResponsePB* resp,
+                                  const char* func_name,
+                                  const boost::function<Status(MasterServiceProxy*,
+                                                               const ListMastersRequestPB&,
+                                                               ListMastersResponsePB*,
+                                                               RpcController*)>& func);
+
+const int ControlShellProtocol::kMaxMessageBytes = 1024 * 1024;
+
+ControlShellProtocol::ControlShellProtocol(SerializationMode serialization_mode,
+                                           CloseMode close_mode,
+                                           int read_fd,
+                                           int write_fd)
+    : serialization_mode_(serialization_mode),
+      close_mode_(close_mode),
+      read_fd_(read_fd),
+      write_fd_(write_fd) {
+}
+
+ControlShellProtocol::~ControlShellProtocol() {
+  if (close_mode_ == CloseMode::CLOSE_ON_DESTROY) {
+    close(read_fd_);
+    close(write_fd_);
+  }
+}
+
+template <class M>
+Status ControlShellProtocol::ReceiveMessage(M* message) {
+  switch (serialization_mode_) {
+    case SerializationMode::JSON:
+    {
+      // Read and accumulate one byte at a time, looking for the newline.
+      //
+      // TODO(adar): it would be more efficient to read a chunk of data, look
+      // for a newline, and if found, store the remainder for the next message.
+      faststring buf;
+      faststring one_byte;
+      one_byte.resize(1);
+      while (true) {
+        RETURN_NOT_OK_PREPEND(DoRead(&one_byte), "unable to receive message byte");
+        if (one_byte[0] == '\n') {
+          break;
+        }
+        buf.push_back(one_byte[0]);
+      }
+
+      // Parse the JSON-encoded message.
+      const auto& google_status =
+          google::protobuf::util::JsonStringToMessage(buf.ToString(), message);
+      if (!google_status.ok()) {
+        return Status::InvalidArgument(
+            Substitute("unable to parse JSON: $0", buf.ToString()),
+            google_status.error_message().ToString());
+      }
+      break;
+    }
+    case SerializationMode::PB:
+    {
+      // Read four bytes of size (big-endian).
+      faststring size_buf;
+      size_buf.resize(sizeof(uint32_t));
+      RETURN_NOT_OK_PREPEND(DoRead(&size_buf), "unable to receive message size");
+      uint32_t body_size = NetworkByteOrder::Load32(size_buf.data());
+
+      if (body_size > kMaxMessageBytes) {
+        return Status::IOError(
+            Substitute("message size ($0) exceeds maximum message size ($1)",
+                       body_size, kMaxMessageBytes));
+      }
+
+      // Read the variable size body.
+      faststring body_buf;
+      body_buf.resize(body_size);
+      RETURN_NOT_OK_PREPEND(DoRead(&body_buf), "unable to receive message body");
+
+      // Parse the body into a PB request.
+      RETURN_NOT_OK_PREPEND(pb_util::ParseFromArray(
+          message, body_buf.data(), body_buf.length()),
+                            Substitute("unable to parse PB: $0", body_buf.ToString()));
+      break;
+    }
+    default: LOG(FATAL) << "Unknown mode";
+  }
+
+  VLOG(1) << "Received message: " << pb_util::SecureDebugString(*message);
+  return Status::OK();
+}
+
+template <class M>
+Status ControlShellProtocol::SendMessage(const M& message) {
+  VLOG(1) << "Sending message: " << pb_util::SecureDebugString(message);
+
+  faststring buf;
+  switch (serialization_mode_) {
+    case SerializationMode::JSON:
+    {
+      string serialized;
+      const auto& google_status =
+          google::protobuf::util::MessageToJsonString(message, &serialized);
+      if (!google_status.ok()) {
+        return Status::InvalidArgument(Substitute(
+            "unable to serialize JSON: $0", pb_util::SecureDebugString(message)),
+                                       google_status.error_message().ToString());
+      }
+
+      buf.append(serialized);
+      buf.append("\n");
+      break;
+    }
+    case SerializationMode::PB:
+    {
+      size_t msg_size = message.ByteSizeLong();
+      buf.resize(sizeof(uint32_t) + msg_size);
+      NetworkByteOrder::Store32(buf.data(), msg_size);
+      if (!message.SerializeWithCachedSizesToArray(buf.data() + sizeof(uint32_t))) {
+        return Status::Corruption("failed to serialize PB to array");
+      }
+      break;
+    }
+    default:
+      break;
+  }
+  RETURN_NOT_OK_PREPEND(DoWrite(buf), "unable to send message");
+  return Status::OK();
+}
+
+Status ControlShellProtocol::DoRead(faststring* buf) {
+  uint8_t* pos = buf->data();
+  size_t rem = buf->length();
+  while (rem > 0) {
+    ssize_t r = read(read_fd_, pos, rem);
+    if (r == -1) {
+      if (errno == EINTR) {
+        // Interrupted by a signal, retry.
+        continue;
+      }
+      return Status::IOError("Error reading from pipe", "", errno);
+    }
+    if (r == 0) {
+      return Status::EndOfFile("Other end of pipe was closed");
+    }
+    DCHECK_GE(rem, r);
+    rem -= r;
+    pos += r;
+  }
+  return Status::OK();
+}
+
+Status ControlShellProtocol::DoWrite(const faststring& buf) {
+  const uint8_t* pos = buf.data();
+  size_t rem = buf.length();
+  while (rem > 0) {
+    ssize_t r = write(write_fd_, pos, rem);
+    if (r == -1) {
+      if (errno == EINTR) {
+        // Interrupted by a signal, retry.
+        continue;
+      }
+      if (errno == EPIPE) {
+        return Status::EndOfFile("Other end of pipe was closed");
+      }
+      return Status::IOError("Error writing to pipe", "", errno);
+    }
+    DCHECK_GE(rem, r);
+    rem -= r;
+    pos += r;
+  }
+  return Status::OK();
+}
+
+// Explicit specialization for callers outside this compilation unit.
+template
+Status ControlShellProtocol::ReceiveMessage(ControlShellRequestPB* message);
+template
+Status ControlShellProtocol::ReceiveMessage(ControlShellResponsePB* message);
+template
+Status ControlShellProtocol::SendMessage(const ControlShellRequestPB& message);
+template
+Status ControlShellProtocol::SendMessage(const ControlShellResponsePB& message);
 
 } // namespace tools
 } // namespace kudu

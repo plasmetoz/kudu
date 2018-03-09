@@ -15,34 +15,67 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <type_traits>
+#include <unordered_set>
+#include <vector>
+
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <memory>
-#include <time.h>
 
+#include "kudu/clock/clock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/iterator.h"
 #include "kudu/common/row.h"
+#include "kudu/common/row_changelist.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stringprintf.h"
-#include "kudu/tablet/delta_compaction.h"
-#include "kudu/tablet/diskrowset.h"
+#include "kudu/gutil/strings/stringpiece.h"
+#include "kudu/tablet/compaction.h"
+#include "kudu/tablet/delta_key.h"
+#include "kudu/tablet/delta_store.h"
+#include "kudu/tablet/delta_tracker.h"
+#include "kudu/tablet/deltamemstore.h"
 #include "kudu/tablet/diskrowset-test-base.h"
+#include "kudu/tablet/diskrowset.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet-test-util.h"
-#include "kudu/util/env.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/util/bloom_filter.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 
 DEFINE_double(update_fraction, 0.1f, "fraction of rows to update");
 DECLARE_bool(cfile_lazy_open);
+DECLARE_bool(crash_on_eio);
 DECLARE_int32(cfile_default_block_size);
+DECLARE_double(env_inject_eio);
 DECLARE_double(tablet_delta_store_major_compact_min_ratio);
 DECLARE_int32(tablet_delta_store_minor_compact_max);
 
 using std::is_sorted;
 using std::shared_ptr;
+using std::string;
 using std::unique_ptr;
 using std::unordered_set;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -165,6 +198,35 @@ TEST_F(TestRowSet, TestRowSetUpdate) {
   VerifyUpdates(*rs, updated);
 }
 
+TEST_F(TestRowSet, TestErrorDuringUpdate) {
+  WriteTestRowSet();
+  shared_ptr<DiskRowSet> rs;
+  ASSERT_OK(OpenTestRowSet(&rs));
+
+  faststring buf;
+  RowChangeListEncoder enc(&buf);
+  enc.SetToDelete();
+
+  // Get a row that we expect to be in the rowset.
+  Timestamp timestamp(0);
+  RowBuilder rb(schema_.CreateKeyProjection());
+  rb.AddString(Slice("hello 000000000000050"));
+  RowSetKeyProbe probe(rb.row());
+
+  // But fail while reading it!
+  FLAGS_crash_on_eio = false;
+  FLAGS_env_inject_eio = 1.0;
+
+  // The mutation should result in an IOError.
+  OperationResultPB result;
+  ProbeStats stats;
+  Status s = rs->MutateRow(timestamp, probe, enc.as_changelist(), op_id_, &stats, &result);
+  LOG(INFO) << s.ToString();
+  ASSERT_TRUE(s.IsIOError());
+
+  FLAGS_env_inject_eio = 0;
+}
+
 TEST_F(TestRowSet, TestRandomRead) {
   // Write 100 rows.
   WriteTestRowSet(100);
@@ -172,31 +234,26 @@ TEST_F(TestRowSet, TestRandomRead) {
   ASSERT_OK(OpenTestRowSet(&rs));
 
   // Read un-updated row.
-  VerifyRandomRead(*rs, "hello 000000000000050",
-                   R"((string key="hello 000000000000050", uint32 val=50))");
-  NO_FATALS();
+  NO_FATALS(VerifyRandomRead(*rs, "hello 000000000000050",
+                             R"((string key="hello 000000000000050", uint32 val=50))"));
 
   // Update the row.
   OperationResultPB result;
   ASSERT_OK(UpdateRow(rs.get(), 50, 12345, &result));
 
   // Read it again -- should see the updated value.
-  VerifyRandomRead(*rs, "hello 000000000000050",
-                   R"((string key="hello 000000000000050", uint32 val=12345))");
-  NO_FATALS();
+  NO_FATALS(VerifyRandomRead(*rs, "hello 000000000000050",
+                             R"((string key="hello 000000000000050", uint32 val=12345))"));
 
   // Try to read a row which comes before the first key.
   // This should return no rows.
-  VerifyRandomRead(*rs, "aaaaa", "");
-  NO_FATALS();
+  NO_FATALS(VerifyRandomRead(*rs, "aaaaa", ""));
 
   // Same with a row which falls between keys.
-  VerifyRandomRead(*rs, "hello 000000000000050_between_keys", "");
-  NO_FATALS();
+  NO_FATALS(VerifyRandomRead(*rs, "hello 000000000000050_between_keys", ""));
 
   // And a row which falls after the last key.
-  VerifyRandomRead(*rs, "hello 000000000000101", "");
-  NO_FATALS();
+  NO_FATALS(VerifyRandomRead(*rs, "hello 000000000000101", ""));
 }
 
 // Test Delete() support within a DiskRowSet.
@@ -323,7 +380,7 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
 
   // Take a snapshot of the pre-update state.
   vector<MvccSnapshot> snaps;
-  snaps.push_back(MvccSnapshot(mvcc_));
+  snaps.emplace_back(mvcc_);
 
 
   // Update the single row multiple times, taking an MVCC snapshot
@@ -352,7 +409,7 @@ TEST_F(TestRowSet, TestFlushedUpdatesRespectMVCC) {
       ASSERT_EQ(0L, result.mutated_stores(0).dms_id());
       tx.Commit();
     }
-    snaps.push_back(MvccSnapshot(mvcc_));
+    snaps.emplace_back(mvcc_);
   }
 
   // Ensure that MVCC is respected by reading the value at each of the stored
@@ -572,6 +629,45 @@ TEST_F(TestRowSet, TestGCAncientStores) {
   ASSERT_GT(bytes_deleted, 0);
   ASSERT_EQ(0, dt->CountUndoDeltaStores());
   ASSERT_EQ(0, dt->CountRedoDeltaStores());
+}
+
+TEST_F(TestRowSet, TestDiskSizeEstimation) {
+  // Force the files to be opened so the stats are read.
+  FLAGS_cfile_lazy_open = false;
+
+  // Write a rowset.
+  WriteTestRowSet();
+  shared_ptr<DiskRowSet> rs;
+  ASSERT_OK(OpenTestRowSet(&rs));
+
+  // Write a first delta file.
+  UpdateExistingRows(rs.get(), FLAGS_update_fraction, nullptr);
+  ASSERT_OK(rs->FlushDeltas());
+
+  // The rowset consists of the cfile set and REDO deltas, so the rowset's
+  // on-disk size and the sum of the cfile set and REDO sizes should equal.
+  DiskRowSetSpace drss;
+  rs->GetDiskRowSetSpaceUsage(&drss);
+  ASSERT_GT(drss.redo_deltas_size, 0);
+  ASSERT_EQ(rs->OnDiskSize(), drss.CFileSetOnDiskSize() + drss.redo_deltas_size);
+
+  // Convert the REDO delta to an UNDO delta.
+  ASSERT_OK(rs->MajorCompactDeltaStores(HistoryGcOpts::Disabled()));
+
+  // REDO size should be zero, but there should be UNDOs, so the on-disk size
+  // of the rowset should be the sum of the cfile set and UNDO sizes.
+  rs->GetDiskRowSetSpaceUsage(&drss);
+  ASSERT_GT(drss.undo_deltas_size, 0);
+  ASSERT_EQ(rs->OnDiskSize(), drss.CFileSetOnDiskSize() + drss.undo_deltas_size);
+
+  // Write a second delta file.
+  UpdateExistingRows(rs.get(), FLAGS_update_fraction, nullptr);
+  ASSERT_OK(rs->FlushDeltas());
+
+  // Now there's base data, REDOs, and UNDOs.
+  rs->GetDiskRowSetSpaceUsage(&drss);
+  ASSERT_GT(drss.undo_deltas_size, 0);
+  ASSERT_GT(drss.redo_deltas_size, 0);
 }
 
 } // namespace tablet

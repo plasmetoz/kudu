@@ -27,19 +27,18 @@ import java.util.Collections;
 import java.util.List;
 
 import com.google.common.collect.ImmutableList;
+import com.google.common.collect.Lists;
 import org.junit.Before;
 import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.ColumnSchema.CompressionAlgorithm;
+import org.apache.kudu.ColumnSchema.Encoding;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.util.Pair;
 
 public class TestAlterTable extends BaseKuduTest {
-
-  private static final Logger LOG = LoggerFactory.getLogger(TestKuduClient.class);
   private String tableName;
 
   @Before
@@ -113,8 +112,6 @@ public class TestAlterTable extends BaseKuduTest {
         .addColumn("addNonNull", Type.INT32, 100)
         .addNullableColumn("addNullable", Type.INT32)
         .addNullableColumn("addNullableDef", Type.INT32, 200));
-    boolean done = syncClient.isAlterTableDone(tableName);
-    assertTrue(done);
 
     // Reopen table for the new schema.
     table = syncClient.openTable(tableName);
@@ -145,6 +142,80 @@ public class TestAlterTable extends BaseKuduTest {
         ", INT32 addNullable=101, INT32 addNullableDef=NULL");
     Collections.sort(expected);
     assertArrayEquals(expected.toArray(new String[0]), actual.toArray(new String[0]));
+  }
+
+  @Test
+  public void testAlterModifyColumns() throws Exception {
+    KuduTable table = createTable(ImmutableList.<Pair<Integer,Integer>>of());
+    insertRows(table, 0, 100);
+    assertEquals(100, countRowsInTable(table));
+
+    // Check for expected defaults.
+    ColumnSchema col = table.getSchema().getColumns().get(1);
+    assertEquals(CompressionAlgorithm.DEFAULT_COMPRESSION, col.getCompressionAlgorithm());
+    assertEquals(Encoding.AUTO_ENCODING, col.getEncoding());
+    assertEquals(null, col.getDefaultValue());
+
+    // Alter the table.
+    syncClient.alterTable(tableName, new AlterTableOptions()
+        .changeCompressionAlgorithm(col.getName(), CompressionAlgorithm.SNAPPY)
+        .changeEncoding(col.getName(), Encoding.RLE)
+        .changeDefault(col.getName(), 0));
+
+    // Check for new values.
+    table = syncClient.openTable(tableName);
+    col = table.getSchema().getColumns().get(1);
+    assertEquals(CompressionAlgorithm.SNAPPY, col.getCompressionAlgorithm());
+    assertEquals(Encoding.RLE, col.getEncoding());
+    assertEquals(0, col.getDefaultValue());
+  }
+
+  @Test
+  public void testRenameKeyColumn() throws Exception {
+    KuduTable table = createTable(ImmutableList.<Pair<Integer,Integer>>of());
+    insertRows(table, 0, 100);
+    assertEquals(100, countRowsInTable(table));
+
+    syncClient.alterTable(tableName, new AlterTableOptions()
+            .renameColumn("c0", "c0Key"));
+
+    // scanning with the old schema
+    try {
+      KuduScanner scanner = syncClient.newScannerBuilder(table)
+              .setProjectedColumnNames(Lists.newArrayList("c0", "c1")).build();
+      while (scanner.hasMoreRows()) {
+        scanner.nextRows();
+      }
+    } catch (KuduException e) {
+      assertTrue(e.getStatus().isInvalidArgument());
+      assertTrue(e.getStatus().getMessage().contains(
+              "Some columns are not present in the current schema: c0"));
+    }
+
+    // Reopen table for the new schema.
+    table = syncClient.openTable(tableName);
+    assertEquals("c0Key", table.getSchema().getPrimaryKeyColumns().get(0).getName());
+    assertEquals(2, table.getSchema().getColumnCount());
+
+    // Add a row
+    KuduSession session = syncClient.newSession();
+    Insert insert = table.newInsert();
+    PartialRow row = insert.getRow();
+    row.addInt("c0Key", 101);
+    row.addInt("c1", 101);
+    session.apply(insert);
+    session.flush();
+    RowError[] rowErrors = session.getPendingErrors().getRowErrors();
+    assertEquals(String.format("row errors: %s", Arrays.toString(rowErrors)), 0, rowErrors.length);
+
+    KuduScanner scanner = syncClient.newScannerBuilder(table)
+            .setProjectedColumnNames(Lists.newArrayList("c0Key", "c1")).build();
+    while (scanner.hasMoreRows()) {
+      RowResultIterator it = scanner.nextRows();
+      assertTrue(it.hasNext());
+      RowResult rr = it.next();
+      assertEquals(rr.getInt(0), rr.getInt(1));
+    }
   }
 
   @Test

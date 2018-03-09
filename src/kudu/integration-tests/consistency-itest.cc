@@ -15,6 +15,8 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
@@ -23,43 +25,56 @@
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
 #include "kudu/client/client-test-util.h"
-#include "kudu/client/scanner-internal.h"
+#include "kudu/client/client.h"
+#include "kudu/client/scan_batch.h"
 #include "kudu/client/scan_configuration.h"
+#include "kudu/client/scan_predicate.h"
+#include "kudu/client/scanner-internal.h"
+#include "kudu/client/schema.h"
 #include "kudu/client/shared_ptr.h"
+#include "kudu/client/value.h"
+#include "kudu/client/write_op.h"
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/clock/mock_ntp.h"
+#include "kudu/clock/time_service.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/internal_mini_cluster-itest-base.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/mini_master.h"
-#include "kudu/integration-tests/cluster_itest_util.h"
-#include "kudu/integration-tests/mini_cluster-itest-base.h"
-#include "kudu/integration-tests/mini_cluster.h"
-#include "kudu/server/hybrid_clock.h"
-#include "kudu/tablet/tablet.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/mini_tablet_server.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/ts_tablet_manager.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/random.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
 DECLARE_int32(heartbeat_interval_ms);
 DECLARE_int32(max_clock_sync_error_usec);
 DECLARE_int32(scanner_gc_check_interval_us);
-DECLARE_bool(use_mock_wall_clock);
+DECLARE_string(time_source);
 
 using kudu::client::ScanConfiguration;
 using kudu::client::sp::shared_ptr;
 using kudu::master::CatalogManager;
 using kudu::master::GetTableLocationsRequestPB;
 using kudu::master::GetTableLocationsResponsePB;
-using kudu::server::HybridClock;
-using kudu::tablet::TabletPeer;
+using kudu::clock::HybridClock;
+using kudu::tablet::TabletReplica;
 using kudu::tserver::MiniTabletServer;
 using kudu::tserver::TabletServer;
 using std::string;
@@ -74,13 +89,13 @@ namespace client {
 class ConsistencyITest : public MiniClusterITestBase {
  public:
   ConsistencyITest()
-      : num_tablet_servers_(2),
+      : num_tablet_servers_(3),
         table_name_("timestamp_propagation_test_table"),
         key_column_name_("key"),
         key_split_value_(8) {
 
     // Using the mock clock: need to advance the clock for tablet servers.
-    FLAGS_use_mock_wall_clock = true;
+    FLAGS_time_source = "mock";
 
     // Reduce the TS<->Master heartbeat interval: this speeds up testing,
     // saving about 700ms per test.
@@ -100,16 +115,47 @@ class ConsistencyITest : public MiniClusterITestBase {
     StartCluster(num_tablet_servers_);
   }
 
+  void ScannerThread(KuduClient::ReplicaSelection selection,
+                     int rows_to_insert,
+                     int first_row,
+                     int scans_to_perform) {
+    client::sp::shared_ptr<KuduClient> client;
+    CHECK_OK(cluster_->CreateClient(nullptr, &client));
+
+    shared_ptr<KuduTable> table;
+    CHECK_OK(client->OpenTable(table_name_, &table));
+
+    size_t row_count;
+    for (int i = 0; i < 3; i++) {
+      // Insert multiple rows into the tablets.
+      InsertTestRows(client.get(), table.get(), rows_to_insert, first_row * i);
+      int expected_count = rows_to_insert * (i + 1);
+      // Perform a bunch of READ_YOUR_WRITES scans to all the replicas
+      // that count the rows. And verify that the count of the rows
+      // never go down from what previously observed, to ensure subsequent
+      // reads will not "go back in time" regarding writes that other
+      // clients have done.
+      for (int j = 0; j < scans_to_perform; j++) {
+        CHECK_OK(GetRowCount(table.get(), KuduScanner::READ_YOUR_WRITES,
+                             selection, 0, &row_count));
+        EXPECT_LE(expected_count, row_count);
+        expected_count = row_count;
+      }
+    }
+  }
+
  protected:
   static void UpdateClock(HybridClock* clock, MonoDelta delta) {
     const uint64_t new_time(HybridClock::GetPhysicalValueMicros(clock->Now()) +
                             delta.ToMicroseconds());
-    clock->SetMockClockWallTimeForTests(new_time);
+    auto* ntp = down_cast<clock::MockNtp*>(clock->time_service());
+    ntp->SetMockClockWallTimeForTests(new_time);
   }
 
   // Creates a table with the specified name and replication factor.
   Status CreateTable(KuduClient* client,
-                     const string& table_name) {
+                     const string& table_name,
+                     int num_replicas = 1) {
     unique_ptr<KuduPartialRow> split_row(schema_.NewRow());
     RETURN_NOT_OK(split_row->SetInt32(0, key_split_value_));
 
@@ -118,7 +164,7 @@ class ConsistencyITest : public MiniClusterITestBase {
                   .schema(&schema_)
                   .add_range_partition_split(split_row.release())
                   .set_range_partition_columns({ key_column_name_ })
-                  .num_replicas(1)
+                  .num_replicas(num_replicas)
                   .Create());
     return Status::OK();
   }
@@ -149,8 +195,15 @@ class ConsistencyITest : public MiniClusterITestBase {
 
   Status GetRowCount(KuduTable* table, KuduScanner::ReadMode read_mode,
                      uint64_t ts, size_t* row_count) {
+    return GetRowCount(table, read_mode, KuduClient::LEADER_ONLY, ts, row_count);
+  }
+
+  Status GetRowCount(KuduTable* table, KuduScanner::ReadMode read_mode,
+                     KuduClient::ReplicaSelection selection, uint64_t ts,
+                     size_t* row_count) {
     KuduScanner scanner(table);
     RETURN_NOT_OK(scanner.SetReadMode(read_mode));
+    RETURN_NOT_OK(scanner.SetSelection(selection));
     if (read_mode == KuduScanner::READ_AT_SNAPSHOT && ts != 0) {
       RETURN_NOT_OK(scanner.SetSnapshotRaw(ts + 1));
     }
@@ -198,24 +251,24 @@ class ConsistencyITest : public MiniClusterITestBase {
   }
 
   Status FindPeerForTablet(const string& tablet_id,
-                           scoped_refptr<TabletPeer>* peer) {
+                           scoped_refptr<TabletReplica>* replica) {
     bool found = false;
     for (size_t i = 0; i < num_tablet_servers_; ++i) {
       MiniTabletServer* mts = cluster_->mini_tablet_server(i);
       TabletServer* ts = mts->server();
 
-      scoped_refptr<TabletPeer> p;
-      if (!ts->tablet_manager()->LookupTablet(tablet_id, &p)) {
+      scoped_refptr<TabletReplica> r;
+      if (!ts->tablet_manager()->LookupTablet(tablet_id, &r)) {
         // Not this one, continue.
         continue;
       }
-      peer->swap(p);
+      replica->swap(r);
       found = true;
       break;
     }
     if (!found) {
       return Status::NotFound(
-          Substitute("$0: cannot find peer for tablet"), tablet_id);
+          Substitute("$0: cannot find replica for tablet"), tablet_id);
     }
     return Status::OK();
   }
@@ -223,10 +276,10 @@ class ConsistencyITest : public MiniClusterITestBase {
   Status UpdateClockForTabletHostingKey(int32_t key, const MonoDelta& offset) {
     string tablet_id;
     RETURN_NOT_OK(GetTabletIdForKey(key, &tablet_id));
-    scoped_refptr<TabletPeer> p;
-    RETURN_NOT_OK(FindPeerForTablet(tablet_id, &p));
+    scoped_refptr<TabletReplica> r;
+    RETURN_NOT_OK(FindPeerForTablet(tablet_id, &r));
 
-    HybridClock* clock = CHECK_NOTNULL(dynamic_cast<HybridClock*>(p->clock()));
+    HybridClock* clock = CHECK_NOTNULL(dynamic_cast<HybridClock*>(r->clock()));
     UpdateClock(clock, offset);
     return Status::OK();
   }
@@ -370,7 +423,7 @@ TEST_F(ConsistencyITest, TestTimestampPropagationFromScans) {
 //   * Get the client's latest observed timestamp: it should be strictly greater
 //     than the recorded timestamp.
 //
-//   * Make a full table scan at in READ_AT_TIMESTAMP mode at 'ts_ref'
+//   * Make a full table scan in the READ_AT_SNAPSHOT mode at 'ts_ref'
 //     timestamp: the scan should retrieve only the first row.
 //
 // If the client propates the timestamps, the second server should receive
@@ -696,5 +749,102 @@ TEST_F(ConsistencyITest, TestScanTokenTimestampPropagation) {
   }
 }
 
+const KuduClient::ReplicaSelection replica_selectors[] = {
+    KuduClient::LEADER_ONLY,
+    KuduClient::CLOSEST_REPLICA,
+    KuduClient::FIRST_REPLICA,
+};
+
+class ScanYourWritesParamTest :
+    public ConsistencyITest,
+    public ::testing::WithParamInterface<KuduClient::ReplicaSelection> {
+};
+
+// Verify that no matter which replica is selected, a single client could
+// achieve read-your-writes on READ_YOUR_WRITES scan mode.
+TEST_P(ScanYourWritesParamTest, Test) {
+  const KuduClient::ReplicaSelection sel = GetParam();
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  ASSERT_OK(CreateTable(client.get(), table_name_, 3));
+  shared_ptr<KuduTable> table;
+  ASSERT_OK(client->OpenTable(table_name_, &table));
+
+  // Insert multiple rows into the tablets.
+  const uint64_t rows_to_insert = 20000;
+  ASSERT_OK(InsertTestRows(client.get(), table.get(), rows_to_insert, 0));
+
+  size_t row_count;
+  ASSERT_OK(GetRowCount(table.get(), KuduScanner::READ_YOUR_WRITES,
+                        sel, 0, &row_count));
+  EXPECT_EQ(rows_to_insert, row_count);
+
+  row_count = 0;
+  ASSERT_OK(GetRowCount(table.get(), KuduScanner::READ_YOUR_WRITES,
+                        sel, 0, &row_count));
+  EXPECT_EQ(rows_to_insert, row_count);
+}
+
+INSTANTIATE_TEST_CASE_P(Params, ScanYourWritesParamTest,
+                        testing::ValuesIn(replica_selectors));
+
+class ScanYourWritesMultiClientsParamTest :
+    public ConsistencyITest,
+    public ::testing::WithParamInterface<KuduClient::ReplicaSelection> {
+};
+
+// This is a test that verifies, when multiple clients running
+// simultaneously, a client can get read-your-writes and
+// read-your-reads session guarantees using READ_YOUR_WRITES
+// scan mode, no matter which replica is selected.
+//
+// Read-your-writes guarantees that a client can see all previous
+// writes that it performed.
+//
+// Read-your-reads guarantees all subsequent reads to a given object
+// "never return any previous values" regarding writes that other
+// clients have done.
+//
+// The test scenario is as the following:
+//
+// 1) Have multiple clients running concurrently,
+//
+// 2) From the same client performs multiple writes and
+//    multiple sets of scans. Each client
+//    continuously performs inserts to a tablet, and then
+//    performs a bunch of READ_YOUR_WRITES scans to all the
+//    replicas that count the rows. The count of the rows
+//    should never go down from the previous observed one.
+TEST_P(ScanYourWritesMultiClientsParamTest, Test) {
+  const KuduClient::ReplicaSelection sel = GetParam();
+  shared_ptr<KuduClient> client;
+  ASSERT_OK(cluster_->CreateClient(nullptr, &client));
+  ASSERT_OK(CreateTable(client.get(), table_name_, 3));
+
+  for (int run = 1; run <= 3; run++) {
+    vector<scoped_refptr<Thread>> threads;
+    const int kNumThreads = 5;
+    const int rows_to_insert = 1000;
+    const int scans_to_performs = AllowSlowTests() ? 10 : 3;
+    for (int i = 0; i < kNumThreads; i++) {
+      Random first_row(rows_to_insert * kNumThreads);
+      scoped_refptr<kudu::Thread> new_thread;
+      CHECK_OK(kudu::Thread::Create(
+          "test", strings::Substitute("test-scanner-$0", i),
+          &ConsistencyITest::ScannerThread, this,
+          sel, rows_to_insert, first_row.Next32(),
+          scans_to_performs, &new_thread));
+      threads.push_back(new_thread);
+    }
+    SleepFor(MonoDelta::FromMilliseconds(50));
+
+    for (const scoped_refptr<kudu::Thread> &thr : threads) {
+      CHECK_OK(ThreadJoiner(thr.get()).Join());
+    }
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(Params, ScanYourWritesMultiClientsParamTest,
+                        testing::ValuesIn(replica_selectors));
 } // namespace client
 } // namespace kudu

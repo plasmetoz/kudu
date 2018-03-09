@@ -4,12 +4,17 @@
 
 #include "kudu/util/condition_variable.h"
 
-#include <glog/logging.h>
-
-#include <errno.h>
 #include <sys/time.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <ctime>
+#include <ostream>
+
+#include <glog/logging.h>
+
 #include "kudu/util/monotime.h"
+#include "kudu/util/mutex.h"
 #include "kudu/util/thread_restrictions.h"
 
 namespace kudu {
@@ -74,7 +79,7 @@ bool ConditionVariable::TimedWait(const MonoDelta& max_time) const {
   ThreadRestrictions::AssertWaitAllowed();
 
   // Negative delta means we've already timed out.
-  int64 nsecs = max_time.ToNanoseconds();
+  int64_t nsecs = max_time.ToNanoseconds();
   if (nsecs < 0) {
     return false;
   }

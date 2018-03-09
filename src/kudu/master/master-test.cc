@@ -15,47 +15,92 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
-#include <rapidjson/document.h>
-
 #include <algorithm>
+#include <cstdint>
+#include <map>
 #include <memory>
-#include <utility>
+#include <ostream>
+#include <set>
+#include <string>
 #include <thread>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
+#include <boost/bind.hpp>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+#include <rapidjson/document.h>
+#include <rapidjson/rapidjson.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/replica_management.pb.h"
 #include "kudu/generated/version_defines.h"
-#include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/gutil/strings/util.h"
+#include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
-#include "kudu/master/master-test-util.h"
+#include "kudu/master/master_options.h"
 #include "kudu/master/mini_master.h"
 #include "kudu/master/sys_catalog.h"
 #include "kudu/master/ts_descriptor.h"
 #include "kudu/master/ts_manager.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
 #include "kudu/server/rpc_server.h"
+#include "kudu/util/atomic.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/curl_util.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/random.h"
 #include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/version_info.h"
 
+using kudu::consensus::ReplicaManagementInfoPB;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
+using std::map;
+using std::multiset;
 using std::pair;
 using std::shared_ptr;
 using std::string;
 using std::thread;
+using std::unordered_map;
+using std::unordered_set;
+using std::vector;
 using strings::Substitute;
 
 DECLARE_bool(catalog_manager_check_ts_count_for_create_table);
+DECLARE_bool(raft_prepare_replacement_before_eviction);
 DECLARE_double(sys_catalog_fail_during_write);
+DECLARE_int32(master_inject_latency_on_tablet_lookups_ms);
 
 namespace kudu {
 namespace master {
@@ -70,15 +115,17 @@ class MasterTest : public KuduTest {
     FLAGS_catalog_manager_check_ts_count_for_create_table = false;
 
     // Start master
-    mini_master_.reset(new MiniMaster(Env::Default(), GetTestPath("Master"), 0));
+    mini_master_.reset(new MiniMaster(GetTestPath("Master"), HostPort("127.0.0.1", 0)));
     ASSERT_OK(mini_master_->Start());
     master_ = mini_master_->master();
-    ASSERT_OK(master_->WaitUntilCatalogManagerIsLeaderAndReadyForTests(MonoDelta::FromSeconds(5)));
+    ASSERT_OK(master_->WaitUntilCatalogManagerIsLeaderAndReadyForTests(
+        MonoDelta::FromSeconds(90)));
 
     // Create a client proxy to it.
     MessengerBuilder bld("Client");
     ASSERT_OK(bld.Build(&client_messenger_));
-    proxy_.reset(new MasterServiceProxy(client_messenger_, mini_master_->bound_rpc_addr()));
+    proxy_.reset(new MasterServiceProxy(client_messenger_, mini_master_->bound_rpc_addr(),
+                                        mini_master_->bound_rpc_addr().host()));
   }
 
   virtual void TearDown() OVERRIDE {
@@ -117,12 +164,12 @@ static void MakeHostPortPB(const string& host, uint32_t port, HostPortPB* pb) {
 // Test that shutting down a MiniMaster without starting it does not
 // SEGV.
 TEST_F(MasterTest, TestShutdownWithoutStart) {
-  MiniMaster m(Env::Default(), "/xxxx", 0);
+  MiniMaster m("/xxxx", HostPort("127.0.0.1", 0));
   m.Shutdown();
 }
 
 TEST_F(MasterTest, TestRegisterAndHeartbeat) {
-  const char *kTsUUID = "my-ts-uuid";
+  const char* const kTsUUID = "my-ts-uuid";
 
   TSToMasterCommonPB common;
   common.mutable_ts_instance()->set_permanent_uuid(kTsUUID);
@@ -137,6 +184,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     req.mutable_common()->CopyFrom(common);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_TRUE(resp.leader_master());
     ASSERT_TRUE(resp.needs_reregister());
     ASSERT_TRUE(resp.needs_full_tablet_report());
@@ -154,7 +202,13 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
   ServerRegistrationPB fake_reg;
   MakeHostPortPB("localhost", 1000, fake_reg.add_rpc_addresses());
   MakeHostPortPB("localhost", 2000, fake_reg.add_http_addresses());
-  fake_reg.set_software_version(VersionInfo::GetShortVersionString());
+  fake_reg.set_software_version(VersionInfo::GetVersionInfo());
+
+  // Information on replica management scheme.
+  ReplicaManagementInfoPB rmi;
+  rmi.set_replacement_scheme(FLAGS_raft_prepare_replacement_before_eviction
+      ? ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION
+      : ReplicaManagementInfoPB::EVICT_FIRST);
 
   {
     TSHeartbeatRequestPB req;
@@ -162,8 +216,10 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     RpcController rpc;
     req.mutable_common()->CopyFrom(common);
     req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
@@ -189,8 +245,10 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     RpcController rpc;
     req.mutable_common()->CopyFrom(common);
     req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
@@ -206,8 +264,10 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     RpcController rpc;
     req.mutable_common()->CopyFrom(common);
     req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_FALSE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
@@ -227,6 +287,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     tr->set_sequence_number(0);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_FALSE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
@@ -245,6 +306,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     tr->set_sequence_number(0);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
@@ -262,6 +324,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     tr->set_sequence_number(0);
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
 
+    ASSERT_FALSE(resp.has_error());
     ASSERT_TRUE(resp.leader_master());
     ASSERT_FALSE(resp.needs_reregister());
     ASSERT_FALSE(resp.needs_full_tablet_report());
@@ -280,7 +343,9 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     ListTabletServersResponsePB resp;
     RpcController rpc;
     ASSERT_OK(proxy_->ListTabletServers(req, &resp, &rpc));
+
     LOG(INFO) << SecureDebugString(resp);
+    ASSERT_FALSE(resp.has_error());
     ASSERT_EQ(1, resp.servers_size());
     ASSERT_EQ("my-ts-uuid", resp.servers(0).instance_id().permanent_uuid());
     ASSERT_EQ(1, resp.servers(0).instance_id().instance_seqno());
@@ -304,7 +369,7 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     ASSERT_STREQ("my-ts-uuid", tablet_server["uuid"].GetString());
     ASSERT_TRUE(tablet_server["millis_since_heartbeat"].GetInt64() >= 0);
     ASSERT_EQ(true, tablet_server["live"].GetBool());
-    ASSERT_STREQ(VersionInfo::GetShortVersionString().c_str(),
+    ASSERT_STREQ(VersionInfo::GetVersionInfo().c_str(),
         tablet_server["version"].GetString());
   }
 
@@ -315,11 +380,13 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     RpcController rpc;
     req.mutable_common()->CopyFrom(common);
     req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
     // This string should never match the actual VersionInfo string, although
     // the numeric portion will match.
     req.mutable_registration()->set_software_version(Substitute("kudu $0 (rev SOME_NON_GIT_HASH)",
                                                                 KUDU_VERSION_STRING));
     ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_FALSE(resp.has_error());
   }
 
   // Ensure that trying to re-register with a different port fails.
@@ -329,12 +396,46 @@ TEST_F(MasterTest, TestRegisterAndHeartbeat) {
     RpcController rpc;
     req.mutable_common()->CopyFrom(common);
     req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
     req.mutable_registration()->mutable_rpc_addresses(0)->set_port(1001);
     Status s = proxy_->TSHeartbeat(req, &resp, &rpc);
     ASSERT_TRUE(s.IsRemoteError());
     ASSERT_STR_CONTAINS(s.ToString(),
                         "Tablet server my-ts-uuid is attempting to re-register "
                         "with a different host/port.");
+  }
+
+  // Ensure an attempt to register fails if the tablet server uses the replica
+  // management scheme which is different from the scheme that
+  // the catalog manager uses.
+  {
+    ServerRegistrationPB fake_reg;
+    MakeHostPortPB("localhost", 3000, fake_reg.add_rpc_addresses());
+    MakeHostPortPB("localhost", 4000, fake_reg.add_http_addresses());
+
+    // Set replica management scheme to something different that master uses
+    // (here, it's just inverted).
+    ReplicaManagementInfoPB rmi;
+    rmi.set_replacement_scheme(FLAGS_raft_prepare_replacement_before_eviction
+        ? ReplicaManagementInfoPB::EVICT_FIRST
+        : ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION);
+
+    TSHeartbeatRequestPB req;
+    req.mutable_common()->CopyFrom(common);
+    req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
+
+    TSHeartbeatResponsePB resp;
+    RpcController rpc;
+    ASSERT_OK(proxy_->TSHeartbeat(req, &resp, &rpc));
+    ASSERT_TRUE(resp.has_error());
+    const Status s = StatusFromPB(resp.error().status());
+    ASSERT_TRUE(s.IsConfigurationError()) << s.ToString();
+    const string msg = Substitute(
+        "replica replacement scheme (.*) of the tablet server $0 "
+        "at .*:[0-9]+ differs from the catalog manager's (.*); "
+        "they must be run with the same scheme", kTsUUID);
+    ASSERT_STR_MATCHES(s.ToString(), msg);
   }
 }
 
@@ -512,7 +613,7 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(),
                         "Invalid argument: split rows may only contain values "
-                        "for range partitioned columns: val")
+                        "for range partitioned columns: val");
   }
 
   { // Overlapping bounds.
@@ -567,7 +668,7 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(),
                         "Invalid argument: range partition lower bound must be "
-                        "less than or equal to the upper bound");
+                        "less than the upper bound");
   }
   { // Lower bound equals upper bound.
     KuduPartialRow bound_lower(&kTableSchema);
@@ -579,7 +680,7 @@ TEST_F(MasterTest, TestCreateTableCheckRangeInvariants) {
     ASSERT_TRUE(s.IsInvalidArgument());
     ASSERT_STR_CONTAINS(s.ToString(),
                         "Invalid argument: range partition lower bound must be "
-                        "less than or equal to the upper bound");
+                        "less than the upper bound");
   }
   { // Split equals lower bound
     KuduPartialRow bound_lower(&kTableSchema);
@@ -696,13 +797,55 @@ TEST_F(MasterTest, TestInvalidGetTableLocations) {
   }
 }
 
+// Test that, if the master's RPC service queue overflows, thread stack traces
+// are dumped to the diagnostics log.
+TEST_F(MasterTest, TestDumpStacksOnRpcQueueOverflow) {
+  mini_master_->mutable_options()->rpc_opts.num_service_threads = 1;
+  mini_master_->mutable_options()->rpc_opts.service_queue_length = 1;
+  FLAGS_master_inject_latency_on_tablet_lookups_ms = 1000;
+  FLAGS_log_dir = GetTestDataDirectory();
+  mini_master_->Shutdown();
+  ASSERT_OK(mini_master_->Restart());
+  ASSERT_OK(mini_master_->master()->
+      WaitUntilCatalogManagerIsLeaderAndReadyForTests(MonoDelta::FromSeconds(5)));
+
+  // Send a bunch of RPCs which will cause the service queue to overflow. We can send a
+  // bogus request since the latency will be injected even if the table doesn't exist.
+  GetTableLocationsRequestPB req;
+  req.mutable_table()->set_table_name("abc");
+  const int kNumRpcs = 20;
+  GetTableLocationsResponsePB resps[kNumRpcs];
+  RpcController rpcs[kNumRpcs];
+  CountDownLatch latch(kNumRpcs);
+  for (int i = 0; i < kNumRpcs; i++) {
+    proxy_->GetTableLocationsAsync(req, &resps[i], &rpcs[i],
+                                   boost::bind(&CountDownLatch::CountDown, &latch));
+  }
+  latch.Wait();
+
+  // Ensure that the metrics log contains a single trace dump for the overflowed service
+  // queue. Even though we may have overflowed the queue many times, we throttle the dumping
+  // so there should only be one.
+  vector<string> log_paths;
+  ASSERT_OK(env_->Glob(FLAGS_log_dir + "/*diagnostics*", &log_paths));
+  ASSERT_EQ(1, log_paths.size());
+  faststring log_contents;
+  ASSERT_OK(ReadFileToString(env_, log_paths[0], &log_contents));
+  vector<string> lines = strings::Split(log_contents.ToString(), "\n");
+  int dump_count = std::count_if(lines.begin(), lines.end(), [](const string& line) {
+      return MatchPattern(line, "*service queue overflowed for kudu.master.MasterService*");
+    });
+  ASSERT_EQ(dump_count, 1) << log_contents.ToString();
+}
+
+
 // Tests that if the master is shutdown while a table visitor is active, the
 // shutdown waits for the visitor to finish, avoiding racing and crashing.
 TEST_F(MasterTest, TestShutdownDuringTableVisit) {
   ASSERT_OK(master_->catalog_manager()->ElectedAsLeaderCb());
 
   // Master will now shut down, potentially racing with
-  // CatalogManager::VisitTablesAndTabletsTask.
+  // CatalogManager::PrepareForLeadershipTask().
 }
 
 // Tests that the catalog manager handles spurious calls to ElectedAsLeaderCb()
@@ -806,10 +949,10 @@ TEST_F(MasterTest, TestGetTableSchemaIsAtomicWithCreateTable) {
 class MasterMetadataVerifier : public TableVisitor,
                                public TabletVisitor {
  public:
-  MasterMetadataVerifier(const unordered_set<string>& live_table_names,
-                         const multiset<string>& dead_table_names)
-    : live_table_names_(live_table_names),
-      dead_table_names_(dead_table_names) {
+  MasterMetadataVerifier(unordered_set<string>  live_table_names,
+                         multiset<string>  dead_table_names)
+    : live_table_names_(std::move(live_table_names)),
+      dead_table_names_(std::move(dead_table_names)) {
   }
 
   virtual Status VisitTable(const std::string& table_id,
@@ -1083,8 +1226,10 @@ TEST_F(MasterTest, TestMasterMetadataConsistentDespiteFailures) {
   ASSERT_GE(num_injected_failures, 1);
 
   // Restart the catalog manager to ensure that it can survive reloading the
-  // metadata we wrote to disk.
+  // metadata we wrote to disk. Make sure failure injection is disabled as
+  // restarting may issue several catalog writes.
   mini_master_->Shutdown();
+  FLAGS_sys_catalog_fail_during_write = 0.0;
   ASSERT_OK(mini_master_->Restart());
 
   // Reload the metadata again, this time verifying its consistency.
@@ -1121,23 +1266,19 @@ TEST_F(MasterTest, TestConcurrentCreateOfSameTable) {
       // There are three expected outcomes:
       //
       // 1. This thread won the CreateTable() race: no error.
-      // 2. This thread lost the CreateTable() race: TABLE_NOT_FOUND error
-      //    with ServiceUnavailable status.
+      // 2. This thread lost the CreateTable() race, but the table is still
+      //    in the process of being created: TABLE_ALREADY_PRESENT error with
+      //    ServiceUnavailable status.
       // 3. This thread arrived after the CreateTable() race was already over:
       //    TABLE_ALREADY_PRESENT error with AlreadyPresent status.
       if (resp.has_error()) {
         Status s = StatusFromPB(resp.error().status());
         string failure_msg = Substitute("Unexpected response: $0",
                                         SecureDebugString(resp));
-        switch (resp.error().code()) {
-          case MasterErrorPB::TABLE_NOT_FOUND:
-            CHECK(s.IsServiceUnavailable()) << failure_msg;
-            break;
-          case MasterErrorPB::TABLE_ALREADY_PRESENT:
-            CHECK(s.IsAlreadyPresent()) << failure_msg;
-            break;
-          default:
-            FAIL() << failure_msg;
+        if (resp.error().code() == MasterErrorPB::TABLE_ALREADY_PRESENT) {
+          CHECK(s.IsServiceUnavailable() || s.IsAlreadyPresent()) << failure_msg;
+        } else {
+          FAIL() << failure_msg;
         }
       }
     });
@@ -1227,23 +1368,17 @@ TEST_F(MasterTest, TestConcurrentCreateAndRenameOfSameTable) {
         // There are three expected outcomes:
         //
         // 1. This thread finished well before the others: no error.
-        // 2. This thread raced with another thread: TABLE_NOT_FOUND error with
-        //    ServiceUnavailable status.
-        // 3. This thread finished well after the others: TABLE_ALREADY_PRESENT
-        //    error with AlreadyPresent status.
+        // 2. This thread raced with CreateTable() or AlterTable():
+        //    TABLE_ALREADY_PRESENT error with ServiceUnavailable status.
+        // 3. This thread finished well after the others:
+        //    TABLE_ALREADY_PRESENT error with AlreadyPresent status.
         if (resp.has_error()) {
           Status s = StatusFromPB(resp.error().status());
-          string failure_msg = Substitute("Unexpected response: $0",
-                                          SecureDebugString(resp));
-          switch (resp.error().code()) {
-            case MasterErrorPB::TABLE_NOT_FOUND:
-              CHECK(s.IsServiceUnavailable()) << failure_msg;
-              break;
-            case MasterErrorPB::TABLE_ALREADY_PRESENT:
-              CHECK(s.IsAlreadyPresent()) << failure_msg;
-              break;
-            default:
-              FAIL() << failure_msg;
+          string failure_msg = Substitute("Unexpected response: $0", SecureDebugString(resp));
+          if (resp.error().code() == MasterErrorPB::TABLE_ALREADY_PRESENT) {
+              CHECK(s.IsServiceUnavailable() || s.IsAlreadyPresent()) << failure_msg;
+          } else {
+            FAIL() << failure_msg;
           }
         } else {
           // Creating the table should only succeed once.
@@ -1261,25 +1396,25 @@ TEST_F(MasterTest, TestConcurrentCreateAndRenameOfSameTable) {
         CHECK_OK(proxy_->AlterTable(req, &resp, &controller));
         SCOPED_TRACE(SecureDebugString(resp));
 
-        // There are three expected outcomes:
+        // There are four expected outcomes:
         //
         // 1. This thread finished well before the others: no error.
-        // 2. This thread raced with CreateTable(): TABLE_NOT_FOUND error with
-        //    ServiceUnavailable status (if raced during reservation stage)
-        //    or TABLE_ALREADY_PRESENT error with AlreadyPresent status (if
-        //    raced after reservation stage).
-        // 3. This thread raced with AlterTable() or finished well after the
-        //    others: TABLE_NOT_FOUND error with NotFound status.
+        // 2. This thread raced with CreateTable() or AlterTable():
+        //    TABLE_ALREADY_PRESENT error with ServiceUnavailable status.
+        // 3. This thread completed well after a CreateTable():
+        //    TABLE_ALREADY_PRESENT error with AlreadyPresent status.
+        // 4. This thread completed well after an AlterTable():
+        //    TABLE_NOT_FOUND error with NotFound status.
         if (resp.has_error()) {
           Status s = StatusFromPB(resp.error().status());
           string failure_msg = Substitute("Unexpected response: $0",
                                           SecureDebugString(resp));
           switch (resp.error().code()) {
-            case MasterErrorPB::TABLE_NOT_FOUND:
-              CHECK(s.IsServiceUnavailable() || s.IsNotFound()) << failure_msg;
-              break;
             case MasterErrorPB::TABLE_ALREADY_PRESENT:
-              CHECK(s.IsAlreadyPresent()) << failure_msg;
+              CHECK(s.IsServiceUnavailable() || s.IsAlreadyPresent()) << failure_msg;
+              break;
+            case MasterErrorPB::TABLE_NOT_FOUND:
+              CHECK(s.IsNotFound()) << failure_msg;
               break;
             default:
               FAIL() << failure_msg;
@@ -1313,6 +1448,68 @@ TEST_F(MasterTest, TestConcurrentCreateAndRenameOfSameTable) {
   ASSERT_OK(verifier.Verify());
 }
 
+TEST_F(MasterTest, TestConcurrentRenameAndDeleteOfSameTable) {
+  const char* kTableName = "testtb";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  bool renamed = false;
+  bool deleted = false;
+
+  thread renamer([&] {
+      AlterTableRequestPB req;
+      AlterTableResponsePB resp;
+      RpcController controller;
+
+      req.mutable_table()->set_table_name(kTableName);
+      req.set_new_table_name("testtb-renamed");
+      CHECK_OK(proxy_->AlterTable(req, &resp, &controller));
+
+      // There are two expected outcomes:
+      //
+      // 1. This thread won the race: no error.
+      // 2. This thread lost the race: TABLE_NOT_FOUND error with NotFound status.
+      if (resp.has_error()) {
+        Status s = StatusFromPB(resp.error().status());
+        string failure_msg = Substitute("Unexpected response: $0",
+                                        SecureDebugString(resp));
+        CHECK_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code()) << failure_msg;
+        CHECK(s.IsNotFound()) << failure_msg;
+      } else {
+        renamed = true;
+      }
+  });
+
+  thread dropper([&] {
+      DeleteTableRequestPB req;
+      DeleteTableResponsePB resp;
+      RpcController controller;
+
+      req.mutable_table()->set_table_name(kTableName);
+      CHECK_OK(proxy_->DeleteTable(req, &resp, &controller));
+
+      // There are two expected outcomes:
+      //
+      // 1. This thread won the race: no error.
+      // 2. This thread lost the race: TABLE_NOT_FOUND error with NotFound status.
+      if (resp.has_error()) {
+        Status s = StatusFromPB(resp.error().status());
+        string failure_msg = Substitute("Unexpected response: $0",
+                                        SecureDebugString(resp));
+        CHECK_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code()) << failure_msg;
+        CHECK(s.IsNotFound()) << failure_msg;
+      } else {
+        deleted = true;
+      }
+  });
+
+  renamer.join();
+  dropper.join();
+
+  ASSERT_TRUE(renamed ^ deleted);
+}
+
 // Unit tests for the ConnectToMaster() RPC:
 // should issue authentication tokens and the master CA cert.
 TEST_F(MasterTest, TestConnectToMaster) {
@@ -1334,15 +1531,79 @@ TEST_F(MasterTest, TestConnectToMaster) {
   security::TokenPB token;
   ASSERT_TRUE(token.ParseFromString(resp.authn_token().token_data()));
   ASSERT_TRUE(token.authn().has_username());
+
+  ASSERT_EQ(1, resp.master_addrs_size());
+  ASSERT_EQ("127.0.0.1", resp.master_addrs(0).host());
+  ASSERT_NE(0, resp.master_addrs(0).port());
 }
 
 // Test that the master signs its on server certificate when it becomes the leader,
 // and also that it loads TSKs into the messenger's verifier.
 TEST_F(MasterTest, TestSignOwnCertAndLoadTSKs) {
-  AssertEventually([&]() {
+  ASSERT_EVENTUALLY([&]() {
       ASSERT_TRUE(master_->tls_context().has_signed_cert());
       ASSERT_GT(master_->messenger()->token_verifier().GetMaxKnownKeySequenceNumber(), -1);
     });
+}
+
+TEST_F(MasterTest, TestTableIdentifierWithIdAndName) {
+  const char *kTableName = "testtb";
+  const Schema kTableSchema({ ColumnSchema("key", INT32) }, 1);
+
+  ASSERT_OK(CreateTable(kTableName, kTableSchema));
+
+  ListTablesResponsePB tables;
+  ASSERT_NO_FATAL_FAILURE(DoListAllTables(&tables));
+  ASSERT_EQ(1, tables.tables_size());
+  ASSERT_EQ(kTableName, tables.tables(0).name());
+  string table_id = tables.tables(0).id();
+  ASSERT_FALSE(table_id.empty());
+
+  // Delete the table with an invalid ID.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(kTableName);
+    req.mutable_table()->set_table_id("abc123");
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code());
+  }
+
+  // Delete the table with an invalid name.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name("abc123");
+    req.mutable_table()->set_table_id(table_id);
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code());
+  }
+
+  // Delete the table with an invalid ID and name.
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name("abc123");
+    req.mutable_table()->set_table_id("abc123");
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_EQ(MasterErrorPB::TABLE_NOT_FOUND, resp.error().code());
+  }
+
+  {
+    DeleteTableRequestPB req;
+    DeleteTableResponsePB resp;
+    RpcController controller;
+    req.mutable_table()->set_table_name(kTableName);
+    req.mutable_table()->set_table_id(table_id);
+    ASSERT_OK(proxy_->DeleteTable(req, &resp, &controller));
+    ASSERT_FALSE(resp.has_error()) << resp.error().DebugString();
+  }
 }
 
 } // namespace master

@@ -20,7 +20,7 @@ from __future__ import division
 
 from kudu.compat import unittest
 from kudu.tests.util import TestScanBase
-from kudu.tests.common import KuduTestBase
+from kudu.tests.common import KuduTestBase, TimeoutError
 import kudu
 import datetime
 import time
@@ -259,6 +259,10 @@ class TestScanner(TestScanBase):
         # Test a single precision float predicate
         # Does a row check count only
         self._test_float_pred()
+
+    def test_decimal_pred(self):
+        # Test a decimal predicate
+        self._test_decimal_pred()
 
     def test_binary_pred(self):
         # Test a binary predicate

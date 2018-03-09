@@ -17,29 +17,37 @@
 
 #include "kudu/cfile/cfile_writer.h"
 
-#include <glog/logging.h>
-#include <string>
+#include <functional>
+#include <numeric>
+#include <ostream>
 #include <utility>
 
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "kudu/cfile/block_compression.h"
+#include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/block_pointer.h"
+#include "kudu/cfile/cfile.pb.h"
 #include "kudu/cfile/cfile_util.h"
-#include "kudu/cfile/index_block.h"
 #include "kudu/cfile/index_btree.h"
 #include "kudu/cfile/type_encodings.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/key_encoder.h"
-#include "kudu/gutil/endian.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/port.h"
+#include "kudu/util/array_view.h" // IWYU pragma: keep
+#include "kudu/util/coding-inl.h"
 #include "kudu/util/coding.h"
 #include "kudu/util/compression/compression_codec.h"
+#include "kudu/util/crc.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/hexdump.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
-
-using google::protobuf::RepeatedPtrField;
-using kudu::fs::ScopedWritableBlockCloser;
-using kudu::fs::WritableBlock;
-using std::string;
 
 DEFINE_int32(cfile_default_block_size, 256*1024, "The default block size to use in cfiles");
 TAG_FLAG(cfile_default_block_size, advanced);
@@ -48,23 +56,19 @@ DEFINE_string(cfile_default_compression_codec, "none",
               "Default cfile block compression codec.");
 TAG_FLAG(cfile_default_compression_codec, advanced);
 
-// The default value is optimized for throughput in the case that
-// there are multiple drives backing the tablet. By asynchronously
-// flushing each cfile before issuing any fsyncs, the IO across
-// disks is done in parallel.
-//
-// This increases throughput but can harm latency in the case that
-// there are few disks and the WAL is on the same disk as the
-// data blocks. The default is chosen based on the assumptions that:
-// - latency is leveled across machines by Raft
-// - latency-sensitive applications can devote a disk to the WAL
-// - super-sensitive applications can devote an SSD to the WAL.
-// - users could always change this to "close", which slows down throughput
-//   but may improve write latency.
-DEFINE_string(cfile_do_on_finish, "flush",
-              "What to do to cfile blocks when writing is finished. "
-              "Possible values are 'close', 'flush', or 'nothing'.");
-TAG_FLAG(cfile_do_on_finish, experimental);
+DEFINE_bool(cfile_write_checksums, true,
+            "Write CRC32 checksums for each block");
+TAG_FLAG(cfile_write_checksums, evolving);
+
+using google::protobuf::RepeatedPtrField;
+using kudu::fs::BlockCreationTransaction;
+using kudu::fs::BlockManager;
+using kudu::fs::WritableBlock;
+using std::accumulate;
+using std::pair;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace cfile {
@@ -72,6 +76,7 @@ namespace cfile {
 const char kMagicStringV1[] = "kuducfil";
 const char kMagicStringV2[] = "kuducfl2";
 const int kMagicLength = 8;
+const size_t kChecksumSize = sizeof(uint32_t);
 
 static const size_t kMinBlockSize = 512;
 
@@ -80,33 +85,20 @@ static CompressionType GetDefaultCompressionCodec() {
 }
 
 ////////////////////////////////////////////////////////////
-// Options
-////////////////////////////////////////////////////////////
-WriterOptions::WriterOptions()
-  : index_block_size(32*1024),
-    block_restart_interval(16),
-    write_posidx(false),
-    write_validx(false),
-    optimize_index_keys(true) {
-}
-
-
-////////////////////////////////////////////////////////////
 // CFileWriter
 ////////////////////////////////////////////////////////////
 
 
-CFileWriter::CFileWriter(const WriterOptions &options,
+CFileWriter::CFileWriter(WriterOptions options,
                          const TypeInfo* typeinfo,
                          bool is_nullable,
-                         gscoped_ptr<WritableBlock> block)
+                         unique_ptr<WritableBlock> block)
   : block_(std::move(block)),
     off_(0),
     value_count_(0),
-    options_(options),
+    options_(std::move(options)),
     is_nullable_(is_nullable),
     typeinfo_(typeinfo),
-    key_encoder_(nullptr),
     state_(kWriterInitialized) {
   EncodingType encoding = options_.storage_attributes.encoding;
   Status s = TypeEncodingInfo::Get(typeinfo_, encoding, &type_encoding_info_);
@@ -135,12 +127,18 @@ CFileWriter::CFileWriter(const WriterOptions &options,
     options_.storage_attributes.cfile_block_size = kMinBlockSize;
   }
 
-  if (options.write_posidx) {
+  if (options_.write_posidx) {
     posidx_builder_.reset(new IndexTreeBuilder(&options_, this));
   }
 
-  if (options.write_validx) {
-    key_encoder_ = &GetKeyEncoder<faststring>(typeinfo_);
+  if (options_.write_validx) {
+    if (!options_.validx_key_encoder) {
+      auto key_encoder = &GetKeyEncoder<faststring>(typeinfo_);
+      options_.validx_key_encoder = [key_encoder] (const void* value, faststring* buffer) {
+        key_encoder->ResetAndEncode(value, buffer);
+      };
+    }
+
     validx_builder_.reset(new IndexTreeBuilder(&options_, this));
   }
 }
@@ -164,14 +162,25 @@ Status CFileWriter::Start() {
 
   uint32_t pb_size = header.ByteSize();
 
-  faststring buf;
+  faststring header_str;
   // First the magic.
-  buf.append(kMagicStringV2);
+  header_str.append(kMagicStringV2);
   // Then Length-prefixed header.
-  PutFixed32(&buf, pb_size);
-  pb_util::AppendToString(header, &buf);
-  RETURN_NOT_OK_PREPEND(block_->Append(Slice(buf)), "Couldn't write header");
-  off_ += buf.size();
+  PutFixed32(&header_str, pb_size);
+  pb_util::AppendToString(header, &header_str);
+
+  vector<Slice> header_slices;
+  header_slices.emplace_back(header_str);
+
+  // Append header checksum.
+  uint8_t checksum_buf[kChecksumSize];
+  if (FLAGS_cfile_write_checksums) {
+    uint32_t header_checksum = crc::Crc32c(header_str.data(), header_str.size());
+    InlineEncodeFixed32(checksum_buf, header_checksum);
+    header_slices.emplace_back(checksum_buf, kChecksumSize);
+  }
+
+  RETURN_NOT_OK_PREPEND(WriteRawData(header_slices), "Couldn't write header");
 
   BlockBuilder *bb;
   RETURN_NOT_OK(type_encoding_info_->CreateBlockBuilder(&bb, &options_));
@@ -190,12 +199,13 @@ Status CFileWriter::Start() {
 
 Status CFileWriter::Finish() {
   TRACE_EVENT0("cfile", "CFileWriter::Finish");
-  ScopedWritableBlockCloser closer;
-  RETURN_NOT_OK(FinishAndReleaseBlock(&closer));
-  return closer.CloseBlocks();
+  BlockManager* bm = block_->block_manager();
+  unique_ptr<BlockCreationTransaction> transaction = bm->NewCreationTransaction();
+  RETURN_NOT_OK(FinishAndReleaseBlock(transaction.get()));
+  return transaction->CommitCreatedBlocks();
 }
 
-Status CFileWriter::FinishAndReleaseBlock(ScopedWritableBlockCloser* closer) {
+Status CFileWriter::FinishAndReleaseBlock(BlockCreationTransaction* transaction) {
   TRACE_EVENT0("cfile", "CFileWriter::FinishAndReleaseBlock");
   CHECK(state_ == kWriterWriting) <<
     "Bad state for Finish(): " << state_;
@@ -205,6 +215,11 @@ Status CFileWriter::FinishAndReleaseBlock(ScopedWritableBlockCloser* closer) {
 
   state_ = kWriterFinished;
 
+  uint32_t incompatible_features = 0;
+  if (FLAGS_cfile_write_checksums) {
+    incompatible_features |= IncompatibleFeatures::CHECKSUM;
+  }
+
   // Start preparing the footer.
   CFileFooterPB footer;
   footer.set_data_type(typeinfo_->type());
@@ -212,6 +227,7 @@ Status CFileWriter::FinishAndReleaseBlock(ScopedWritableBlockCloser* closer) {
   footer.set_encoding(type_encoding_info_->encoding_type());
   footer.set_num_values(value_count_);
   footer.set_compression(compression_);
+  footer.set_incompatible_features(incompatible_features);
 
   // Write out any pending positional index blocks.
   if (options_.write_posidx) {
@@ -240,20 +256,21 @@ Status CFileWriter::FinishAndReleaseBlock(ScopedWritableBlockCloser* closer) {
   footer_str.append(kMagicStringV2);
   PutFixed32(&footer_str, footer.GetCachedSize());
 
-  RETURN_NOT_OK(block_->Append(footer_str));
+  // Prepend the footer checksum.
+  vector<Slice> footer_slices;
+  uint8_t checksum_buf[kChecksumSize];
+  if (FLAGS_cfile_write_checksums) {
+    uint32_t footer_checksum = crc::Crc32c(footer_str.data(), footer_str.size());
+    InlineEncodeFixed32(checksum_buf, footer_checksum);
+    footer_slices.emplace_back(checksum_buf, kChecksumSize);
+  }
+
+  footer_slices.emplace_back(footer_str);
+  RETURN_NOT_OK_PREPEND(WriteRawData(footer_slices), "Couldn't write footer");
 
   // Done with this block.
-  if (FLAGS_cfile_do_on_finish == "flush") {
-    RETURN_NOT_OK(block_->FlushDataAsync());
-    closer->AddBlock(std::move(block_));
-  } else if (FLAGS_cfile_do_on_finish == "close") {
-    RETURN_NOT_OK(block_->Close());
-  } else if (FLAGS_cfile_do_on_finish == "nothing") {
-    closer->AddBlock(std::move(block_));
-  } else {
-    LOG(FATAL) << "Unknown value for cfile_do_on_finish: "
-               << FLAGS_cfile_do_on_finish;
-  }
+  RETURN_NOT_OK(block_->Finalize());
+  transaction->AddCreatedBlock(std::move(block_));
   return Status::OK();
 }
 
@@ -378,7 +395,7 @@ Status CFileWriter::FinishCurDataBlock() {
     Slice null_bitmap = null_bitmap_builder_->Finish();
     PutVarint32(&null_headers, num_elems_in_block);
     PutVarint32(&null_headers, null_bitmap.size());
-    v.push_back(Slice(null_headers.data(), null_headers.size()));
+    v.emplace_back(null_headers.data(), null_headers.size());
     v.push_back(null_bitmap);
   }
   v.push_back(data);
@@ -393,17 +410,17 @@ Status CFileWriter::FinishCurDataBlock() {
 
   if (validx_builder_ != nullptr) {
     RETURN_NOT_OK(data_block_->GetLastKey(key_tmp_space));
-    key_encoder_->ResetAndEncode(key_tmp_space, &last_key_);
+    (*options_.validx_key_encoder)(key_tmp_space, &last_key_);
   }
   data_block_->Reset();
 
   return s;
 }
 
-Status CFileWriter::AppendRawBlock(const vector<Slice> &data_slices,
+Status CFileWriter::AppendRawBlock(const vector<Slice>& data_slices,
                                    size_t ordinal_pos,
                                    const void *validx_curr,
-                                   const Slice &validx_prev,
+                                   const Slice& validx_prev,
                                    const char *name_for_log) {
   CHECK_EQ(state_, kWriterWriting);
 
@@ -425,7 +442,7 @@ Status CFileWriter::AppendRawBlock(const vector<Slice> &data_slices,
     CHECK(validx_curr != nullptr) <<
       "must pass a key for raw block if validx is configured";
 
-    key_encoder_->ResetAndEncode(validx_curr, &tmp_buf_);
+    (*options_.validx_key_encoder)(validx_curr, &tmp_buf_);
     Slice idx_key = Slice(tmp_buf_);
     if (options_.optimize_index_keys) {
       GetSeparatingKey(validx_prev, &idx_key);
@@ -440,13 +457,6 @@ Status CFileWriter::AppendRawBlock(const vector<Slice> &data_slices,
   }
 
   return s;
-}
-
-size_t CFileWriter::written_size() const {
-  // This is a low estimate, but that's OK -- this is checked after every block
-  // write during flush/compact, so better to give a fast slightly-inaccurate result
-  // than spend a lot of effort trying to improve accuracy by a few KB.
-  return off_;
 }
 
 Status CFileWriter::AddBlock(const vector<Slice> &data_slices,
@@ -467,9 +477,18 @@ Status CFileWriter::AddBlock(const vector<Slice> &data_slices,
     out_slices = data_slices;
   }
 
-  for (const Slice &data : out_slices) {
-    RETURN_NOT_OK(WriteRawData(data));
+  // Calculate and append a data checksum.
+  uint8_t checksum_buf[kChecksumSize];
+  if (FLAGS_cfile_write_checksums) {
+    uint32_t checksum = 0;
+    for (const Slice &data : out_slices) {
+      checksum = crc::Crc32c(data.data(), data.size(), checksum);
+    }
+    InlineEncodeFixed32(checksum_buf, checksum);
+    out_slices.emplace_back(checksum_buf, kChecksumSize);
   }
+
+  RETURN_NOT_OK(WriteRawData(out_slices));
 
   uint64_t total_size = off_ - start_offset;
 
@@ -479,14 +498,18 @@ Status CFileWriter::AddBlock(const vector<Slice> &data_slices,
   return Status::OK();
 }
 
-Status CFileWriter::WriteRawData(const Slice& data) {
-  Status s = block_->Append(data);
+Status CFileWriter::WriteRawData(const vector<Slice>& data) {
+  size_t data_size = accumulate(data.begin(), data.end(), static_cast<size_t>(0),
+                                [&](int sum, const Slice& curr) {
+                                  return sum + curr.size();
+                                });
+  Status s = block_->AppendV(data);
   if (!s.ok()) {
-    LOG(WARNING) << "Unable to append slice of size "
-                << data.size() << " at offset " << off_
-                << ": " << s.ToString();
+    LOG(WARNING) << "Unable to append data of size "
+                 << data_size << " at offset " << off_
+                 << ": " << s.ToString();
   }
-  off_ += data.size();
+  off_ += data_size;
   return s;
 }
 

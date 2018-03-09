@@ -18,17 +18,24 @@
 #include "kudu/tools/tool_action.h"
 
 #include <algorithm>
-#include <iomanip>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/url-coding.h"
 
+using std::pair;
 using std::string;
 using std::unique_ptr;
 using std::unordered_map;
@@ -61,8 +68,7 @@ string FakeDescribeOneFlag(const ActionArgsDescriptor::Arg& arg) {
 }
 
 string BuildUsageString(const vector<Mode*>& chain) {
-  string modes = JoinMapped(chain, [](Mode* a){ return a->name(); }, " ");
-  return Substitute("Usage: $0", modes);
+  return JoinMapped(chain, [](Mode* a){ return a->name(); }, " ");
 }
 
 
@@ -112,8 +118,8 @@ string SpacePad(StringPiece s, int len) {
 
 } // anonymous namespace
 
-ModeBuilder::ModeBuilder(const string& name)
-    : name_(name) {
+ModeBuilder::ModeBuilder(string name)
+    : name_(std::move(name)) {
 }
 
 ModeBuilder& ModeBuilder::Description(const string& description) {
@@ -145,7 +151,8 @@ unique_ptr<Mode> ModeBuilder::Build() {
 // Get help for this mode, passing in its parent mode chain.
 string Mode::BuildHelp(const vector<Mode*>& chain) const {
   string msg;
-  msg += Substitute("$0 <command> [<args>]\n\n", BuildUsageString(chain));
+  msg += Substitute("Usage: $0 <command> [<args>]\n\n",
+                    BuildUsageString(chain));
   msg += "<command> can be one of the following:\n";
 
   vector<pair<string, string>> line_pairs;
@@ -170,9 +177,28 @@ string Mode::BuildHelp(const vector<Mode*>& chain) const {
   return msg;
 }
 
-ActionBuilder::ActionBuilder(const string& name, const ActionRunner& runner)
-    : name_(name),
-      runner_(runner) {
+string Mode::BuildHelpXML(const vector<Mode*>& chain) const {
+  string xml;
+  xml += "<mode>";
+  xml += Substitute("<name>$0</name>", name());
+  xml += Substitute("<description>$0</description>",
+                    EscapeForHtmlToString(description()));
+  for (const auto& a : actions()) {
+    xml += a->BuildHelpXML(chain);
+  }
+
+  for (const auto& m : modes()) {
+    vector<Mode*> m_chain(chain);
+    m_chain.push_back(m.get());
+    xml += m->BuildHelpXML(m_chain);
+  }
+  xml += "</mode>";
+  return xml;
+}
+
+ActionBuilder::ActionBuilder(string name, ActionRunner runner)
+    : name_(std::move(name)),
+      runner_(std::move(runner)) {
 }
 
 ActionBuilder& ActionBuilder::Description(const string& description) {
@@ -200,13 +226,17 @@ ActionBuilder& ActionBuilder::AddRequiredVariadicParameter(
   return *this;
 }
 
-ActionBuilder& ActionBuilder::AddOptionalParameter(const string& param) {
+ActionBuilder& ActionBuilder::AddOptionalParameter(string param,
+                                                   boost::optional<std::string> default_value,
+                                                   boost::optional<std::string> description) {
 #ifndef NDEBUG
   // Make sure this gflag exists.
   string option;
-  DCHECK(google::GetCommandLineOption(param.c_str(), &option));
+  DCHECK(google::GetCommandLineOption(param.c_str(), &option)) << "unknown option: " << param;
 #endif
-  args_.optional.push_back(param);
+  args_.optional.emplace_back(ActionArgsDescriptor::Flag({ std::move(param),
+                                                           std::move(default_value),
+                                                           std::move(description) }));
   return *this;
 }
 
@@ -224,11 +254,14 @@ unique_ptr<Action> ActionBuilder::Build() {
 Status Action::Run(const vector<Mode*>& chain,
                    const unordered_map<string, string>& required_args,
                    const vector<string>& variadic_args) const {
+  SetOptionalParameterDefaultValues();
   return runner_({ chain, this, required_args, variadic_args });
 }
 
-string Action::BuildHelp(const vector<Mode*>& chain) const {
-  string usage_msg = Substitute("$0 $1", BuildUsageString(chain), name());
+string Action::BuildHelp(const vector<Mode*>& chain,
+                         Action::HelpMode mode) const {
+  SetOptionalParameterDefaultValues();
+  string usage_msg = Substitute("Usage: $0 $1", BuildUsageString(chain), name());
   string desc_msg;
   for (const auto& param : args_.required) {
     usage_msg += Substitute(" <$0>", param.name);
@@ -243,27 +276,34 @@ string Action::BuildHelp(const vector<Mode*>& chain) const {
   }
   for (const auto& param : args_.optional) {
     google::CommandLineFlagInfo gflag_info =
-        google::GetCommandLineFlagInfoOrDie(param.c_str());
+        google::GetCommandLineFlagInfoOrDie(param.name.c_str());
+
+    if (param.description) {
+      gflag_info.description = *param.description;
+    }
 
     if (gflag_info.type == "bool") {
       if (gflag_info.default_value == "false") {
-        usage_msg += Substitute(" [-$0]", param);
+        usage_msg += Substitute(" [-$0]", param.name);
       } else {
-        usage_msg += Substitute(" [-no$0]", param);
+        usage_msg += Substitute(" [-no$0]", param.name);
       }
     } else {
       string noun;
-      string::size_type last_underscore_idx = param.rfind('_');
+      string::size_type last_underscore_idx = param.name.rfind('_');
       if (last_underscore_idx != string::npos &&
-          last_underscore_idx != param.size() - 1) {
-        noun = param.substr(last_underscore_idx + 1);
+          last_underscore_idx != param.name.size() - 1) {
+        noun = param.name.substr(last_underscore_idx + 1);
       } else {
-        noun = param;
+        noun = param.name;
       }
-      usage_msg += Substitute(" [-$0=<$1>]", param, noun);
+      usage_msg += Substitute(" [-$0=<$1>]", param.name, noun);
     }
     desc_msg += google::DescribeOneFlag(gflag_info);
     desc_msg += "\n";
+  }
+  if (mode == USAGE_ONLY) {
+    return usage_msg;
   }
   string msg;
   AppendHardWrapped(usage_msg, 8, &msg);
@@ -276,6 +316,90 @@ string Action::BuildHelp(const vector<Mode*>& chain) const {
   msg += "\n\n";
   msg += desc_msg;
   return msg;
+}
+
+string Action::BuildHelpXML(const vector<Mode*>& chain) const {
+  SetOptionalParameterDefaultValues();
+  string usage = Substitute("$0 $1", BuildUsageString(chain), name());
+  string xml;
+  xml += "<action>";
+  xml += Substitute("<name>$0</name>", name());
+  xml += Substitute("<description>$0</description>",
+                    EscapeForHtmlToString(description()));
+  xml += Substitute("<extra_description>$0</extra_description>",
+                    EscapeForHtmlToString(extra_description()
+                                              .get_value_or("")));
+  for (const auto& r : args().required) {
+    usage += Substitute(" &lt;$0&gt;", r.name);
+    xml += "<argument>";
+    xml += "<kind>required</kind>";
+    xml += Substitute("<name>$0</name>", r.name);
+    xml += Substitute("<description>$0</description>",
+                      EscapeForHtmlToString(r.description));
+    xml += "<type>string</type>";
+    xml += "</argument>";
+  }
+
+  if (args().variadic) {
+    const ActionArgsDescriptor::Arg& v = args().variadic.get();
+    usage += Substitute(" &lt;$0&gt;...", v.name);
+    xml += "<argument>";
+    xml += "<kind>variadic</kind>";
+    xml += Substitute("<name>$0</name>", v.name);
+    xml += Substitute("<description>$0</description>",
+                      EscapeForHtmlToString(v.description));
+    xml += "<type>string</type>";
+    xml += "</argument>";
+  }
+
+  for (const auto& o : args().optional) {
+    google::CommandLineFlagInfo gflag_info =
+        google::GetCommandLineFlagInfoOrDie(o.name.c_str());
+
+    if (o.description) {
+      gflag_info.description = *o.description;
+    }
+
+    if (gflag_info.type == "bool") {
+      if (gflag_info.default_value == "false") {
+        usage += Substitute(" [-$0]", o.name);
+      } else {
+        usage += Substitute(" [-no$0]", o.name);
+      }
+    } else {
+      string noun;
+      string::size_type last_underscore_idx = o.name.rfind('_');
+      if (last_underscore_idx != string::npos &&
+          last_underscore_idx != o.name.size() - 1) {
+        noun = o.name.substr(last_underscore_idx + 1);
+      } else {
+        noun = o.name;
+      }
+      usage += Substitute(" [-$0=&lt;$1&gt;]", o.name, noun);
+    }
+
+    xml += "<argument>";
+    xml += "<kind>optional</kind>";
+    xml += Substitute("<name>$0</name>", gflag_info.name);
+    xml += Substitute("<description>$0</description>", gflag_info.description);
+    xml += Substitute("<type>$0</type>", gflag_info.type);
+    xml += Substitute("<default_value>$0</default_value>",
+                      gflag_info.default_value);
+    xml += "</argument>";
+  }
+  xml += Substitute("<usage>$0</usage>", EscapeForHtmlToString(usage));
+  xml += "</action>";
+  return xml;
+}
+
+void Action::SetOptionalParameterDefaultValues() const {
+  for (const auto& param : args_.optional) {
+    if (param.default_value) {
+      google::SetCommandLineOptionWithMode(param.name.c_str(),
+                                           param.default_value->c_str(),
+                                           google::FlagSettingMode::SET_FLAGS_DEFAULT);
+    }
+  }
 }
 
 } // namespace tools

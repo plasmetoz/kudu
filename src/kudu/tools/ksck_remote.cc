@@ -17,13 +17,40 @@
 
 #include "kudu/tools/ksck_remote.h"
 
+#include <cstdint>
+#include <ostream>
+#include <unordered_map>
+#include <utility>
+
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+
 #include "kudu/client/client.h"
+#include "kudu/client/replica_controller-internal.h"
+#include "kudu/client/schema.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/consensus.proxy.h"
+#include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/strings/util.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/server/server_base.pb.h"
+#include "kudu/server/server_base.proxy.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tserver/tablet_server.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_service.pb.h"
+#include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/net/sockaddr.h"
 
@@ -42,6 +69,7 @@ using client::KuduScanToken;
 using client::KuduScanTokenBuilder;
 using client::KuduTable;
 using client::KuduTabletServer;
+using client::internal::ReplicaController;
 using rpc::Messenger;
 using rpc::MessengerBuilder;
 using rpc::RpcController;
@@ -59,8 +87,11 @@ Status RemoteKsckTabletServer::Init() {
   RETURN_NOT_OK(ParseAddressList(
       host_port_.ToString(),
       tserver::TabletServer::kDefaultPort, &addresses));
-  generic_proxy_.reset(new server::GenericServiceProxy(messenger_, addresses[0]));
-  ts_proxy_.reset(new tserver::TabletServerServiceProxy(messenger_, addresses[0]));
+  const auto& addr = addresses[0];
+  const auto& host = host_port_.host();
+  generic_proxy_.reset(new server::GenericServiceProxy(messenger_, addr, host));
+  ts_proxy_.reset(new tserver::TabletServerServiceProxy(messenger_, addr, host));
+  consensus_proxy_.reset(new consensus::ConsensusServiceProxy(messenger_, addr, host));
   return Status::OK();
 }
 
@@ -105,6 +136,28 @@ Status RemoteKsckTabletServer::FetchInfo() {
   return Status::OK();
 }
 
+Status RemoteKsckTabletServer::FetchConsensusState() {
+  tablet_consensus_state_map_.clear();
+  consensus::GetConsensusStateRequestPB req;
+  consensus::GetConsensusStateResponsePB resp;
+  RpcController rpc;
+  rpc.set_timeout(GetDefaultTimeout());
+  req.set_dest_uuid(uuid_);
+  RETURN_NOT_OK_PREPEND(consensus_proxy_->GetConsensusState(req, &resp, &rpc),
+                        "could not fetch all consensus info");
+  for (auto& tablet_info : resp.tablets()) {
+    // Don't crash in rare and bad case where multiple remotes have the same UUID and tablet id.
+    if (!InsertOrUpdate(&tablet_consensus_state_map_,
+                        std::make_pair(uuid_, tablet_info.tablet_id()),
+                        tablet_info.cstate())) {
+      LOG(ERROR) << "Found duplicated tablet information: tablet " << tablet_info.tablet_id()
+                 << " is reported on ts " << uuid_ << " twice";
+    }
+  }
+
+  return Status::OK();
+}
+
 class ChecksumStepper;
 
 // Simple class to act as a callback in order to collate results from parallel
@@ -112,7 +165,7 @@ class ChecksumStepper;
 class ChecksumCallbackHandler {
  public:
   explicit ChecksumCallbackHandler(ChecksumStepper* const stepper)
-      : stepper(DCHECK_NOTNULL(stepper)) {
+      : stepper_(DCHECK_NOTNULL(stepper)) {
   }
 
   // Invoked by an RPC completion callback. Simply calls back into the stepper.
@@ -120,7 +173,7 @@ class ChecksumCallbackHandler {
   void Run();
 
  private:
-  ChecksumStepper* const stepper;
+  ChecksumStepper* const stepper_;
 };
 
 // Simple class to have a "conversation" over multiple requests to a server
@@ -135,7 +188,7 @@ class ChecksumStepper {
       : schema_(schema),
         tablet_id_(std::move(tablet_id)),
         server_uuid_(std::move(server_uuid)),
-        options_(std::move(options)),
+        options_(options),
         callbacks_(callbacks),
         proxy_(std::move(proxy)),
         call_seq_id_(0),
@@ -244,7 +297,7 @@ class ChecksumStepper {
 };
 
 void ChecksumCallbackHandler::Run() {
-  stepper->HandleResponse();
+  stepper_->HandleResponse();
   delete this;
 }
 
@@ -260,15 +313,17 @@ void RemoteKsckTabletServer::RunTabletChecksumScanAsync(
 }
 
 Status RemoteKsckMaster::Connect() {
-  client::sp::shared_ptr<KuduClient> client;
   KuduClientBuilder builder;
   builder.default_rpc_timeout(GetDefaultTimeout());
   builder.master_server_addrs(master_addresses_);
+  ReplicaController::SetVisibility(&builder, ReplicaController::Visibility::ALL);
+  client::sp::shared_ptr<KuduClient> client;
   return builder.Build(&client_);
 }
 
 Status RemoteKsckMaster::Build(const vector<string>& master_addresses,
                                shared_ptr<KsckMaster>* master) {
+  CHECK(!master_addresses.empty());
   shared_ptr<Messenger> messenger;
   MessengerBuilder builder(kMessengerName);
   RETURN_NOT_OK(builder.Build(&messenger));
@@ -327,10 +382,10 @@ Status RemoteKsckMaster::RetrieveTabletsList(const shared_ptr<KsckTable>& table)
         new KsckTablet(table.get(), t->tablet().id()));
     vector<shared_ptr<KsckTabletReplica>> replicas;
     for (const auto* r : t->tablet().replicas()) {
-      replicas.push_back(shared_ptr<KsckTabletReplica>(
-          new KsckTabletReplica(r->ts().uuid(), r->is_leader())));
+      replicas.push_back(std::make_shared<KsckTabletReplica>(
+          r->ts().uuid(), r->is_leader(), ReplicaController::is_voter(*r)));
     }
-    tablet->set_replicas(replicas);
+    tablet->set_replicas(std::move(replicas));
     tablets.push_back(tablet);
   }
 

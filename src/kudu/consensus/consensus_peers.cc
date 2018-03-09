@@ -15,55 +15,65 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/consensus/consensus.proxy.h"
+#include "kudu/consensus/consensus_peers.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
-#include <gflags/gflags.h>
-#include <glog/logging.h>
+#include <cstdlib>
+#include <memory>
 #include <mutex>
+#include <ostream>
 #include <string>
-#include <utility>
+#include <type_traits>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/consensus/consensus_peers.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/consensus.proxy.h"
 #include "kudu/consensus/consensus_queue.h"
-#include "kudu/consensus/log.h"
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/stl_util.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/opid_util.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/periodic.h"
+#include "kudu/rpc/response_callback.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
 #include "kudu/util/threadpool.h"
 
-// This file uses C++14 'generalized lambda capture' syntax, which is supported
-// in C++11 mode both by clang and by GCC. Disable the accompanying warning.
-#pragma clang diagnostic ignored "-Wc++14-extensions"
-
-DEFINE_int32(consensus_rpc_timeout_ms, 1000,
+DEFINE_int32(consensus_rpc_timeout_ms, 30000,
              "Timeout used for all consensus internal RPC communications.");
 TAG_FLAG(consensus_rpc_timeout_ms, advanced);
 
 DEFINE_int32(raft_get_node_instance_timeout_ms, 30000,
              "Timeout for retrieving node instance data over RPC.");
-TAG_FLAG(consensus_rpc_timeout_ms, hidden);
-
-DECLARE_int32(raft_heartbeat_interval_ms);
+TAG_FLAG(raft_get_node_instance_timeout_ms, hidden);
 
 DEFINE_double(fault_crash_on_leader_request_fraction, 0.0,
               "Fraction of the time when the leader will crash just before sending an "
               "UpdateConsensus RPC. (For testing only!)");
+TAG_FLAG(fault_crash_on_leader_request_fraction, unsafe);
 
 DEFINE_double(fault_crash_after_leader_request_fraction, 0.0,
               "Fraction of the time when the leader will crash on getting a response for an "
               "UpdateConsensus RPC. (For testing only!)");
-
-TAG_FLAG(fault_crash_on_leader_request_fraction, unsafe);
+TAG_FLAG(fault_crash_after_leader_request_fraction, unsafe);
 
 
 // Allow for disabling Tablet Copy in unit tests where we want to test
@@ -74,54 +84,79 @@ DEFINE_bool(enable_tablet_copy, true,
             "replica. For testing purposes only.");
 TAG_FLAG(enable_tablet_copy, unsafe);
 
+DECLARE_int32(raft_heartbeat_interval_ms);
+
+using kudu::pb_util::SecureShortDebugString;
+using kudu::rpc::Messenger;
+using kudu::rpc::PeriodicTimer;
+using kudu::rpc::RpcController;
+using kudu::tserver::TabletServerErrorPB;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+using std::weak_ptr;
+using strings::Substitute;
+
+
 namespace kudu {
 namespace consensus {
 
-using std::shared_ptr;
-using rpc::Messenger;
-using rpc::RpcController;
-using strings::Substitute;
-using tserver::TabletServerErrorPB;
-
-Status Peer::NewRemotePeer(const RaftPeerPB& peer_pb,
-                           const string& tablet_id,
-                           const string& leader_uuid,
+Status Peer::NewRemotePeer(RaftPeerPB peer_pb,
+                           string tablet_id,
+                           string leader_uuid,
                            PeerMessageQueue* queue,
-                           ThreadPool* thread_pool,
+                           ThreadPoolToken* raft_pool_token,
                            gscoped_ptr<PeerProxy> proxy,
+                           shared_ptr<Messenger> messenger,
                            shared_ptr<Peer>* peer) {
 
-  shared_ptr<Peer> new_peer(new Peer(peer_pb,
-                                     tablet_id,
-                                     leader_uuid,
-                                     std::move(proxy),
+  shared_ptr<Peer> new_peer(new Peer(std::move(peer_pb),
+                                     std::move(tablet_id),
+                                     std::move(leader_uuid),
                                      queue,
-                                     thread_pool));
+                                     raft_pool_token,
+                                     std::move(proxy),
+                                     std::move(messenger)));
   RETURN_NOT_OK(new_peer->Init());
   *peer = std::move(new_peer);
   return Status::OK();
 }
 
-Peer::Peer(const RaftPeerPB& peer_pb, string tablet_id, string leader_uuid,
-           gscoped_ptr<PeerProxy> proxy, PeerMessageQueue* queue,
-           ThreadPool* thread_pool)
+Peer::Peer(RaftPeerPB peer_pb,
+           string tablet_id,
+           string leader_uuid,
+           PeerMessageQueue* queue,
+           ThreadPoolToken* raft_pool_token,
+           gscoped_ptr<PeerProxy> proxy,
+           shared_ptr<Messenger> messenger)
     : tablet_id_(std::move(tablet_id)),
       leader_uuid_(std::move(leader_uuid)),
-      peer_pb_(peer_pb),
+      peer_pb_(std::move(peer_pb)),
       proxy_(std::move(proxy)),
       queue_(queue),
       failed_attempts_(0),
-      heartbeater_(
-          peer_pb.permanent_uuid(),
-          MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms),
-          boost::bind(&Peer::SignalRequest, this, true)),
-      thread_pool_(thread_pool) {
+      messenger_(std::move(messenger)),
+      raft_pool_token_(raft_pool_token) {
 }
 
 Status Peer::Init() {
-  std::lock_guard<simple_spinlock> lock(peer_lock_);
-  queue_->TrackPeer(peer_pb_.permanent_uuid());
-  RETURN_NOT_OK(heartbeater_.Start());
+  {
+    std::lock_guard<simple_spinlock> l(peer_lock_);
+    queue_->TrackPeer(peer_pb_);
+  }
+
+  // Capture a weak_ptr reference into the functor so it can safely handle
+  // outliving the peer.
+  weak_ptr<Peer> w = shared_from_this();
+  heartbeater_ = PeriodicTimer::Create(
+      messenger_,
+      [w]() {
+        if (auto p = w.lock()) {
+          p->SignalRequest(true);
+        }
+      },
+      MonoDelta::FromMilliseconds(FLAGS_raft_heartbeat_interval_ms));
+  heartbeater_->Start();
   return Status::OK();
 }
 
@@ -132,9 +167,20 @@ Status Peer::SignalRequest(bool even_if_queue_empty) {
     return Status::IllegalState("Peer was closed.");
   }
 
-  RETURN_NOT_OK(thread_pool_->SubmitFunc([=, s_this = shared_from_this()]() {
-        s_this->SendNextRequest(even_if_queue_empty);
-      }));
+  // Only allow one request at a time. No sense waking up the
+  // raft thread pool if the task will just abort anyway.
+  if (request_pending_) {
+    return Status::OK();
+  }
+
+  // Capture a weak_ptr reference into the submitted functor so that we can
+  // safely handle the functor outliving its peer.
+  weak_ptr<Peer> w_this = shared_from_this();
+  RETURN_NOT_OK(raft_pool_token_->SubmitFunc([even_if_queue_empty, w_this]() {
+    if (auto p = w_this.lock()) {
+      p->SendNextRequest(even_if_queue_empty);
+    }
+  }));
   return Status::OK();
 }
 
@@ -188,20 +234,21 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
 
   if (PREDICT_FALSE(needs_tablet_copy)) {
     Status s = PrepareTabletCopyRequest();
-    if (!s.ok()) {
+    if (s.ok()) {
+      controller_.Reset();
+      request_pending_ = true;
+      l.unlock();
+      // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
+      // that this object outlives the RPC.
+      shared_ptr<Peer> s_this = shared_from_this();
+      proxy_->StartTabletCopy(&tc_request_, &tc_response_, &controller_,
+                              [s_this]() {
+                                s_this->ProcessTabletCopyResponse();
+                              });
+    } else {
       LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to generate Tablet Copy request for peer: "
                                         << s.ToString();
     }
-
-    controller_.Reset();
-    request_pending_ = true;
-    l.unlock();
-    // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
-    // that this object outlives the RPC.
-    proxy_->StartTabletCopy(&tc_request_, &tc_response_, &controller_,
-                            [s_this = shared_from_this()]() {
-                              s_this->ProcessTabletCopyResponse();
-                            });
     return;
   }
 
@@ -216,10 +263,9 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
     return;
   }
 
-  // If we're actually sending ops there's no need to heartbeat for a while,
-  // reset the heartbeater
   if (req_has_ops) {
-    heartbeater_.Reset();
+    // If we're actually sending ops there's no need to heartbeat for a while.
+    heartbeater_->Snooze();
   }
 
   MAYBE_FAULT(FLAGS_fault_crash_on_leader_request_fraction);
@@ -233,8 +279,9 @@ void Peer::SendNextRequest(bool even_if_queue_empty) {
   l.unlock();
   // Capture a shared_ptr reference into the RPC callback so that we're guaranteed
   // that this object outlives the RPC.
+  shared_ptr<Peer> s_this = shared_from_this();
   proxy_->UpdateAsync(&request_, &response_, &controller_,
-                      [s_this = shared_from_this()]() {
+                      [s_this]() {
                         s_this->ProcessResponse();
                       });
 }
@@ -249,30 +296,48 @@ void Peer::ProcessResponse() {
 
   MAYBE_FAULT(FLAGS_fault_crash_after_leader_request_fraction);
 
-  if (!controller_.status().ok()) {
-    if (controller_.status().IsRemoteError()) {
-      // Most controller errors are caused by network issues or corner cases
-      // like shutdown and failure to serialize a protobuf. Therefore, we
-      // generally consider these errors to indicate an unreachable peer.
-      // However, a RemoteError wraps some other error propagated from the
-      // remote peer, so we know the remote is alive. Therefore, we will let
-      // the queue know that the remote is responsive.
-      queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
-    }
-    ProcessResponseError(controller_.status());
+  // Process RpcController errors.
+  const auto controller_status = controller_.status();
+  if (!controller_status.ok()) {
+    auto ps = controller_status.IsRemoteError() ?
+        PeerStatus::REMOTE_ERROR : PeerStatus::RPC_LAYER_ERROR;
+    queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, controller_status);
+    ProcessResponseError(controller_status);
     return;
   }
 
-  // Pass through errors we can respond to, like not found, since in that case
-  // we will need to start a Tablet Copy. TODO: Handle DELETED response once implemented.
-  if ((response_.has_error() &&
-      response_.error().code() != TabletServerErrorPB::TABLET_NOT_FOUND) ||
-      (response_.status().has_error() &&
-          response_.status().error().code() == consensus::ConsensusErrorPB::CANNOT_PREPARE)) {
-    // Again, let the queue know that the remote is still responsive, since we
-    // will not be sending this error response through to the queue.
-    queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
-    ProcessResponseError(StatusFromPB(response_.error().status()));
+  // Process CANNOT_PREPARE.
+  // TODO(todd): there is no integration test coverage of this code path. Likely a bug in
+  // this path is responsible for KUDU-1779.
+  if (response_.status().has_error() &&
+      response_.status().error().code() == consensus::ConsensusErrorPB::CANNOT_PREPARE) {
+    Status response_status = StatusFromPB(response_.status().error().status());
+    queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), PeerStatus::CANNOT_PREPARE,
+                             response_status);
+    ProcessResponseError(response_status);
+    return;
+  }
+
+  // Process tserver-level errors.
+  if (response_.has_error()) {
+    Status response_status = StatusFromPB(response_.error().status());
+    PeerStatus ps;
+    TabletServerErrorPB resp_error = response_.error();
+    switch (response_.error().code()) {
+      // We treat WRONG_SERVER_UUID as failed.
+      case TabletServerErrorPB::WRONG_SERVER_UUID: FALLTHROUGH_INTENDED;
+      case TabletServerErrorPB::TABLET_FAILED:
+        ps = PeerStatus::TABLET_FAILED;
+        break;
+      case TabletServerErrorPB::TABLET_NOT_FOUND:
+        ps = PeerStatus::TABLET_NOT_FOUND;
+        break;
+      default:
+        // Unknown kind of error.
+        ps = PeerStatus::REMOTE_ERROR;
+    }
+    queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), ps, response_status);
+    ProcessResponseError(response_status);
     return;
   }
 
@@ -280,9 +345,16 @@ void Peer::ProcessResponse() {
   // the WAL) and SendNextRequest() may do the same thing. So we run the rest
   // of the response handling logic on our thread pool and not on the reactor
   // thread.
-  Status s = thread_pool_->SubmitFunc([s_this = shared_from_this()]() {
-      s_this->DoProcessResponse();
-    });
+  //
+  // Capture a weak_ptr reference into the submitted functor so that we can
+  // safely handle the functor outliving its peer.
+  weak_ptr<Peer> w_this = shared_from_this();
+  Status s = raft_pool_token_->SubmitFunc([w_this]() {
+    if (auto p = w_this.lock()) {
+      p->DoProcessResponse();
+
+    }
+  });
   if (PREDICT_FALSE(!s.ok())) {
     LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to process peer response: " << s.ToString()
         << ": " << SecureShortDebugString(response_);
@@ -332,16 +404,24 @@ void Peer::ProcessTabletCopyResponse() {
   CHECK(request_pending_);
   request_pending_ = false;
 
-  if (controller_.status().ok() && tc_response_.has_error()) {
-    // ALREADY_INPROGRESS is expected, so we do not log this error.
-    if (tc_response_.error().code() ==
-        TabletServerErrorPB::TabletServerErrorPB::ALREADY_INPROGRESS) {
-      lock.unlock();
-      queue_->NotifyPeerIsResponsiveDespiteError(peer_pb_.permanent_uuid());
-    } else {
-      LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin Tablet Copy on peer: "
-                                        << SecureShortDebugString(tc_response_);
-    }
+  // If the response is OK, or ALREADY_INPROGRESS, then consider the RPC successful.
+  const auto controller_status = controller_.status();
+  bool success =
+    controller_status.ok() &&
+    (!tc_response_.has_error() ||
+     tc_response_.error().code() == TabletServerErrorPB::TabletServerErrorPB::ALREADY_INPROGRESS);
+
+  if (success) {
+    lock.unlock();
+    queue_->UpdatePeerStatus(peer_pb_.permanent_uuid(), PeerStatus::OK, Status::OK());
+  } else if (!tc_response_.has_error() ||
+              tc_response_.error().code() != TabletServerErrorPB::TabletServerErrorPB::THROTTLED) {
+    // THROTTLED is a common response after a tserver with many replicas fails;
+    // logging it would generate a great deal of log spam.
+    LOG_WITH_PREFIX_UNLOCKED(WARNING) << "Unable to begin Tablet Copy on peer: "
+                                      << (controller_status.ok() ?
+                                          SecureShortDebugString(tc_response_) :
+                                          controller_status.ToString());
   }
 }
 
@@ -369,8 +449,6 @@ string Peer::LogPrefixUnlocked() const {
 }
 
 void Peer::Close() {
-  WARN_NOT_OK(heartbeater_.Stop(), "Could not stop heartbeater");
-
   // If the peer is already closed return.
   {
     std::lock_guard<simple_spinlock> lock(peer_lock_);
@@ -384,10 +462,13 @@ void Peer::Close() {
 
 Peer::~Peer() {
   Close();
+  if (heartbeater_) {
+    heartbeater_->Stop();
+  }
+
   // We don't own the ops (the queue does).
   request_.mutable_ops()->ExtractSubrange(0, request_.ops_size(), nullptr);
 }
-
 
 RpcPeerProxy::RpcPeerProxy(gscoped_ptr<HostPort> hostport,
                            gscoped_ptr<ConsensusServiceProxy> consensus_proxy)
@@ -411,9 +492,9 @@ void RpcPeerProxy::RequestConsensusVoteAsync(const VoteRequestPB* request,
 }
 
 void RpcPeerProxy::StartTabletCopy(const StartTabletCopyRequestPB* request,
-                                        StartTabletCopyResponsePB* response,
-                                        rpc::RpcController* controller,
-                                        const rpc::ResponseCallback& callback) {
+                                   StartTabletCopyResponsePB* response,
+                                   rpc::RpcController* controller,
+                                   const rpc::ResponseCallback& callback) {
   consensus_proxy_->StartTabletCopyAsync(*request, response, controller, callback);
 }
 
@@ -431,7 +512,7 @@ Status CreateConsensusServiceProxyForHost(const shared_ptr<Messenger>& messenger
     << "resolves to " << addrs.size() << " different addresses. Using "
     << addrs[0].ToString();
   }
-  new_proxy->reset(new ConsensusServiceProxy(messenger, addrs[0]));
+  new_proxy->reset(new ConsensusServiceProxy(messenger, addrs[0], hostport.host()));
   return Status::OK();
 }
 

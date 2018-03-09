@@ -18,11 +18,12 @@ package org.apache.kudu.spark.kudu
 
 import scala.collection.JavaConverters._
 
-import org.apache.kudu.client._
-import org.apache.kudu.{Type, client}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.Row
 import org.apache.spark.{Partition, SparkContext, TaskContext}
+
+import org.apache.kudu.client._
+import org.apache.kudu.{Type, client}
 
 /**
   * A Resilient Distributed Dataset backed by a Kudu table.
@@ -34,6 +35,8 @@ class KuduRDD private[kudu] (val kuduContext: KuduContext,
                              @transient val projectedCols: Array[String],
                              @transient val predicates: Array[client.KuduPredicate],
                              @transient val table: KuduTable,
+                             @transient val isFaultTolerant: Boolean,
+                             @transient val scanLocality: ReplicaSelection,
                              @transient val sc: SparkContext) extends RDD[Row](sc, Nil) {
 
   override protected def getPartitions: Array[Partition] = {
@@ -41,7 +44,17 @@ class KuduRDD private[kudu] (val kuduContext: KuduContext,
                              .newScanTokenBuilder(table)
                              .batchSizeBytes(batchSize)
                              .setProjectedColumnNames(projectedCols.toSeq.asJava)
+                             .setFaultTolerant(isFaultTolerant)
                              .cacheBlocks(true)
+
+    // A scan is partitioned to multiple ones. If scan locality is enabled,
+    // each will take place at the closet replica from the executor. In this
+    // case, to ensure the consistency of such scan, we use READ_AT_SNAPSHOT
+    // read mode without setting a timestamp.
+    if (scanLocality == ReplicaSelection.CLOSEST_REPLICA) {
+      builder.replicaSelection(ReplicaSelection.CLOSEST_REPLICA)
+             .readMode(AsyncKuduScanner.ReadMode.READ_AT_SNAPSHOT)
+    }
 
     for (predicate <- predicates) {
       builder.addPredicate(predicate)
@@ -49,8 +62,16 @@ class KuduRDD private[kudu] (val kuduContext: KuduContext,
     val tokens = builder.build().asScala
     tokens.zipWithIndex.map {
       case (token, index) =>
-        new KuduPartition(index, token.serialize(),
-                          token.getTablet.getReplicas.asScala.map(_.getRpcHost).toArray)
+        // Only list the leader replica as the preferred location if
+        // replica selection policy is leader only, to take advantage
+        // of scan locality.
+        var locations: Array[String] = null
+        if (scanLocality == ReplicaSelection.LEADER_ONLY) {
+          locations = Array(token.getTablet.getLeaderReplica.getRpcHost)
+        } else {
+          locations = token.getTablet.getReplicas.asScala.map(_.getRpcHost).toArray
+        }
+        new KuduPartition(index, token.serialize(), locations)
     }.toArray
   }
 
@@ -58,7 +79,7 @@ class KuduRDD private[kudu] (val kuduContext: KuduContext,
     val client: KuduClient = kuduContext.syncClient
     val partition: KuduPartition = part.asInstanceOf[KuduPartition]
     val scanner = KuduScanToken.deserializeIntoScanner(partition.scanToken, client)
-    new RowIterator(scanner)
+    new RowIterator(scanner, kuduContext)
   }
 
   override def getPreferredLocations(partition: Partition): Seq[String] = {
@@ -76,15 +97,23 @@ private class KuduPartition(val index: Int,
 /**
   * A Spark SQL [[Row]] iterator which wraps a [[KuduScanner]].
   * @param scanner the wrapped scanner
+  * @param kuduContext the kudu context
   */
-private class RowIterator(private val scanner: KuduScanner) extends Iterator[Row] {
+private class RowIterator(private val scanner: KuduScanner,
+                          private val kuduContext: KuduContext) extends Iterator[Row] {
 
   private var currentIterator: RowResultIterator = null
 
   override def hasNext: Boolean = {
     while ((currentIterator != null && !currentIterator.hasNext && scanner.hasMoreRows) ||
            (scanner.hasMoreRows && currentIterator == null)) {
+      if (TaskContext.get().isInterrupted()) {
+        throw new RuntimeException("Kudu task interrupted")
+      }
       currentIterator = scanner.nextRows()
+      // Update timestampAccumulator with the client's last propagated
+      // timestamp on each executor.
+      kuduContext.timestampAccumulator.add(kuduContext.syncClient.getLastPropagatedTimestamp)
     }
     currentIterator.hasNext
   }
@@ -102,11 +131,17 @@ private class RowIterator(private val scanner: KuduScanner) extends Iterator[Row
       case Type.DOUBLE => rowResult.getDouble(i)
       case Type.STRING => rowResult.getString(i)
       case Type.BINARY => rowResult.getBinaryCopy(i)
+      case Type.DECIMAL => rowResult.getDecimal(i)
     }
   }
 
   override def next(): Row = {
     val rowResult = currentIterator.next()
-    Row.fromSeq(Range(0, rowResult.getColumnProjection.getColumnCount).map(get(rowResult, _)))
+    val columnCount = rowResult.getColumnProjection.getColumnCount
+    val columns = Array.ofDim[Any](columnCount)
+    for (i <- 0 until columnCount) {
+      columns(i) = get(rowResult, i)
+    }
+    Row.fromSeq(columns)
   }
 }

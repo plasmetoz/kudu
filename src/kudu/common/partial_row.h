@@ -17,41 +17,44 @@
 #ifndef KUDU_COMMON_PARTIAL_ROW_H
 #define KUDU_COMMON_PARTIAL_ROW_H
 
+// NOTE: using stdint.h instead of cstdint because this file is supposed
+//       to be processed by a compiler lacking C++11 support.
 #include <stdint.h>
+
 #include <string>
-#include <vector>
 
 #ifdef KUDU_HEADERS_NO_STUBS
-#include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #include <gtest/gtest_prod.h>
+
+#include "kudu/gutil/port.h"
 #else
 // This is a poor module interdependency, but the stubs are header-only and
 // it's only for exported header builds, so we'll make an exception.
 #include "kudu/client/stubs.h"
 #endif
 
+#include "kudu/util/int128.h"
 #include "kudu/util/kudu_export.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 /// @cond
 namespace kudu {
 class ColumnSchema;
 namespace client {
 class KuduWriteOperation;
-template<typename KeyTypeWrapper> struct SliceKeysTestSetup;
-template<typename KeyTypeWrapper> struct IntKeysTestSetup;
+template<typename KeyTypeWrapper> struct SliceKeysTestSetup;// IWYU pragma: keep
+template<typename KeyTypeWrapper> struct IntKeysTestSetup;  // IWYU pragma: keep
 } // namespace client
 
 namespace tablet {
-  template<typename KeyTypeWrapper> struct SliceTypeRowOps;
-  template<typename KeyTypeWrapper> struct NumTypeRowOps;
+  template<typename KeyTypeWrapper> struct SliceTypeRowOps; // IWYU pragma: keep
+  template<typename KeyTypeWrapper> struct NumTypeRowOps;   // IWYU pragma: keep
 } // namespace tablet
 
 /// @endcond
 
 class Schema;
-class PartialRowPB;
 
 /// @brief A row which may only contain values for a subset of the columns.
 ///
@@ -102,6 +105,9 @@ class KUDU_EXPORT KuduPartialRow {
 
   Status SetFloat(const Slice& col_name, float val) WARN_UNUSED_RESULT;
   Status SetDouble(const Slice& col_name, double val) WARN_UNUSED_RESULT;
+#if KUDU_INT128_SUPPORTED
+  Status SetUnscaledDecimal(const Slice& col_name, int128_t val) WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Setters for integral type columns by index.
@@ -130,6 +136,9 @@ class KUDU_EXPORT KuduPartialRow {
 
   Status SetFloat(int col_idx, float val) WARN_UNUSED_RESULT;
   Status SetDouble(int col_idx, double val) WARN_UNUSED_RESULT;
+#if KUDU_INT128_SUPPORTED
+  Status SetUnscaledDecimal(int col_idx, int128_t val) WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Setters for binary/string columns by name (copying).
@@ -351,6 +360,9 @@ class KUDU_EXPORT KuduPartialRow {
 
   Status GetFloat(const Slice& col_name, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(const Slice& col_name, double* val) const WARN_UNUSED_RESULT;
+#if KUDU_INT128_SUPPORTED
+  Status GetUnscaledDecimal(const Slice& col_name, int128_t* val) WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Getters for column of integral type by column index.
@@ -381,6 +393,9 @@ class KUDU_EXPORT KuduPartialRow {
 
   Status GetFloat(int col_idx, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(int col_idx, double* val) const WARN_UNUSED_RESULT;
+#if KUDU_INT128_SUPPORTED
+  Status GetUnscaledDecimal(int col_idx, int128_t* val) WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Getters for string/binary column by column name.
@@ -486,8 +501,10 @@ class KUDU_EXPORT KuduPartialRow {
   template<typename KeyTypeWrapper> friend struct client::IntKeysTestSetup;
   template<typename KeyTypeWrapper> friend struct tablet::SliceTypeRowOps;
   template<typename KeyTypeWrapper> friend struct tablet::NumTypeRowOps;
-  FRIEND_TEST(PartitionPrunerTest, TestPrimaryKeyRangePruning);
+  FRIEND_TEST(KeyUtilTest, TestIncrementInt128PrimaryKey);
+  FRIEND_TEST(PartitionPrunerTest, TestIntPartialPrimaryKeyRangePruning);
   FRIEND_TEST(PartitionPrunerTest, TestPartialPrimaryKeyRangePruning);
+  FRIEND_TEST(PartitionPrunerTest, TestPrimaryKeyRangePruning);
 
   template<typename T>
   Status Set(const Slice& col_name, const typename T::cpp_type& val,

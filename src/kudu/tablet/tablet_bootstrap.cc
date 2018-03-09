@@ -17,48 +17,78 @@
 
 #include "kudu/tablet/tablet_bootstrap.h"
 
-#include <gflags/gflags.h>
+#include <cstdint>
+#include <iterator>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include "kudu/common/partial_row.h"
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/consensus/consensus_meta.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/log.h"
+#include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/log_index.h"
 #include "kudu/consensus/log_reader.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/fs.pb.h"
 #include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/human_readable.h"
-#include "kudu/gutil/strings/strcat.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/strings/util.h"
 #include "kudu/gutil/walltime.h"
 #include "kudu/rpc/result_tracker.h"
-#include "kudu/server/clock.h"
-#include "kudu/server/hybrid_clock.h"
-#include "kudu/tablet/lock_manager.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/mvcc.h"
 #include "kudu/tablet/row_op.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/tablet.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tablet/transactions/alter_schema_transaction.h"
+#include "kudu/tablet/transactions/transaction.h"
 #include "kudu/tablet/transactions/write_transaction.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
 #include "kudu/util/debug/trace_event.h"
+#include "kudu/util/env.h"
+#include "kudu/util/env_util.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
 
 DECLARE_int32(group_commit_queue_size_bytes);
@@ -78,38 +108,39 @@ DECLARE_int32(max_clock_sync_error_usec);
 namespace kudu {
 namespace tablet {
 
+using clock::Clock;
 using consensus::ALTER_SCHEMA_OP;
 using consensus::CHANGE_CONFIG_OP;
-using consensus::ChangeConfigRecordPB;
 using consensus::CommitMsg;
 using consensus::ConsensusBootstrapInfo;
-using consensus::ConsensusMetadata;
-using consensus::ConsensusRound;
 using consensus::MinimumOpId;
 using consensus::NO_OP;
-using consensus::OperationType;
-using consensus::OperationType_Name;
 using consensus::OpId;
 using consensus::OpIdEquals;
 using consensus::OpIdEqualsFunctor;
 using consensus::OpIdHashFunctor;
 using consensus::OpIdToString;
+using consensus::OperationType;
+using consensus::OperationType_Name;
 using consensus::RaftConfigPB;
 using consensus::ReplicateMsg;
 using consensus::WRITE_OP;
 using log::Log;
 using log::LogAnchorRegistry;
 using log::LogEntryPB;
+using log::LogIndex;
 using log::LogOptions;
 using log::LogReader;
 using log::ReadableLogSegment;
 using rpc::ResultTracker;
-using server::Clock;
+using pb_util::SecureDebugString;
+using pb_util::SecureShortDebugString;
 using std::map;
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
 using std::unordered_map;
+using std::vector;
 using strings::Substitute;
 using tserver::AlterSchemaRequestPB;
 using tserver::WriteRequestPB;
@@ -131,7 +162,7 @@ struct ReplayState;
 class FlushedStoresSnapshot {
  public:
   FlushedStoresSnapshot() {}
-  Status InitFrom(const TabletMetadata& meta);
+  Status InitFrom(const TabletMetadata& tablet_meta);
 
   // Return true if the given memory store is still active (i.e. edits that were
   // originally written to this memory store should be replayed during the bootstrap
@@ -166,12 +197,13 @@ class FlushedStoresSnapshot {
 // we need to set it before replay or we won't be able to re-rebuild.
 class TabletBootstrap {
  public:
-  TabletBootstrap(const scoped_refptr<TabletMetadata>& meta,
+  TabletBootstrap(const scoped_refptr<TabletMetadata>& tablet_meta,
+                  RaftConfigPB committed_raft_config,
                   const scoped_refptr<Clock>& clock,
                   shared_ptr<MemTracker> mem_tracker,
-                  const scoped_refptr<ResultTracker> result_tracker,
+                  const scoped_refptr<ResultTracker>& result_tracker,
                   MetricRegistry* metric_registry,
-                  TabletStatusListener* listener,
+                  const scoped_refptr<TabletReplica>& tablet_replica,
                   const scoped_refptr<LogAnchorRegistry>& log_anchor_registry);
 
   // Plays the log segments, rebuilding the portion of the Tablet's soft
@@ -223,9 +255,9 @@ class TabletBootstrap {
   Status OpenNewLog();
 
   // Finishes bootstrap, setting 'rebuilt_log' and 'rebuilt_tablet'.
-  void FinishBootstrap(const string& message,
-                       scoped_refptr<log::Log>* rebuilt_log,
-                       shared_ptr<Tablet>* rebuilt_tablet);
+  Status FinishBootstrap(const string& message,
+                         scoped_refptr<log::Log>* rebuilt_log,
+                         shared_ptr<Tablet>* rebuilt_tablet);
 
   // Plays the log segments into the tablet being built.
   // The process of playing the segments generates a new log that can be continued
@@ -248,32 +280,46 @@ class TabletBootstrap {
   Status PlayNoOpRequest(ReplicateMsg* replicate_msg,
                          const CommitMsg& commit_msg);
 
-  // Plays operations, skipping those that have already been flushed,
-  // as indicated in the 'already_flushed' vector.
+  // Plays operations, skipping those that have already been flushed or have previously failed.
+  // See ApplyRowOperations() for more details on how the decision of whether an operation
+  // is applied or skipped is made.
   Status PlayRowOperations(WriteTransactionState* tx_state,
-                           const SchemaPB& schema_pb,
-                           const RowOperationsPB& ops_pb,
-                           const TxResultPB& result,
-                           const vector<bool>& already_flushed);
+                           const TxResultPB& orig_result,
+                           TxResultPB* new_result);
 
-  // Determine which of the operations from 'result' correspond to already-flushed stores.
+  // Determine which of the operations from 'orig_result' must be skipped.
   // At the same time this builds the WriteResponsePB that we'll store on the ResultTracker.
-  Status DetermineFlushedOpsAndBuildResponse(const TxResultPB& result,
-                                             vector<bool>* flushed_by_op,
-                                             WriteResponsePB* response);
+  // 'new_result' store the results of the operations that were skipped, 'response' stores
+  // any error that might have previously happened so that we can send them back to clients,
+  // if needed.
+  // Finally 'all_skipped' indicates whether all of the original operations were skipped.
+  Status DetermineSkippedOpsAndBuildResponse(const TxResultPB& orig_result,
+                                             TxResultPB* new_result,
+                                             WriteResponsePB* response,
+                                             bool* all_skipped);
 
-  // Pass through all of the decoded operations in tx_state. For
-  // each op:
+  // Pass through all of the decoded operations in tx_state. For each op:
   // - if it was previously failed, mark as failed
   // - if it previously succeeded but was flushed, skip it.
   // - otherwise, re-apply to the tablet being bootstrapped.
   Status ApplyOperations(WriteTransactionState* tx_state,
-                         const TxResultPB& orig_result);
+                         const TxResultPB& orig_result,
+                         TxResultPB* new_result);
 
-  // Filter a row  operation, setting '*already_flushed' to indicate if
-  // it was already flushed.
+  enum OpAction {
+    // The operation was never applied or was applied to an unflushed memory store and thus
+    // needs to be applied again.
+    NEEDS_REPLAY,
+    // The operation was already applied to a memory store that was flushed.
+    SKIP_PREVIOUSLY_FLUSHED,
+    // The operation was never applied due to an error.
+    SKIP_PREVIOUSLY_FAILED
+  };
+
+  // Filter a row operation, setting 'action' to indicate what needs to be done
+  // to the operation, i.e. whether it must applied or skipped.
   Status FilterOperation(const OperationResultPB& op_result,
-                         bool* already_flushed);
+                         OpAction* action);
 
   enum ActiveStores {
     // The OperationResultPBs in the commit message do not reference any stores.
@@ -320,22 +366,20 @@ class TabletBootstrap {
   // Return a log prefix string in the standard "T xxx P yyy" format.
   string LogPrefix() const;
 
-  // Report a status message in the WAL as well as update the tablet peer's
-  // status.
-  void StatusMessage(const string& status);
+  // Log a status message and set the TabletReplica's status as well.
+  void SetStatusMessage(const string& status);
 
-  scoped_refptr<TabletMetadata> meta_;
-  scoped_refptr<Clock> clock_;
+  const scoped_refptr<TabletMetadata> tablet_meta_;
+  const RaftConfigPB committed_raft_config_;
+  const scoped_refptr<Clock> clock_;
   shared_ptr<MemTracker> mem_tracker_;
   scoped_refptr<rpc::ResultTracker> result_tracker_;
   MetricRegistry* metric_registry_;
-  TabletStatusListener* listener_;
+  scoped_refptr<TabletReplica> tablet_replica_;
   gscoped_ptr<tablet::Tablet> tablet_;
   const scoped_refptr<log::LogAnchorRegistry> log_anchor_registry_;
   scoped_refptr<log::Log> log_;
   std::shared_ptr<log::LogReader> log_reader_;
-
-  unique_ptr<ConsensusMetadata> cmeta_;
 
   // Statistics on the replay of entries in the log.
   struct Stats {
@@ -388,26 +432,28 @@ class TabletBootstrap {
   DISALLOW_COPY_AND_ASSIGN(TabletBootstrap);
 };
 
-void TabletBootstrap::StatusMessage(const string& status) {
-  LOG(INFO) << "T " << meta_->tablet_id() << " P " << meta_->fs_manager()->uuid() << ": "
+void TabletBootstrap::SetStatusMessage(const string& status) {
+  LOG(INFO) << "T " << tablet_meta_->tablet_id()
+            << " P " << tablet_meta_->fs_manager()->uuid() << ": "
             << status;
-  if (listener_) listener_->StatusMessage(status);
+  if (tablet_replica_) tablet_replica_->SetStatusMessage(status);
 }
 
-Status BootstrapTablet(const scoped_refptr<TabletMetadata>& meta,
+Status BootstrapTablet(const scoped_refptr<TabletMetadata>& tablet_meta,
+                       RaftConfigPB committed_raft_config,
                        const scoped_refptr<Clock>& clock,
                        const shared_ptr<MemTracker>& mem_tracker,
                        const scoped_refptr<ResultTracker>& result_tracker,
                        MetricRegistry* metric_registry,
-                       TabletStatusListener* listener,
+                       const scoped_refptr<TabletReplica>& tablet_replica,
                        shared_ptr<tablet::Tablet>* rebuilt_tablet,
                        scoped_refptr<log::Log>* rebuilt_log,
                        const scoped_refptr<log::LogAnchorRegistry>& log_anchor_registry,
                        ConsensusBootstrapInfo* consensus_info) {
   TRACE_EVENT1("tablet", "BootstrapTablet",
-               "tablet_id", meta->tablet_id());
-  TabletBootstrap bootstrap(meta, clock, mem_tracker, result_tracker,
-                            metric_registry, listener, log_anchor_registry);
+               "tablet_id", tablet_meta->tablet_id());
+  TabletBootstrap bootstrap(tablet_meta, std::move(committed_raft_config), clock, mem_tracker,
+                            result_tracker, metric_registry, tablet_replica, log_anchor_registry);
   RETURN_NOT_OK(bootstrap.Bootstrap(rebuilt_tablet, rebuilt_log, consensus_info));
   // This is necessary since OpenNewLog() initially disables sync.
   RETURN_NOT_OK((*rebuilt_log)->ReEnableSyncIfRequired());
@@ -433,17 +479,20 @@ static string DebugInfo(const string& tablet_id,
 }
 
 TabletBootstrap::TabletBootstrap(
-    const scoped_refptr<TabletMetadata>& meta,
+    const scoped_refptr<TabletMetadata>& tablet_meta,
+    RaftConfigPB committed_raft_config,
     const scoped_refptr<Clock>& clock, shared_ptr<MemTracker> mem_tracker,
-    const scoped_refptr<ResultTracker> result_tracker,
-    MetricRegistry* metric_registry, TabletStatusListener* listener,
+    const scoped_refptr<ResultTracker>& result_tracker,
+    MetricRegistry* metric_registry,
+    const scoped_refptr<TabletReplica>& tablet_replica,
     const scoped_refptr<LogAnchorRegistry>& log_anchor_registry)
-    : meta_(meta),
+    : tablet_meta_(tablet_meta),
+      committed_raft_config_(std::move(committed_raft_config)),
       clock_(clock),
       mem_tracker_(std::move(mem_tracker)),
       result_tracker_(result_tracker),
       metric_registry_(metric_registry),
-      listener_(listener),
+      tablet_replica_(tablet_replica),
       log_anchor_registry_(log_anchor_registry) {}
 
 Status TabletBootstrap::Bootstrap(shared_ptr<Tablet>* rebuilt_tablet,
@@ -451,7 +500,7 @@ Status TabletBootstrap::Bootstrap(shared_ptr<Tablet>* rebuilt_tablet,
                                   ConsensusBootstrapInfo* consensus_info) {
   // We pin (prevent) metadata flush at the beginning of the bootstrap process
   // and always unpin it at the end.
-  meta_->PinFlush();
+  tablet_meta_->PinFlush();
 
   // Now run the actual bootstrap process.
   Status bootstrap_status = RunBootstrap(rebuilt_tablet, rebuilt_log, consensus_info);
@@ -464,14 +513,14 @@ Status TabletBootstrap::Bootstrap(shared_ptr<Tablet>* rebuilt_tablet,
   CHECK((*rebuilt_tablet && *rebuilt_log) || !bootstrap_status.ok())
       << "Tablet and Log not initialized";
   if (bootstrap_status.ok()) {
-    meta_->SetPreFlushCallback(
+    tablet_meta_->SetPreFlushCallback(
         Bind(&FlushInflightsToLogCallback::WaitForInflightsAndFlushLog,
              make_scoped_refptr(new FlushInflightsToLogCallback(
                  rebuilt_tablet->get(), *rebuilt_log))));
   }
 
   // This will cause any pending TabletMetadata flush to be executed.
-  Status unpin_status = meta_->UnPinFlush();
+  Status unpin_status = tablet_meta_->UnPinFlush();
 
   constexpr char kFailedUnpinMsg[] = "Failed to flush after unpinning";
   if (PREDICT_FALSE(!bootstrap_status.ok() && !unpin_status.ok())) {
@@ -486,34 +535,37 @@ Status TabletBootstrap::Bootstrap(shared_ptr<Tablet>* rebuilt_tablet,
 Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
                                      scoped_refptr<Log>* rebuilt_log,
                                      ConsensusBootstrapInfo* consensus_info) {
-  string tablet_id = meta_->tablet_id();
-
-  // Replay requires a valid Consensus metadata file to exist in order to
-  // compare the committed consensus configuration seqno with the log entries and also to persist
-  // committed but unpersisted changes.
-  RETURN_NOT_OK_PREPEND(ConsensusMetadata::Load(meta_->fs_manager(), tablet_id,
-                                                meta_->fs_manager()->uuid(), &cmeta_),
-                        "Unable to load Consensus metadata");
+  string tablet_id = tablet_meta_->tablet_id();
 
   // Make sure we don't try to locally bootstrap a tablet that was in the middle
   // of a tablet copy. It's likely that not all files were copied over
   // successfully.
-  TabletDataState tablet_data_state = meta_->tablet_data_state();
+  TabletDataState tablet_data_state = tablet_meta_->tablet_data_state();
   if (tablet_data_state != TABLET_DATA_READY) {
     return Status::Corruption("Unable to locally bootstrap tablet " + tablet_id + ": " +
                               "TabletMetadata bootstrap state is " +
                               TabletDataState_Name(tablet_data_state));
   }
 
-  StatusMessage("Bootstrap starting.");
+  SetStatusMessage("Bootstrap starting.");
 
   if (VLOG_IS_ON(1)) {
     TabletSuperBlockPB super_block;
-    RETURN_NOT_OK(meta_->ToSuperBlock(&super_block));
+    RETURN_NOT_OK(tablet_meta_->ToSuperBlock(&super_block));
     VLOG_WITH_PREFIX(1) << "Tablet Metadata: " << SecureDebugString(super_block);
   }
 
-  RETURN_NOT_OK(flushed_stores_.InitFrom(*meta_.get()));
+
+  // Ensure the tablet's data dirs are present and healthy before it is opened.
+  DataDirGroupPB data_dir_group;
+  RETURN_NOT_OK_PREPEND(
+      tablet_meta_->fs_manager()->dd_manager()->GetDataDirGroupPB(tablet_id, &data_dir_group),
+      "error retrieving tablet data dir group (one or more data dirs may have been removed)");
+  if (tablet_meta_->fs_manager()->dd_manager()->IsTabletInFailedDir(tablet_id)) {
+    return Status::IOError("some tablet data is in a failed directory");
+  }
+
+  RETURN_NOT_OK(flushed_stores_.InitFrom(*tablet_meta_.get()));
 
   bool has_blocks;
   RETURN_NOT_OK(OpenTablet(&has_blocks));
@@ -528,7 +580,8 @@ Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
   if (!has_blocks && !needs_recovery) {
     LOG_WITH_PREFIX(INFO) << "No blocks or log segments found. Creating new log.";
     RETURN_NOT_OK_PREPEND(OpenNewLog(), "Failed to open new log");
-    FinishBootstrap("No bootstrap required, opened a new log", rebuilt_log, rebuilt_tablet);
+    RETURN_NOT_OK(FinishBootstrap("No bootstrap required, opened a new log",
+                                  rebuilt_log, rebuilt_tablet));
     consensus_info->last_id = MinimumOpId();
     consensus_info->last_committed_id = MinimumOpId();
     return Status::OK();
@@ -545,32 +598,31 @@ Status TabletBootstrap::RunBootstrap(shared_ptr<Tablet>* rebuilt_tablet,
 
   RETURN_NOT_OK_PREPEND(PlaySegments(consensus_info), "Failed log replay. Reason");
 
-  // Flush the consensus metadata once at the end to persist our changes, if any.
-  cmeta_->Flush();
-
   RETURN_NOT_OK(RemoveRecoveryDir());
-  FinishBootstrap("Bootstrap complete.", rebuilt_log, rebuilt_tablet);
+  RETURN_NOT_OK(FinishBootstrap("Bootstrap complete.", rebuilt_log, rebuilt_tablet));
 
   return Status::OK();
 }
 
-void TabletBootstrap::FinishBootstrap(const string& message,
+Status TabletBootstrap::FinishBootstrap(const string& message,
                                       scoped_refptr<log::Log>* rebuilt_log,
                                       shared_ptr<Tablet>* rebuilt_tablet) {
-  tablet_->MarkFinishedBootstrapping();
-  StatusMessage(message);
+  RETURN_NOT_OK(tablet_->MarkFinishedBootstrapping());
+  SetStatusMessage(message);
   rebuilt_tablet->reset(tablet_.release());
   rebuilt_log->swap(log_);
+  return Status::OK();
 }
 
 Status TabletBootstrap::OpenTablet(bool* has_blocks) {
-  gscoped_ptr<Tablet> tablet(new Tablet(meta_,
+  gscoped_ptr<Tablet> tablet(new Tablet(tablet_meta_,
                                         clock_,
                                         mem_tracker_,
                                         metric_registry_,
                                         log_anchor_registry_));
   // doing nothing for now except opening a tablet locally.
-  LOG_TIMING_PREFIX(INFO, LogPrefix(), "opening tablet") {
+  {
+    SCOPED_LOG_SLOW_EXECUTION_PREFIX(INFO, 100, LogPrefix(), "opening tablet");
     RETURN_NOT_OK(tablet->Open());
   }
   *has_blocks = tablet->num_rowsets() != 0;
@@ -596,14 +648,14 @@ Status TabletBootstrap::PrepareRecoveryDir(bool* needs_recovery) {
     // Since we have a recovery directory, clear out the log_dir by recursively
     // deleting it and creating a new one so that we don't end up with remnants
     // of old WAL segments or indexes after replay.
-    if (fs_manager->env()->FileExists(log_dir)) {
+    if (fs_manager->Exists(log_dir)) {
       LOG_WITH_PREFIX(INFO) << "Deleting old log files from previous recovery attempt in "
                             << log_dir;
       RETURN_NOT_OK_PREPEND(fs_manager->env()->DeleteRecursively(log_dir),
                             "Could not recursively delete old log dir " + log_dir);
     }
 
-    RETURN_NOT_OK_PREPEND(fs_manager->CreateDirIfMissing(log_dir),
+    RETURN_NOT_OK_PREPEND(env_util::CreateDirIfMissing(fs_manager->env(), log_dir),
                           "Failed to create log directory " + log_dir);
 
     *needs_recovery = true;
@@ -613,7 +665,7 @@ Status TabletBootstrap::PrepareRecoveryDir(bool* needs_recovery) {
   // If we made it here, there was no pre-existing recovery dir.
   // Now we look for log files in log_dir, and if we find any then we rename
   // the whole log_dir to a recovery dir and return needs_recovery = true.
-  RETURN_NOT_OK_PREPEND(fs_manager->CreateDirIfMissing(log_dir),
+  RETURN_NOT_OK_PREPEND(env_util::CreateDirIfMissing(fs_manager->env(), log_dir),
                         "Failed to create log dir");
 
   vector<string> children;
@@ -626,16 +678,16 @@ Status TabletBootstrap::PrepareRecoveryDir(bool* needs_recovery) {
 
     string source_path = JoinPathSegments(log_dir, child);
     string dest_path = JoinPathSegments(recovery_path, child);
-    LOG_WITH_PREFIX(INFO) << "Will attempt to recover log segment " << source_path
-                          << " to " << dest_path;
+    VLOG_WITH_PREFIX(1) << "Will attempt to recover log segment " << source_path
+                        << " to " << dest_path;
     *needs_recovery = true;
   }
 
   if (*needs_recovery) {
     // Atomically rename the log directory to the recovery directory
     // and then re-create the log directory.
-    LOG_WITH_PREFIX(INFO) << "Moving log directory " << log_dir << " to recovery directory "
-                          << recovery_path << " in preparation for log replay";
+    VLOG_WITH_PREFIX(1) << "Moving log directory " << log_dir << " to recovery directory "
+                        << recovery_path << " in preparation for log replay";
     RETURN_NOT_OK_PREPEND(fs_manager->env()->RenameFile(log_dir, recovery_path),
                           Substitute("Could not move log directory $0 to recovery dir $1",
                                      log_dir, recovery_path));
@@ -646,13 +698,18 @@ Status TabletBootstrap::PrepareRecoveryDir(bool* needs_recovery) {
 }
 
 Status TabletBootstrap::OpenLogReaderInRecoveryDir() {
+  const string& tablet_id = tablet_->tablet_id();
+  FsManager* fs_manager = tablet_meta_->fs_manager();
   VLOG_WITH_PREFIX(1) << "Opening log reader in log recovery dir "
-                      << meta_->fs_manager()->GetTabletWalRecoveryDir(tablet_->tablet_id());
+                      << fs_manager->GetTabletWalRecoveryDir(tablet_id);
   // Open the reader.
-  RETURN_NOT_OK_PREPEND(LogReader::OpenFromRecoveryDir(tablet_->metadata()->fs_manager(),
-                                                       tablet_->metadata()->tablet_id(),
-                                                       tablet_->GetMetricEntity().get(),
-                                                       &log_reader_),
+  // Since we're recovering, we don't want to have any log index -- since it
+  // isn't fsynced() during writing, its contents are useless to us.
+  scoped_refptr<LogIndex> log_index(nullptr);
+  const string recovery_dir = fs_manager->GetTabletWalRecoveryDir(tablet_id);
+  RETURN_NOT_OK_PREPEND(LogReader::Open(fs_manager->env(), recovery_dir, log_index, tablet_id,
+                                        tablet_->GetMetricEntity().get(),
+                                        &log_reader_),
                         "Could not open LogReader. Reason");
   return Status::OK();
 }
@@ -663,10 +720,10 @@ Status TabletBootstrap::RemoveRecoveryDir() {
   CHECK(fs_manager->Exists(recovery_path))
       << "Tablet WAL recovery dir " << recovery_path << " does not exist.";
 
-  LOG_WITH_PREFIX(INFO) << "Preparing to delete log recovery files and directory " << recovery_path;
+  VLOG_WITH_PREFIX(1) << "Preparing to delete log recovery files and directory " << recovery_path;
 
   string tmp_path = Substitute("$0-$1", recovery_path, GetCurrentTimeMicros());
-  LOG_WITH_PREFIX(INFO) << "Renaming log recovery dir from "  << recovery_path
+  VLOG_WITH_PREFIX(1) << "Renaming log recovery dir from "  << recovery_path
                         << " to " << tmp_path;
   RETURN_NOT_OK_PREPEND(fs_manager->env()->RenameFile(recovery_path, tmp_path),
                         Substitute("Could not rename old recovery dir from: $0 to: $1",
@@ -676,10 +733,10 @@ Status TabletBootstrap::RemoveRecoveryDir() {
     LOG_WITH_PREFIX(INFO) << "--skip_remove_old_recovery_dir enabled. NOT deleting " << tmp_path;
     return Status::OK();
   }
-  LOG_WITH_PREFIX(INFO) << "Deleting all files from renamed log recovery directory " << tmp_path;
+  VLOG_WITH_PREFIX(1) << "Deleting all files from renamed log recovery directory " << tmp_path;
   RETURN_NOT_OK_PREPEND(fs_manager->env()->DeleteRecursively(tmp_path),
                         "Could not remove renamed recovery dir " + tmp_path);
-  LOG_WITH_PREFIX(INFO) << "Completed deletion of old log recovery files and directory "
+  VLOG_WITH_PREFIX(1) << "Completed deletion of old log recovery files and directory "
                         << tmp_path;
   return Status::OK();
 }
@@ -957,9 +1014,11 @@ TabletBootstrap::ActiveStores TabletBootstrap::AnalyzeActiveStores(const CommitM
 Status TabletBootstrap::CheckOrphanedCommitDoesntNeedReplay(const CommitMsg& commit) {
   if (AnalyzeActiveStores(commit) == SOME_STORES_ACTIVE) {
     TabletSuperBlockPB super;
-    WARN_NOT_OK(meta_->ToSuperBlock(&super), LogPrefix() + "Couldn't build TabletSuperBlockPB");
+    WARN_NOT_OK(tablet_meta_->ToSuperBlock(&super),
+                Substitute("$0$1", LogPrefix(), "Couldn't build TabletSuperBlockPB"));
     return Status::Corruption(Substitute("CommitMsg was orphaned but it referred to "
-        "stores which need replay. Commit: $0. TabletMetadata: $1", SecureShortDebugString(commit),
+        "stores which need replay. Commit: $0. TabletMetadata: $1",
+        SecureShortDebugString(commit),
         SecureShortDebugString(super)));
   }
 
@@ -1061,7 +1120,7 @@ Status TabletBootstrap::HandleEntryPair(LogEntryPB* replicate_entry, LogEntryPB*
   } else {
     DCHECK(clock_->SupportsExternalConsistencyMode(COMMIT_WAIT)) << "The provided clock does not"
         "support COMMIT_WAIT external consistency mode.";
-    safe_time = server::HybridClock::AddPhysicalTimeToTimestamp(
+    safe_time = clock::HybridClock::AddPhysicalTimeToTimestamp(
         Timestamp(replicate->timestamp()),
         MonoDelta::FromMicroseconds(-FLAGS_max_clock_sync_error_usec));
   }
@@ -1144,21 +1203,21 @@ Status TabletBootstrap::PlaySegments(ConsensusBootstrapInfo* consensus_info) {
 
       auto now = MonoTime::Now();
       if (now - last_status_update > kStatusUpdateInterval) {
-        StatusMessage(Substitute("Bootstrap replaying log segment $0/$1 "
-                                 "($2/$3 this segment, stats: $4)",
-                                 segment_count + 1, log_reader_->num_segments(),
-                                 HumanReadableNumBytes::ToString(reader.offset()),
-                                 HumanReadableNumBytes::ToString(reader.read_up_to_offset()),
-                                 stats_.ToString()));
+        SetStatusMessage(Substitute("Bootstrap replaying log segment $0/$1 "
+                                    "($2/$3 this segment, stats: $4)",
+                                    segment_count + 1, log_reader_->num_segments(),
+                                    HumanReadableNumBytes::ToString(reader.offset()),
+                                    HumanReadableNumBytes::ToString(reader.read_up_to_offset()),
+                                    stats_.ToString()));
         last_status_update = now;
       }
     }
 
-    StatusMessage(Substitute("Bootstrap replayed $0/$1 log segments. "
-                             "Stats: $2. Pending: $3 replicates",
-                             segment_count + 1, log_reader_->num_segments(),
-                             stats_.ToString(),
-                             state.pending_replicates.size()));
+    SetStatusMessage(Substitute("Bootstrap replayed $0/$1 log segments. "
+                                "Stats: $2. Pending: $3 replicates",
+                                segment_count + 1, log_reader_->num_segments(),
+                                stats_.ToString(),
+                                state.pending_replicates.size()));
     segment_count++;
   }
 
@@ -1175,7 +1234,7 @@ Status TabletBootstrap::PlaySegments(ConsensusBootstrapInfo* consensus_info) {
           AnalyzeActiveStores(entry.second->commit()) == NO_STORES_ACTIVE) {
         DumpReplayStateToLog(state);
         TabletSuperBlockPB super;
-        WARN_NOT_OK(meta_->ToSuperBlock(&super), "Couldn't build TabletSuperBlockPB.");
+        WARN_NOT_OK(tablet_meta_->ToSuperBlock(&super), "Couldn't build TabletSuperBlockPB.");
         return Status::Corruption(Substitute("CommitMsg was pending but it did not refer "
             "to any active memory stores. Commit: $0. TabletMetadata: $1",
             SecureShortDebugString(entry.second->commit()), SecureShortDebugString(super)));
@@ -1222,7 +1281,9 @@ Status TabletBootstrap::PlaySegments(ConsensusBootstrapInfo* consensus_info) {
   //   no later committed replicate message (with index > Y) is visible across reboots
   //   in the tablet data.
 
-  DumpReplayStateToLog(state);
+  if (VLOG_IS_ON(1)) {
+    DumpReplayStateToLog(state);
+  }
 
   // Set up the ConsensusBootstrapInfo structure for the caller.
   for (OpIndexToEntryMap::value_type& e : state.pending_replicates) {
@@ -1242,22 +1303,38 @@ Status TabletBootstrap::AppendCommitMsg(const CommitMsg& commit_msg) {
   return log_->Append(&commit_entry);
 }
 
-Status TabletBootstrap::DetermineFlushedOpsAndBuildResponse(const TxResultPB& result,
-                                                            vector<bool>* flushed_by_op,
-                                                            WriteResponsePB* response) {
-  int num_ops = result.ops_size();
-  flushed_by_op->resize(num_ops);
+Status TabletBootstrap::DetermineSkippedOpsAndBuildResponse(const TxResultPB& orig_result,
+                                                            TxResultPB* new_result,
+                                                            WriteResponsePB* response,
+                                                            bool* all_skipped) {
+  int num_ops = orig_result.ops_size();
+  new_result->mutable_ops()->Reserve(num_ops);
+  *all_skipped = true;
 
   for (int i = 0; i < num_ops; i++) {
-    const auto& orig_op_result = result.ops(i);
-    if (orig_op_result.has_failed_status() && response) {
-      WriteResponsePB::PerRowErrorPB* error = response->add_per_row_errors();
-      error->set_row_index(i);
-      error->mutable_error()->CopyFrom(orig_op_result.failed_status());
+    const auto& orig_op_result = orig_result.ops(i);
+    OpAction action;
+    RETURN_NOT_OK(FilterOperation(orig_op_result, &action));
+    *all_skipped &= action != NEEDS_REPLAY;
+
+    if (action != NEEDS_REPLAY) {
+      new_result->mutable_ops(i)->set_skip_on_replay(true);
     }
-    bool f;
-    RETURN_NOT_OK(FilterOperation(orig_op_result, &f));
-    (*flushed_by_op)[i] = f;
+
+    if (action == SKIP_PREVIOUSLY_FAILED) {
+      if (response) {
+        WriteResponsePB::PerRowErrorPB* error = response->add_per_row_errors();
+        error->set_row_index(i);
+        error->mutable_error()->CopyFrom(orig_op_result.failed_status());
+      }
+      // If the op is already flushed we won't be applying it.
+      DCHECK(orig_op_result.has_failed_status());
+      new_result->mutable_ops(i)->mutable_failed_status()->CopyFrom(orig_op_result.failed_status());
+    }
+  }
+
+  if (*all_skipped) {
+    stats_.ops_ignored++;
   }
   return Status::OK();
 }
@@ -1267,8 +1344,8 @@ Status TabletBootstrap::PlayWriteRequest(ReplicateMsg* replicate_msg,
   // Prepare the commit entry for the rewritten log.
   LogEntryPB commit_entry;
   commit_entry.set_type(log::COMMIT);
-  CommitMsg* commit = commit_entry.mutable_commit();
-  commit->CopyFrom(commit_msg);
+  CommitMsg* new_commit = commit_entry.mutable_commit();
+  new_commit->CopyFrom(commit_msg);
 
   // Set up the new transaction.
   // Even if we're going to ignore the transaction, it's important to
@@ -1313,45 +1390,30 @@ Status TabletBootstrap::PlayWriteRequest(ReplicateMsg* replicate_msg,
   // storage and don't need to be re-applied. We can do this even before
   // we decode any row operations, so we can short-circuit that decoding
   // in the case that the entire op has been already flushed.
-  vector<bool> already_flushed;
-  RETURN_NOT_OK(DetermineFlushedOpsAndBuildResponse(commit_msg.result(),
-                                                    &already_flushed,
-                                                    response.get()));
+  TxResultPB* new_result = new_commit->mutable_result();
+  bool all_flushed;
+  RETURN_NOT_OK(DetermineSkippedOpsAndBuildResponse(commit_msg.result(),
+                                                    new_result,
+                                                    response.get(),
+                                                    &all_flushed));
 
   if (tracking_results && state == ResultTracker::NEW) {
     result_tracker_->RecordCompletionAndRespond(replicate_msg->request_id(), response.get());
   }
 
   Status play_status;
-  bool all_already_flushed = std::all_of(already_flushed.begin(),
-                                         already_flushed.end(),
-                                         [](bool f) { return f; });
-  if (all_already_flushed) {
-    stats_.ops_ignored++;
-    for (auto& op : *commit->mutable_result()->mutable_ops()) {
-      op.Clear();
-      op.set_flushed(true);
-    }
-  } else {
-    if (write->has_row_operations()) {
-      // TODO(todd): get rid of redundant params below - they can be gotten from the Request
-      // Rather than RETURN_NOT_OK() here, we need to just save the status and do the
-      // RETURN_NOT_OK() down below the Commit() call below. Even though it seems wrong
-      // to commit the transaction when in fact it failed to apply, we would throw a CHECK
-      // failure if we attempted to 'Abort()' after entering the applying stage. Allowing it to
-      // Commit isn't problematic because we don't expose the results anyway, and the bad
-      // Status returned below will cause us to fail the entire tablet bootstrap anyway.
-      play_status = PlayRowOperations(&tx_state,
-                                      write->schema(),
-                                      write->row_operations(),
-                                      commit_msg.result(),
-                                      already_flushed);
-    }
+  if (!all_flushed && write->has_row_operations()) {
+    // Rather than RETURN_NOT_OK() here, we need to just save the status and do the
+    // RETURN_NOT_OK() down below the Commit() call below. Even though it seems wrong
+    // to commit the transaction when in fact it failed to apply, we would throw a CHECK
+    // failure if we attempted to 'Abort()' after entering the applying stage. Allowing it to
+    // Commit isn't problematic because we don't expose the results anyway, and the bad
+    // Status returned below will cause us to fail the entire tablet bootstrap anyway.
+    play_status = PlayRowOperations(&tx_state, commit_msg.result(), new_result);
 
     if (play_status.ok()) {
-      // Replace the original commit message's result with the new one from
-      // the replayed operation.
-      tx_state.ReleaseTxResultPB(commit->mutable_result());
+      // Replace the original commit message's result with the new one from the replayed operation.
+      tx_state.ReleaseTxResultPB(new_commit->mutable_result());
     }
   }
 
@@ -1394,28 +1456,20 @@ Status TabletBootstrap::PlayAlterSchemaRequest(ReplicateMsg* replicate_msg,
 
 Status TabletBootstrap::PlayChangeConfigRequest(ReplicateMsg* replicate_msg,
                                                 const CommitMsg& commit_msg) {
-  ChangeConfigRecordPB* change_config = replicate_msg->mutable_change_config_record();
-  RaftConfigPB config = change_config->new_config();
-
-  int64_t cmeta_opid_index =  cmeta_->committed_config().opid_index();
-  if (replicate_msg->id().index() > cmeta_opid_index) {
-    DCHECK(!config.has_opid_index());
-    config.set_opid_index(replicate_msg->id().index());
-    VLOG_WITH_PREFIX(1) << "WAL replay found Raft configuration with log index "
-                        << config.opid_index()
-                        << " that is greater than the committed config's index "
-                        << cmeta_opid_index
-                        << ". Applying this configuration change.";
-    cmeta_->set_committed_config(config);
-    // We flush once at the end of bootstrap.
-  } else {
-    VLOG_WITH_PREFIX(1) << "WAL replay found Raft configuration with log index "
-                        << replicate_msg->id().index()
-                        << ", which is less than or equal to the committed "
-                        << "config's index " << cmeta_opid_index << ". "
-                        << "Skipping application of this config change.";
+  // Invariant: The committed config change request is always locally persisted
+  // in the consensus metadata before the commit message is written to the WAL.
+  if (PREDICT_FALSE(replicate_msg->id().index() > committed_raft_config_.opid_index())) {
+    string msg = Substitute("Committed config change op in WAL has opid index ($0) greater than "
+                            "config persisted in the consensus metadata ($1). "
+                            "Replicate message: {$2}. "
+                            "Committed raft config in consensus metadata: {$3}",
+                            replicate_msg->id().index(),
+                            committed_raft_config_.opid_index(),
+                            SecureShortDebugString(*replicate_msg),
+                            SecureShortDebugString(committed_raft_config_));
+    LOG_WITH_PREFIX(DFATAL) << msg;
+    return Status::Corruption(msg);
   }
-
   return AppendCommitMsg(commit_msg);
 }
 
@@ -1424,43 +1478,33 @@ Status TabletBootstrap::PlayNoOpRequest(ReplicateMsg* replicate_msg, const Commi
 }
 
 Status TabletBootstrap::PlayRowOperations(WriteTransactionState* tx_state,
-                                          const SchemaPB& schema_pb,
-                                          const RowOperationsPB& ops_pb,
-                                          const TxResultPB& result,
-                                          const vector<bool>& already_flushed) {
+                                          const TxResultPB& orig_result,
+                                          TxResultPB* new_result) {
   Schema inserts_schema;
-  RETURN_NOT_OK_PREPEND(SchemaFromPB(schema_pb, &inserts_schema),
+  RETURN_NOT_OK_PREPEND(SchemaFromPB(tx_state->request()->schema(), &inserts_schema),
                         "Couldn't decode client schema");
 
   RETURN_NOT_OK_PREPEND(tablet_->DecodeWriteOperations(&inserts_schema, tx_state),
                         Substitute("Could not decode row operations: $0",
-                                   SecureShortDebugString(ops_pb)));
-  DCHECK_EQ(tx_state->row_ops().size(), already_flushed.size());
-
-  // Propagate the 'already_flushed' information into the decoded operations.
-  // This signals to ApplyOperations() below that it doesn't need to actually
-  // apply these ops again.
-  for (int i = 0; i < already_flushed.size(); i++) {
-    if (already_flushed[i]) {
-      tx_state->row_ops()[i]->SetAlreadyFlushed();
-    }
-  }
+                                   SecureDebugString(tx_state->request()->row_operations())));
 
   // Run AcquireRowLocks, Apply, etc!
   RETURN_NOT_OK_PREPEND(tablet_->AcquireRowLocks(tx_state),
                         "Failed to acquire row locks");
 
-  RETURN_NOT_OK(ApplyOperations(tx_state, result));
+  RETURN_NOT_OK(ApplyOperations(tx_state, orig_result, new_result));
 
   return Status::OK();
 }
 
 Status TabletBootstrap::ApplyOperations(WriteTransactionState* tx_state,
-                                        const TxResultPB& orig_result) {
+                                        const TxResultPB& orig_result,
+                                        TxResultPB* new_result) {
+  DCHECK_EQ(tx_state->row_ops().size(), orig_result.ops_size());
+  DCHECK_EQ(tx_state->row_ops().size(), new_result->ops_size());
   int32_t op_idx = 0;
   for (RowOp* op : tx_state->row_ops()) {
-    const OperationResultPB& orig_op_result = orig_result.ops(op_idx++);
-
+    int32_t curr_op_idx = op_idx++;
     // Increment the seen/ignored stats.
     switch (op->decoded_op.type) {
       case RowOperationsPB::INSERT:
@@ -1485,30 +1529,23 @@ Status TabletBootstrap::ApplyOperations(WriteTransactionState* tx_state,
         break;
     }
 
-    // If the op is already flushed, no need to replay it.
-    if (op->has_result()) {
-      DCHECK(op->result->flushed());
+    const OperationResultPB& new_op_result = new_result->ops(curr_op_idx);
+    // If the op is already flushed or had previously failed, no need to replay it.
+    // TODO(dralves) this back and forth is weird. We're first setting the flushed/failed
+    // status on the rewritten message's commit entry. Then we pass it here to
+    // set the status on the op, then we set it back on the commit entry with
+    // ReleaseTxResultPB(). This could be simplified if we build the RowOps on
+    // demand and just created DecodedRowOperation/RowOp for the replayed stuff.
+    if (new_op_result.skip_on_replay()) {
+      op->SetSkippedResult(new_op_result);
       continue;
     }
 
-    op->set_original_result_from_log(&orig_op_result);
-
-    // check if the operation failed in the original transaction
-    if (PREDICT_FALSE(orig_op_result.has_failed_status())) {
-      Status status = StatusFromPB(orig_op_result.failed_status());
-      if (VLOG_IS_ON(1)) {
-        VLOG_WITH_PREFIX(1) << "Skipping operation that originally resulted in error. OpId: "
-                            << SecureDebugString(tx_state->op_id()) << " op index: "
-                            << op_idx - 1 << " original error: "
-                            << status.ToString();
-      }
-      op->SetFailed(status);
-      continue;
-    }
+    op->set_original_result_from_log(&orig_result.ops(curr_op_idx));
 
     // Actually apply it.
     ProbeStats stats; // we don't use this, but tablet internals require non-NULL.
-    tablet_->ApplyRowOperation(tx_state, op, &stats);
+    RETURN_NOT_OK(tablet_->ApplyRowOperation(tx_state, op, &stats));
     DCHECK(op->result != nullptr);
 
     // We expect that the above Apply() will always succeed, because we're
@@ -1527,10 +1564,16 @@ Status TabletBootstrap::ApplyOperations(WriteTransactionState* tx_state,
 }
 
 Status TabletBootstrap::FilterOperation(const OperationResultPB& op_result,
-                                        bool* already_flushed) {
+                                        OpAction* action) {
+
   // If the operation failed or was skipped, originally, no need to re-apply it.
-  if (op_result.has_failed_status() || op_result.flushed()) {
-    *already_flushed = true;
+  if (op_result.has_failed_status()) {
+    *action = SKIP_PREVIOUSLY_FAILED;
+    return Status::OK();
+  }
+
+  if (op_result.skip_on_replay()) {
+    *action = SKIP_PREVIOUSLY_FLUSHED;
     return Status::OK();
   }
 
@@ -1554,7 +1597,7 @@ Status TabletBootstrap::FilterOperation(const OperationResultPB& op_result,
 
   if (num_active_stores == 0) {
     // The mutation was fully flushed.
-    *already_flushed = true;
+    *action = SKIP_PREVIOUSLY_FLUSHED;
     return Status::OK();
   }
 
@@ -1568,7 +1611,7 @@ Status TabletBootstrap::FilterOperation(const OperationResultPB& op_result,
                               SecureShortDebugString(op_result));
   }
 
-  *already_flushed = false;
+  *action = NEEDS_REPLAY;
   return Status::OK();
 }
 
@@ -1579,13 +1622,13 @@ Status TabletBootstrap::UpdateClock(uint64_t timestamp) {
 }
 
 string TabletBootstrap::LogPrefix() const {
-  return Substitute("T $0 P $1: ", meta_->tablet_id(), meta_->fs_manager()->uuid());
+  return Substitute("T $0 P $1: ", tablet_meta_->tablet_id(), tablet_meta_->fs_manager()->uuid());
 }
 
-Status FlushedStoresSnapshot::InitFrom(const TabletMetadata& meta) {
+Status FlushedStoresSnapshot::InitFrom(const TabletMetadata& tablet_meta) {
   CHECK(flushed_dms_by_drs_id_.empty()) << "already initted";
-  last_durable_mrs_id_ = meta.last_durable_mrs_id();
-  for (const shared_ptr<RowSetMetadata>& rsmd : meta.rowsets()) {
+  last_durable_mrs_id_ = tablet_meta.last_durable_mrs_id();
+  for (const shared_ptr<RowSetMetadata>& rsmd : tablet_meta.rowsets()) {
     if (!InsertIfNotPresent(&flushed_dms_by_drs_id_, rsmd->id(),
                             rsmd->last_durable_redo_dms_id())) {
       return Status::Corruption(Substitute(

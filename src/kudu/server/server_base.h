@@ -17,6 +17,7 @@
 #ifndef KUDU_SERVER_SERVER_BASE_H
 #define KUDU_SERVER_SERVER_BASE_H
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
@@ -24,14 +25,13 @@
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/messenger.h"
-#include "kudu/rpc/service_if.h"
 #include "kudu/security/simple_acl.h"
 #include "kudu/server/server_base_options.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
-class Env;
 class FsManager;
 class MemTracker;
 class MetricEntity;
@@ -44,8 +44,15 @@ class Sockaddr;
 class Thread;
 class Webserver;
 
+namespace clock {
+class Clock;
+} // namespace clock
+
 namespace rpc {
+class ResultTracker;
 class RpcContext;
+class ServiceIf;
+class ServicePool;
 } // namespace rpc
 
 namespace security {
@@ -54,9 +61,7 @@ class TokenVerifier;
 } // namespace security
 
 namespace server {
-class Clock;
-
-struct ServerBaseOptions;
+class DiagnosticsLog;
 class ServerStatusPB;
 
 // Base class for tablet server and master.
@@ -97,10 +102,10 @@ class ServerBase {
   const scoped_refptr<rpc::ResultTracker>& result_tracker() const { return result_tracker_; }
 
   // Returns this server's clock.
-  Clock* clock() { return clock_.get(); }
+  clock::Clock* clock() { return clock_.get(); }
 
   // Return a PB describing the status of the server (version info, bound ports, etc)
-  void GetStatusPB(ServerStatusPB* status) const;
+  Status GetStatusPB(ServerStatusPB* status) const;
 
   enum {
     SUPER_USER = 1,
@@ -119,10 +124,39 @@ class ServerBase {
              const std::string& metric_namespace);
   virtual ~ServerBase();
 
-  Status Init();
+  virtual Status Init();
+
+  // Starts the server, including activating its RPC and HTTP endpoints such
+  // that incoming requests get processed.
+  virtual Status Start();
+
+  // Shuts down the server.
+  virtual void Shutdown();
+
+  // Registers a new RPC service. Once Start() is called, the server will
+  // process and dispatch incoming RPCs belonging to this service.
   Status RegisterService(gscoped_ptr<rpc::ServiceIf> rpc_impl);
-  Status Start();
-  void Shutdown();
+
+  // Unregisters all RPC services. After this function returns, any subsequent
+  // incoming RPCs will be rejected.
+  //
+  // When shutting down, this function should be called before shutting down
+  // higher-level subsystems. For example:
+  // 1. ServerBase::UnregisterAllServices()
+  // 2. <shut down other subsystems>
+  // 3. ServerBase::Shutdown()
+  //
+  // TODO(adar): this should also wait on all outstanding RPCs to finish via
+  // Messenger::Shutdown, but doing that causes too many other shutdown-related
+  // issues. Here are a few that I observed:
+  // - tserver heartbeater threads access acceptor pool socket state.
+  // - Shutting down TabletReplicas invokes RPC callbacks for aborted
+  //   transactions, but Messenger::Shutdown has already destroyed too much
+  //   necessary RPC state.
+  //
+  // TODO(adar): this should also shutdown the webserver, but it isn't safe to
+  // do that before before shutting down the tserver heartbeater.
+  void UnregisterAllServices();
 
   void LogUnauthorizedAccess(rpc::RpcContext* rpc) const;
 
@@ -140,7 +174,7 @@ class ServerBase {
   scoped_refptr<rpc::ResultTracker> result_tracker_;
   bool is_first_run_;
 
-  scoped_refptr<Clock> clock_;
+  scoped_refptr<clock::Clock> clock_;
 
   // The instance identifier of this server.
   gscoped_ptr<NodeInstancePB> instance_pb_;
@@ -162,13 +196,16 @@ class ServerBase {
   void MetricsLoggingThread();
   std::string FooterHtml() const;
 
+  // Callback from the RPC system when a service queue has overflowed.
+  void ServiceQueueOverflowed(rpc::ServicePool* service);
+
   // Start thread to remove excess glog and minidump files.
   Status StartExcessLogFileDeleterThread();
   void ExcessLogFileDeleterThread();
 
   ServerBaseOptions options_;
 
-  scoped_refptr<Thread> metrics_logging_thread_;
+  std::unique_ptr<DiagnosticsLog> diag_log_;
   scoped_refptr<Thread> excess_log_deleter_thread_;
   CountDownLatch stop_background_threads_latch_;
 

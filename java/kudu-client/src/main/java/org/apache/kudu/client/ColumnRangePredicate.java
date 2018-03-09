@@ -17,17 +17,20 @@
 
 package org.apache.kudu.client;
 
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
 import com.google.protobuf.InvalidProtocolBufferException;
-import com.google.protobuf.ZeroCopyLiteralByteString;
+import com.google.protobuf.UnsafeByteOperations;
+import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Type;
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.tserver.Tserver;
+import org.apache.kudu.util.DecimalUtil;
 
 /**
  * A range predicate on one of the columns in the underlying data.
@@ -55,12 +58,12 @@ public class ColumnRangePredicate {
 
   private void setLowerBoundInternal(byte[] value) {
     this.lowerBound = value;
-    pb.setLowerBound(ZeroCopyLiteralByteString.wrap(this.lowerBound));
+    pb.setLowerBound(UnsafeByteOperations.unsafeWrap(this.lowerBound));
   }
 
   private void setUpperBoundInternal(byte[] value) {
     this.upperBound = value;
-    pb.setInclusiveUpperBound(ZeroCopyLiteralByteString.wrap(this.upperBound));
+    pb.setInclusiveUpperBound(UnsafeByteOperations.unsafeWrap(this.upperBound));
   }
 
   /**
@@ -76,7 +79,7 @@ public class ColumnRangePredicate {
     if (bound == null) {
       return null;
     }
-    switch (column.getType().getDataType()) {
+    switch (column.getType().getDataType(column.getTypeAttributes())) {
       case BOOL:
         return KuduPredicate.newComparisonPredicate(column, op, Bytes.getBoolean(bound));
       case INT8:
@@ -96,6 +99,12 @@ public class ColumnRangePredicate {
         return KuduPredicate.newComparisonPredicate(column, op, Bytes.getString(bound));
       case BINARY:
         return KuduPredicate.newComparisonPredicate(column, op, bound);
+      case DECIMAL32:
+      case DECIMAL64:
+      case DECIMAL128:
+        ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+        return KuduPredicate.newComparisonPredicate(column, op,
+            Bytes.getDecimal(bound, typeAttributes.getPrecision(), typeAttributes.getScale()));
       default:
         throw new IllegalStateException(String.format("unknown column type %s", column.getType()));
     }
@@ -206,6 +215,18 @@ public class ColumnRangePredicate {
   }
 
   /**
+   * Set a BigDecimal for the lower bound
+   * @param lowerBound value for the lower bound
+   */
+  public void setLowerBound(BigDecimal lowerBound) {
+    checkColumn(Type.DECIMAL);
+    int precision = column.getTypeAttributes().getPrecision();
+    int scale = column.getTypeAttributes().getScale();
+    BigDecimal coercedVal = DecimalUtil.coerce(lowerBound, precision, scale);
+    setLowerBoundInternal(Bytes.fromBigDecimal(coercedVal, precision));
+  }
+
+  /**
    * Set a boolean for the upper bound
    * @param upperBound value for the upper bound
    */
@@ -288,6 +309,18 @@ public class ColumnRangePredicate {
   public void setUpperBound(double upperBound) {
     checkColumn(Type.DOUBLE);
     setUpperBoundInternal(Bytes.fromDouble(upperBound));
+  }
+
+  /**
+   * Set a BigDecimal for the upper bound
+   * @param upperBound value for the upper bound
+   */
+  public void setUpperBound(BigDecimal upperBound) {
+    checkColumn(Type.DECIMAL);
+    int precision = column.getTypeAttributes().getPrecision();
+    int scale = column.getTypeAttributes().getScale();
+    BigDecimal coercedVal = DecimalUtil.coerce(upperBound, precision, scale);
+    setUpperBoundInternal(Bytes.fromBigDecimal(coercedVal, precision));
   }
 
   /**

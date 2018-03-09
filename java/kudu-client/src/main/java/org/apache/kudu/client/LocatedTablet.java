@@ -22,8 +22,9 @@ package org.apache.kudu.client;
 
 import java.util.List;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+
 import org.apache.kudu.consensus.Metadata.RaftPeerPB.Role;
 import org.apache.kudu.master.Master.TabletLocationsPB.ReplicaPB;
 
@@ -86,7 +87,7 @@ public class LocatedTablet {
    */
   private Replica getOneOfRoleOrNull(Role role) {
     for (Replica r : replicas) {
-      if (r.getRole() == role.toString()) {
+      if (r.getRoleAsEnum().equals(role)) {
         return r;
       }
     }
@@ -122,6 +123,10 @@ public class LocatedTablet {
         return null;
       }
       return pb.getTsInfo().getRpcAddressesList().get(0).getPort();
+    }
+
+    public Role getRoleAsEnum() {
+      return pb.getRole();
     }
 
     public String getRole() {

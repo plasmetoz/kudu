@@ -21,32 +21,36 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 #include <sasl/sasl.h>
 
+#include "kudu/rpc/messenger.h"
 #include "kudu/rpc/negotiation.h"
 #include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/sasl_helper.h"
+#include "kudu/security/security_flags.h"
 #include "kudu/security/tls_handshake.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/socket.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
+
+class Slice;
+class faststring;
 
 namespace security {
 class TlsContext;
 }
 
 namespace rpc {
-
-class NegotiatePB;
-class NegotiatePB_SaslAuth;
-class ResponseHeader;
 
 // Class for doing KRPC negotiation with a remote server over a bidirectional socket.
 // Operations on this class are NOT thread-safe.
@@ -60,8 +64,9 @@ class ClientNegotiation {
   // The provided TlsContext must outlive this negotiation instance.
   ClientNegotiation(std::unique_ptr<Socket> socket,
                     const security::TlsContext* tls_context,
-                    const boost::optional<security::SignedTokenPB>& authn_token,
-                    RpcEncryption encryption);
+                    boost::optional<security::SignedTokenPB> authn_token,
+                    RpcEncryption encryption,
+                    std::string sasl_proto_name);
 
   // Enable PLAIN authentication.
   // Must be called before Negotiate().
@@ -122,7 +127,7 @@ class ClientNegotiation {
   //
   // Returns OK on success, otherwise may return NotAuthorized, NotSupported, or
   // another non-OK status.
-  Status Negotiate();
+  Status Negotiate(std::unique_ptr<ErrorStatusPB>* rpc_error = nullptr);
 
   // SASL callback for plugin options, supported mechanisms, etc.
   // Returns SASL_FAIL if the option is not handled, which does not fail the handshake.
@@ -135,6 +140,9 @@ class ClientNegotiation {
   // SASL callback for SASL_CB_PASS
   int SecretCb(sasl_conn_t* conn, int id, sasl_secret_t** psecret);
 
+  // Check that GSSAPI/Kerberos credentials are available.
+  static Status CheckGSSAPI() WARN_UNUSED_RESULT;
+
  private:
 
   // Encode and send the specified negotiate request message to the server.
@@ -142,10 +150,13 @@ class ClientNegotiation {
 
   // Receive a negotiate response message from the server, deserializing it into 'msg'.
   // Validates that the response is not an error.
-  Status RecvNegotiatePB(NegotiatePB* msg, faststring* buffer) WARN_UNUSED_RESULT;
+  Status RecvNegotiatePB(NegotiatePB* msg,
+                         faststring* buffer,
+                         std::unique_ptr<ErrorStatusPB>* rpc_error) WARN_UNUSED_RESULT;
 
   // Parse error status message from raw bytes of an ErrorStatusPB.
-  Status ParseError(const Slice& err_data) WARN_UNUSED_RESULT;
+  Status ParseError(const Slice& err_data,
+                    std::unique_ptr<ErrorStatusPB>* rpc_error) WARN_UNUSED_RESULT;
 
   Status SendConnectionHeader() WARN_UNUSED_RESULT;
 
@@ -166,11 +177,13 @@ class ClientNegotiation {
 
   // Authenticate to the server using SASL.
   // 'recv_buf' allows a receive buffer to be reused.
-  Status AuthenticateBySasl(faststring* recv_buf) WARN_UNUSED_RESULT;
+  Status AuthenticateBySasl(faststring* recv_buf,
+                            std::unique_ptr<ErrorStatusPB>* rpc_error) WARN_UNUSED_RESULT;
 
   // Authenticate to the server using a token.
   // 'recv_buf' allows a receive buffer to be reused.
-  Status AuthenticateByToken(faststring* recv_buf) WARN_UNUSED_RESULT;
+  Status AuthenticateByToken(faststring* recv_buf,
+                             std::unique_ptr<ErrorStatusPB> *rpc_error) WARN_UNUSED_RESULT;
 
   // Send an SASL_INITIATE message to the server.
   // Returns:
@@ -238,6 +251,9 @@ class ClientNegotiation {
 
   // The SASL mechanism used by the connection. Filled in during negotiation.
   SaslMechanism::Type negotiated_mech_;
+
+  // The SASL protocol name that is used for the SASL negotiation.
+  const std::string sasl_proto_name_;
 
   // Negotiation timeout deadline.
   MonoTime deadline_;

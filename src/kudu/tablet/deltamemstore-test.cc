@@ -15,21 +15,50 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <memory>
-#include <stdlib.h>
+#include <ostream>
+#include <string>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/clock/logical_clock.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/row_changelist.h"
 #include "kudu/common/schema.h"
-#include "kudu/consensus/consensus.pb.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/types.h"
+#include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/fs/block_manager.h"
+#include "kudu/fs/fs_manager.h"
 #include "kudu/gutil/casts.h"
 #include "kudu/gutil/gscoped_ptr.h"
-#include "kudu/server/logical_clock.h"
-#include "kudu/tablet/deltamemstore.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/tablet/delta_stats.h"
+#include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/deltafile.h"
+#include "kudu/tablet/deltamemstore.h"
 #include "kudu/tablet/mutation.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/mem_tracker.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
@@ -37,7 +66,10 @@
 DEFINE_int32(benchmark_num_passes, 100, "Number of passes to apply deltas in the benchmark");
 
 using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
 using std::unordered_set;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -49,7 +81,7 @@ class TestDeltaMemStore : public KuduTest {
   TestDeltaMemStore()
     : op_id_(consensus::MaximumOpId()),
       schema_(CreateSchema()),
-      clock_(server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
+      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
     CHECK_OK(DeltaMemStore::Create(0, 0,
                                    new log::LogAnchorRegistry(),
                                    MemTracker::GetRootTracker(), &dms_));
@@ -121,7 +153,7 @@ class TestDeltaMemStore : public KuduTest {
 
   const Schema schema_;
   shared_ptr<DeltaMemStore> dms_;
-  scoped_refptr<server::Clock> clock_;
+  scoped_refptr<clock::Clock> clock_;
   MvccManager mvcc_;
   gscoped_ptr<FsManager> fs_manager_;
 };
@@ -166,8 +198,8 @@ TEST_F(TestDeltaMemStore, TestUpdateCount) {
 
 
   // Flush the delta file so that the stats get updated.
-  gscoped_ptr<WritableBlock> block;
-  ASSERT_OK(fs_manager_->CreateNewBlock(&block));
+  unique_ptr<WritableBlock> block;
+  ASSERT_OK(fs_manager_->CreateNewBlock({}, &block));
   DeltaFileWriter dfw(std::move(block));
   ASSERT_OK(dfw.Start());
   gscoped_ptr<DeltaStats> stats;
@@ -446,7 +478,7 @@ TEST_F(TestDeltaMemStore, TestIteratorDoesUpdates) {
 }
 
 TEST_F(TestDeltaMemStore, TestCollectMutations) {
-  Arena arena(1024, 1024);
+  Arena arena(1024);
 
   // Update rows 5 and 12
   vector<uint32_t> to_update;

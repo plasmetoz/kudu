@@ -18,31 +18,52 @@
 #include "kudu/tserver/heartbeater.h"
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
+#include <mutex>
+#include <ostream>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/replica_management.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/cert.h"
+#include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/security/token_verifier.h"
+#include "kudu/server/rpc_server.h"
 #include "kudu/server/webserver.h"
 #include "kudu/tserver/tablet_server.h"
 #include "kudu/tserver/tablet_server_options.h"
 #include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/util/condition_variable.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/mutex.h"
 #include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
+#include "kudu/util/trace.h"
 #include "kudu/util/version_info.h"
 
 DEFINE_int32(heartbeat_rpc_timeout_ms, 15000,
@@ -59,13 +80,30 @@ DEFINE_int32(heartbeat_max_failures_before_backoff, 3,
              "rather than retrying.");
 TAG_FLAG(heartbeat_max_failures_before_backoff, advanced);
 
+DEFINE_int32(heartbeat_inject_latency_before_heartbeat_ms, 0,
+             "How much latency (in ms) to inject when a tablet copy session is initialized. "
+             "(For testing only!)");
+TAG_FLAG(heartbeat_inject_latency_before_heartbeat_ms, runtime);
+TAG_FLAG(heartbeat_inject_latency_before_heartbeat_ms, unsafe);
+
+DECLARE_bool(raft_prepare_replacement_before_eviction);
+
+using kudu::master::MasterErrorPB;
 using kudu::master::MasterServiceProxy;
 using kudu::master::TabletReportPB;
+using kudu::pb_util::SecureDebugString;
 using kudu::rpc::RpcController;
 using std::shared_ptr;
+using std::string;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
+
+namespace rpc {
+class Messenger;
+}
+
 namespace tserver {
 
 namespace {
@@ -81,7 +119,7 @@ Status MasterServiceProxyForHostPort(const HostPort& hostport,
                  << "resolves to " << addrs.size() << " different addresses. Using "
                  << addrs[0].ToString();
   }
-  proxy->reset(new MasterServiceProxy(messenger, addrs[0]));
+  proxy->reset(new MasterServiceProxy(messenger, addrs[0], hostport.host()));
   return Status::OK();
 }
 
@@ -93,7 +131,7 @@ Status MasterServiceProxyForHostPort(const HostPort& hostport,
 // This is basically the "PIMPL" pattern.
 class Heartbeater::Thread {
  public:
-  Thread(const HostPort& master_address, TabletServer* server);
+  Thread(HostPort master_address, TabletServer* server);
 
   Status Start();
   Status Stop();
@@ -112,7 +150,7 @@ class Heartbeater::Thread {
   Status ConnectToMaster();
   int GetMinimumHeartbeatMillis() const;
   int GetMillisUntilNextHeartbeat() const;
-  Status DoHeartbeat();
+  Status DoHeartbeat(MasterErrorPB* error = nullptr);
   Status SetupRegistration(ServerRegistrationPB* reg);
   void SetupCommonField(master::TSToMasterCommonPB* common);
   bool IsCurrentThread() const;
@@ -131,7 +169,7 @@ class Heartbeater::Thread {
   scoped_refptr<kudu::Thread> thread_;
 
   // Current RPC proxy to the leader master.
-  gscoped_ptr<master::MasterServiceProxy> proxy_;
+  gscoped_ptr<MasterServiceProxy> proxy_;
 
   // The most recent response from a heartbeat.
   master::TSHeartbeatResponsePB last_hb_response_;
@@ -266,8 +304,8 @@ void Heartbeater::MarkTabletReportsAcknowledgedForTests(
 // Heartbeater::Thread
 ////////////////////////////////////////////////////////////
 
-Heartbeater::Thread::Thread(const HostPort& master_address, TabletServer* server)
-  : master_address_(master_address),
+Heartbeater::Thread::Thread(HostPort master_address, TabletServer* server)
+  : master_address_(std::move(master_address)),
     server_(server),
     consecutive_failed_heartbeats_(0),
     next_report_seq_(0),
@@ -301,19 +339,19 @@ Status Heartbeater::Thread::SetupRegistration(ServerRegistrationPB* reg) {
   reg->Clear();
 
   vector<Sockaddr> addrs;
-  RETURN_NOT_OK(CHECK_NOTNULL(server_->rpc_server())->GetBoundAddresses(&addrs));
+  RETURN_NOT_OK(CHECK_NOTNULL(server_->rpc_server())->GetAdvertisedAddresses(&addrs));
   RETURN_NOT_OK_PREPEND(AddHostPortPBs(addrs, reg->mutable_rpc_addresses()),
                         "Failed to add RPC addresses to registration");
 
   addrs.clear();
   if (server_->web_server()) {
-    RETURN_NOT_OK_PREPEND(server_->web_server()->GetBoundAddresses(&addrs),
+    RETURN_NOT_OK_PREPEND(server_->web_server()->GetAdvertisedAddresses(&addrs),
                           "Unable to get bound HTTP addresses");
     RETURN_NOT_OK_PREPEND(AddHostPortPBs(addrs, reg->mutable_http_addresses()),
                           "Failed to add HTTP addresses to registration");
     reg->set_https_enabled(server_->web_server()->IsSecure());
   }
-  reg->set_software_version(VersionInfo::GetShortVersionString());
+  reg->set_software_version(VersionInfo::GetVersionInfo());
 
   return Status::OK();
 }
@@ -341,12 +379,19 @@ int Heartbeater::Thread::GetMillisUntilNextHeartbeat() const {
   return FLAGS_heartbeat_interval_ms;
 }
 
-Status Heartbeater::Thread::DoHeartbeat() {
+Status Heartbeater::Thread::DoHeartbeat(MasterErrorPB* error) {
   if (PREDICT_FALSE(server_->fail_heartbeats_for_tests())) {
     return Status::IOError("failing all heartbeats for tests");
   }
 
   CHECK(IsCurrentThread());
+
+  // Inject latency for testing purposes.
+  if (PREDICT_FALSE(FLAGS_heartbeat_inject_latency_before_heartbeat_ms > 0)) {
+    TRACE("Injecting $0ms of latency due to --heartbeat_inject_latency_before_heartbeat_ms",
+          FLAGS_heartbeat_inject_latency_before_heartbeat_ms);
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_heartbeat_inject_latency_before_heartbeat_ms));
+  }
 
   if (!proxy_) {
     VLOG(1) << "No valid master proxy. Connecting...";
@@ -361,12 +406,18 @@ Status Heartbeater::Thread::DoHeartbeat() {
     LOG(INFO) << "Registering TS with master...";
     RETURN_NOT_OK_PREPEND(SetupRegistration(req.mutable_registration()),
                           "Unable to set up registration");
+    // If registering, let the catalog manager know what replica replacement
+    // scheme the tablet server is running with.
+    auto* info = req.mutable_replica_management_info();
+    info->set_replacement_scheme(FLAGS_raft_prepare_replacement_before_eviction
+        ? consensus::ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION
+        : consensus::ReplicaManagementInfoPB::EVICT_FIRST);
   }
 
   // Check with the TS cert manager if it has a cert that needs signing.
-  // if so, send the CSR in the heartbeat for the master to sign.
+  // If so, send the CSR in the heartbeat for the master to sign.
   boost::optional<security::CertSignRequest> csr =
-    server_->mutable_tls_context()->GetCsrIfNecessary();
+      server_->mutable_tls_context()->GetCsrIfNecessary();
   if (csr != boost::none) {
     RETURN_NOT_OK(csr->ToString(req.mutable_csr_der(), security::DataFormat::DER));
     VLOG(1) << "Sending a CSR to the master in the next heartbeat";
@@ -404,7 +455,10 @@ Status Heartbeater::Thread::DoHeartbeat() {
   RETURN_NOT_OK_PREPEND(proxy_->TSHeartbeat(req, &resp, &rpc),
                         "Failed to send heartbeat to master");
   if (resp.has_error()) {
-    return StatusFromPB(resp.error().status());
+    if (error) {
+      error->Swap(resp.mutable_error());
+    }
+    return StatusFromPB(error ? error->status() : resp.error().status());
   }
 
   VLOG(2) << Substitute("Received heartbeat response from $0:\n$1",
@@ -493,16 +547,21 @@ void Heartbeater::Thread::RunThread() {
       }
     }
 
-    Status s = DoHeartbeat();
+    MasterErrorPB error;
+    const auto& s = DoHeartbeat(&error);
     if (!s.ok()) {
+      const auto& err_msg = s.ToString();
       LOG(WARNING) << Substitute("Failed to heartbeat to $0: $1",
-                                 master_address_.ToString(), s.ToString());
+                                 master_address_.ToString(), err_msg);
       consecutive_failed_heartbeats_++;
       // If we encountered a network error (e.g., connection
       // refused), try reconnecting.
       if (s.IsNetworkError() ||
           consecutive_failed_heartbeats_ >= FLAGS_heartbeat_max_failures_before_backoff) {
         proxy_.reset();
+      }
+      if (error.has_code() && error.code() == MasterErrorPB::INCOMPATIBILITY) {
+        LOG(FATAL) << "master detected incompatibility: " << err_msg;
       }
       continue;
     }
@@ -514,7 +573,7 @@ bool Heartbeater::Thread::IsCurrentThread() const {
   return thread_.get() == kudu::Thread::current_thread();
 }
 
-void Heartbeater::Thread::MarkTabletReportAcknowledged(const master::TabletReportPB& report) {
+void Heartbeater::Thread::MarkTabletReportAcknowledged(const TabletReportPB& report) {
   std::lock_guard<simple_spinlock> l(dirty_tablets_lock_);
 
   int32_t acked_seq = report.sequence_number();
@@ -586,7 +645,7 @@ void Heartbeater::Thread::MarkTabletDirty(const string& tablet_id, const string&
     state->change_seq = seqno;
   } else {
     TabletReportState state = { seqno };
-    InsertOrDie(&dirty_tablets_, tablet_id, std::move(state));
+    InsertOrDie(&dirty_tablets_, tablet_id, state);
   }
 }
 

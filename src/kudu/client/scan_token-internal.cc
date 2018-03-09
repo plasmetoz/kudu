@@ -17,22 +17,41 @@
 
 #include "kudu/client/scan_token-internal.h"
 
-#include <boost/optional.hpp>
-#include <vector>
-#include <string>
+#include <cstdint>
 #include <memory>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 
 #include "kudu/client/client-internal.h"
 #include "kudu/client/client.h"
 #include "kudu/client/meta_cache.h"
 #include "kudu/client/replica-internal.h"
 #include "kudu/client/scanner-internal.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/client/tablet-internal.h"
 #include "kudu/client/tablet_server-internal.h"
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/encoded_key.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/partition_pruner.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/pb_util.h"
+#include "kudu/util/async_util.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 
 using std::string;
@@ -144,6 +163,9 @@ Status KuduScanToken::Data::PBIntoScanner(KuduClient* client,
       case ReadMode::READ_AT_SNAPSHOT:
         RETURN_NOT_OK(scan_builder->SetReadMode(KuduScanner::READ_AT_SNAPSHOT));
         break;
+      case ReadMode::READ_YOUR_WRITES:
+        RETURN_NOT_OK(scan_builder->SetReadMode(KuduScanner::READ_YOUR_WRITES));
+        break;
       default:
         return Status::InvalidArgument("scan token has unrecognized read mode");
     }
@@ -159,8 +181,22 @@ Status KuduScanToken::Data::PBIntoScanner(KuduClient* client,
 
   RETURN_NOT_OK(scan_builder->SetCacheBlocks(message.cache_blocks()));
 
+  // Since the latest observed timestamp from the given client might be
+  // more recent than the one when the token is created, the performance
+  // of the scan could be affected if using READ_YOUR_WRITES mode.
+  //
+  // We choose to keep it this way because the code path is simpler.
+  // Beside, in practice it's very rarely the case that an active client
+  // is permanently being written to and read from (using scan tokens).
+  //
+  // However it is worth to note that this is a possible optimization, if
+  // we ever notice READ_YOUR_WRITES read stalling with scan tokens.
   if (message.has_propagated_timestamp()) {
     client->data_->UpdateLatestObservedTimestamp(message.propagated_timestamp());
+  }
+
+  if (message.has_batch_size_bytes()) {
+    RETURN_NOT_OK(scan_builder->SetBatchSizeBytes(message.batch_size_bytes()));
   }
 
   *scanner = scan_builder.release();
@@ -210,14 +246,21 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
     case KuduScanner::READ_LATEST:
       pb.set_read_mode(kudu::READ_LATEST);
       if (configuration_.has_snapshot_timestamp()) {
-        LOG(WARNING) << "Ignoring snapshot timestamp since not in "
-                        "READ_AT_TIMESTAMP mode.";
+        return Status::InvalidArgument("Snapshot timestamp should only be configured "
+                                       "for READ_AT_SNAPSHOT scan mode.");
       }
       break;
     case KuduScanner::READ_AT_SNAPSHOT:
       pb.set_read_mode(kudu::READ_AT_SNAPSHOT);
       if (configuration_.has_snapshot_timestamp()) {
         pb.set_snap_timestamp(configuration_.snapshot_timestamp());
+      }
+      break;
+    case KuduScanner::READ_YOUR_WRITES:
+      pb.set_read_mode(kudu::READ_YOUR_WRITES);
+      if (configuration_.has_snapshot_timestamp()) {
+        return Status::InvalidArgument("Snapshot timestamp should only be configured "
+                                       "for READ_AT_SNAPSHOT scan mode.");
       }
       break;
     default:
@@ -227,6 +270,10 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
   pb.set_cache_blocks(configuration_.spec().cache_blocks());
   pb.set_fault_tolerant(configuration_.is_fault_tolerant());
   pb.set_propagated_timestamp(client->GetLatestObservedTimestamp());
+
+  if (configuration_.has_batch_size_bytes()) {
+    pb.set_batch_size_bytes(configuration_.batch_size_bytes());
+  }
 
   MonoTime deadline = MonoTime::Now() + client->default_admin_operation_timeout();
 
@@ -240,7 +287,8 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
                                                         partition_key,
                                                         deadline,
                                                         &tablet,
-                                                        sync.AsStatusCallback());
+                                                        sync.AsStatusCallback(),
+                                                        internal::kFetchTabletsPerRangeLookup);
     Status s = sync.Wait();
     if (s.IsNotFound()) {
       // No more tablets in the table.
@@ -278,8 +326,9 @@ Status KuduScanTokenBuilder::Data::Build(vector<KuduScanToken*>* tokens) {
       client_ts->data_ = new KuduTabletServer::Data(r.ts->permanent_uuid(),
                                                     host_ports[0]);
       bool is_leader = r.role == consensus::RaftPeerPB::LEADER;
+      bool is_voter = is_leader || r.role == consensus::RaftPeerPB::FOLLOWER;
       unique_ptr<KuduReplica> client_replica(new KuduReplica);
-      client_replica->data_ = new KuduReplica::Data(is_leader,
+      client_replica->data_ = new KuduReplica::Data(is_leader, is_voter,
                                                     std::move(client_ts));
       client_replicas.push_back(client_replica.release());
     }

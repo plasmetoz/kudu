@@ -247,7 +247,6 @@ Then open `cov_html/coverage.html` in your web browser.
 
 === Running lint checks
 
-
 Kudu uses cpplint.py from Google to enforce coding style guidelines. You can run the
 lint checks via cmake using the `ilint` target:
 
@@ -259,6 +258,36 @@ $ make ilint
 This will scan any file which is dirty in your working tree, or changed since the last
 gerrit-integrated upstream change in your git log. If you really want to do a full
 scan of the source tree, you may use the `lint` target instead.
+
+=== Running clang-tidy checks
+
+Kudu also uses the clang-tidy tool from LLVM to enforce coding style
+guidelines. You can run the tidy checks via cmake using the `tidy` target:
+
+[source,bash]
+----
+$ make tidy
+----
+
+This will scan any changes in the latest commit in the local tree. At the time
+of writing, it will not scan any changes that are not locally committed.
+
+=== Running include-what-you-use (IWYU) checks
+
+Kudu uses the https://github.com/include-what-you-use/include-what-you-use[IWYU]
+tool to keep the set of headers in the C++ source files consistent. For more
+information on what _consistent_ means, see
+https://github.com/include-what-you-use/include-what-you-use/blob/master/docs/WhyIWYU.md[_Why IWYU_].
+
+You can run the IWYU checks via cmake using the `iwyu` target:
+
+[source,bash]
+----
+$ make iwyu
+----
+
+This will scan any file which is dirty in your working tree, or changed since the last
+gerrit-integrated upstream change in your git log.
 
 === Building Kudu documentation
 
@@ -278,7 +307,7 @@ emitted to _build/docs_. This script requires `ruby` and `gem` to be installed
 on the system path, and will attempt to install `asciidoctor` and other related
 dependencies into `$HOME/.gems` using http://bundler.io/[bundler].
 
-=== Updating the documentation on the Kudu web site
+=== Updating the Kudu web site documentation
 
 To update the documentation that is integrated into the Kudu web site,
 including Javadoc documentation, you may run the following command:
@@ -298,6 +327,31 @@ Everything can be found in the _build/site_ subdirectory.
 You can proceed to commit the changes in the pages repository and send a code
 review for your changes. In the future, this step may be automated whenever
 changes are checked into the main Kudu repository.
+
+After making changes to the `gh-branch` branch, follow the instructions below
+when you want to deploy those changes to the live web site.
+
+=== Deploying changes to the Apache Kudu web site
+
+When the documentation is updated on the `gh-pages` branch, or when other web
+site files on that branch are updated, the following procedure can be used to
+deploy the changes to the official Apache Kudu web site. Committers have
+permissions to publish changes to the live site.
+
+[source,bash]
+----
+git checkout gh-pages
+git fetch origin
+git merge --ff-only origin/gh-pages
+./site_tool proof        # Check for broken links (takes a long time to run)
+./site_tool publish      # Generate the static HTML for the site.
+cd _publish && git push  # Update the live web site.
+----
+
+NOTE: sometimes, due to glitches with the ASF gitpubsub system, a large commit,
+such as a change to the docs, will not get mirrored to the live site. Adding an
+empty commit and doing another git push tends to fix the problem. See the git
+log for examples of people doing this in the past.
 
 == Improving build times
 
@@ -394,7 +448,7 @@ on writing code, though it may affect your ability to build from within Eclipse.
 1. https://cmake.org/pipermail/cmake-developers/2011-November/014153.html
 2. http://public.kitware.com/Bug/view.php?id=15102
 
-= Export Control Notice
+== Export Control Notice
 
 This distribution uses cryptographic software and may be subject to export controls.
 Please refer to docs/export_control.adoc for more information.

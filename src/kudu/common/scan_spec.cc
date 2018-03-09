@@ -18,19 +18,32 @@
 #include "kudu/common/scan_spec.h"
 
 #include <algorithm>
+#include <cstdint>
+#include <iterator>
+#include <ostream>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
+
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/encoded_key.h"
 #include "kudu/common/key_util.h"
 #include "kudu/common/row.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/util/auto_release_pool.h"
+#include "kudu/util/memory/arena.h"
 
 using std::any_of;
 using std::max;
 using std::move;
+using std::pair;
 using std::string;
 using std::vector;
 
@@ -81,16 +94,16 @@ void ScanSpec::SetExclusiveUpperBoundKey(const EncodedKey* key) {
   }
 }
 
-void ScanSpec::SetLowerBoundPartitionKey(const Slice& partitionKey) {
-  if (partitionKey.compare(lower_bound_partition_key_) > 0) {
-    lower_bound_partition_key_ = partitionKey.ToString();
+void ScanSpec::SetLowerBoundPartitionKey(const Slice& partition_key) {
+  if (partition_key.compare(lower_bound_partition_key_) > 0) {
+    lower_bound_partition_key_ = partition_key.ToString();
   }
 }
 
-void ScanSpec::SetExclusiveUpperBoundPartitionKey(const Slice& partitionKey) {
+void ScanSpec::SetExclusiveUpperBoundPartitionKey(const Slice& partition_key) {
   if (exclusive_upper_bound_partition_key_.empty() ||
-      (!partitionKey.empty() && partitionKey.compare(exclusive_upper_bound_partition_key_) < 0)) {
-    exclusive_upper_bound_partition_key_ = partitionKey.ToString();
+      (!partition_key.empty() && partition_key.compare(exclusive_upper_bound_partition_key_) < 0)) {
+    exclusive_upper_bound_partition_key_ = partition_key.ToString();
   }
 }
 

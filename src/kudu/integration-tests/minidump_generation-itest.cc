@@ -15,24 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <csignal>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <gflags/gflags.h>
+#include <gtest/gtest.h>
 
-#include "kudu/integration-tests/external_mini_cluster-itest-base.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/util/env.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/subprocess.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-
-DECLARE_string(minidump_path);
 
 using std::string;
 using std::vector;
 using strings::Substitute;
 
 namespace kudu {
+
+using cluster::ExternalMaster;
+using cluster::ExternalTabletServer;
 
 // Test the creation of minidumps upon process crash.
 class MinidumpGenerationITest : public ExternalMiniClusterITestBase {
@@ -41,7 +47,7 @@ class MinidumpGenerationITest : public ExternalMiniClusterITestBase {
 };
 
 void MinidumpGenerationITest::WaitForMinidumps(int expected, const string& dir) {
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     vector<string> matches;
     ASSERT_OK(env_->Glob(JoinPathSegments(dir, "*.dmp"), &matches));
     ASSERT_EQ(expected, matches.size());

@@ -15,38 +15,63 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
-
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <string>
 #include <vector>
 
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/client/client.h"
-#include "kudu/common/schema.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/replica_management.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/mini_cluster.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/mini_master.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
+DECLARE_bool(raft_prepare_replacement_before_eviction);
+
+using kudu::client::KuduClient;
+using kudu::client::KuduClientBuilder;
+using kudu::client::KuduColumnSchema;
+using kudu::client::KuduSchema;
+using kudu::client::KuduSchemaBuilder;
+using kudu::client::KuduTableCreator;
+using kudu::client::sp::shared_ptr;
+using kudu::consensus::ReplicaManagementInfoPB;
+using kudu::cluster::InternalMiniCluster;
+using kudu::cluster::InternalMiniClusterOptions;
+using std::string;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 namespace master {
 
-using client::KuduClient;
-using client::KuduClientBuilder;
-using client::KuduColumnSchema;
-using client::KuduScanner;
-using client::KuduSchema;
-using client::KuduSchemaBuilder;
-using client::KuduTable;
-using client::KuduTableCreator;
-using client::sp::shared_ptr;
+class TSDescriptor;
 
 const char * const kTableId1 = "testMasterReplication-1";
 const char * const kTableId2 = "testMasterReplication-2";
@@ -67,7 +92,7 @@ class MasterReplicationTest : public KuduTest {
 
   virtual void SetUp() OVERRIDE {
     KuduTest::SetUp();
-    cluster_.reset(new MiniCluster(env_, opts_));
+    cluster_.reset(new InternalMiniCluster(env_, opts_));
     ASSERT_OK(cluster_->Start());
   }
 
@@ -119,8 +144,8 @@ class MasterReplicationTest : public KuduTest {
 
  protected:
   int num_masters_;
-  MiniClusterOptions opts_;
-  gscoped_ptr<MiniCluster> cluster_;
+  InternalMiniClusterOptions opts_;
+  gscoped_ptr<InternalMiniCluster> cluster_;
 };
 
 // Basic test. Verify that:
@@ -231,6 +256,13 @@ TEST_F(MasterReplicationTest, TestHeartbeatAcceptedByAnyMaster) {
   std::shared_ptr<rpc::Messenger> messenger;
   rpc::MessengerBuilder bld("Client");
   ASSERT_OK(bld.Build(&messenger));
+
+  // Information on replica management scheme.
+  ReplicaManagementInfoPB rmi;
+  rmi.set_replacement_scheme(FLAGS_raft_prepare_replacement_before_eviction
+      ? ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION
+      : ReplicaManagementInfoPB::EVICT_FIRST);
+
   for (int i = 0; i < cluster_->num_masters(); i++) {
     TSHeartbeatRequestPB req;
     TSHeartbeatResponsePB resp;
@@ -238,13 +270,14 @@ TEST_F(MasterReplicationTest, TestHeartbeatAcceptedByAnyMaster) {
 
     req.mutable_common()->CopyFrom(common);
     req.mutable_registration()->CopyFrom(fake_reg);
+    req.mutable_replica_management_info()->CopyFrom(rmi);
 
-    MasterServiceProxy proxy(messenger,
-                             cluster_->mini_master(i)->bound_rpc_addr());
+    const auto& addr = cluster_->mini_master(i)->bound_rpc_addr();
+    MasterServiceProxy proxy(messenger, addr, addr.host());
 
     // All masters (including followers) should accept the heartbeat.
     ASSERT_OK(proxy.TSHeartbeat(req, &resp, &rpc));
-    SCOPED_TRACE(SecureDebugString(resp));
+    SCOPED_TRACE(pb_util::SecureDebugString(resp));
     ASSERT_FALSE(resp.has_error());
   }
 
@@ -252,21 +285,66 @@ TEST_F(MasterReplicationTest, TestHeartbeatAcceptedByAnyMaster) {
   vector<std::shared_ptr<TSDescriptor>> descs;
   ASSERT_OK(cluster_->WaitForTabletServerCount(
       kNumTabletServerReplicas + 1,
-      MiniCluster::MatchMode::DO_NOT_MATCH_TSERVERS, &descs));
+      InternalMiniCluster::MatchMode::DO_NOT_MATCH_TSERVERS, &descs));
 }
 
 TEST_F(MasterReplicationTest, TestMasterPeerSetsDontMatch) {
   // Restart one master with an additional entry in --master_addresses. The
   // discrepancy with the on-disk list of masters should trigger a failure.
   cluster_->mini_master(0)->Shutdown();
-  vector<uint16_t> master_rpc_ports = opts_.master_rpc_ports;
-  master_rpc_ports.push_back(55555);
-  ASSERT_OK(cluster_->mini_master(0)->StartDistributedMaster(master_rpc_ports));
+  vector<HostPort> master_rpc_addrs = cluster_->master_rpc_addrs();
+  master_rpc_addrs.emplace_back("127.0.0.1", 55555);
+  cluster_->mini_master(0)->SetMasterAddresses(master_rpc_addrs);
+  ASSERT_OK(cluster_->mini_master(0)->Start());
   Status s = cluster_->mini_master(0)->WaitForCatalogManagerInit();
   SCOPED_TRACE(s.ToString());
   ASSERT_TRUE(s.IsInvalidArgument());
-  ASSERT_STR_CONTAINS(s.ToString(), "55555")
+  ASSERT_STR_CONTAINS(s.ToString(), "55555");
 }
+
+TEST_F(MasterReplicationTest, TestConnectToClusterReturnsAddresses) {
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    SCOPED_TRACE(Substitute("Connecting to master $0", i));
+    auto proxy = cluster_->master_proxy(i);
+    rpc::RpcController rpc;
+    ConnectToMasterRequestPB req;
+    ConnectToMasterResponsePB resp;
+    ASSERT_OK(proxy->ConnectToMaster(req, &resp, &rpc));
+    ASSERT_EQ(cluster_->num_masters(), resp.master_addrs_size());
+    for (int j = 0; j < cluster_->num_masters(); j++) {
+      const auto& addr = resp.master_addrs(j);
+      ASSERT_EQ(cluster_->mini_master(j)->bound_rpc_addr().ToString(),
+                Substitute("$0:$1", addr.host(), addr.port()));
+    }
+  }
+}
+
+
+// Test for KUDU-2200: if a user specifies just one of the masters, and that master is a
+// follower, we should give a status message that explains their mistake.
+TEST_F(MasterReplicationTest, TestConnectToFollowerMasterOnly) {
+  int successes = 0;
+  for (int i = 0; i < cluster_->num_masters(); i++) {
+    SCOPED_TRACE(Substitute("Connecting to master $0", i));
+
+    shared_ptr<KuduClient> client;
+    KuduClientBuilder builder;
+    builder.add_master_server_addr(cluster_->mini_master(i)->bound_rpc_addr_str());
+    Status s = builder.Build(&client);
+    if (s.ok()) {
+      successes++;
+    } else {
+      ASSERT_STR_MATCHES(s.ToString(),
+                         R"(Configuration error: .*Client configured with 1 master\(s\) \(.+\) )"
+                         R"(but cluster indicates it expects 3.*)");
+    }
+  }
+  // It's possible that we get either 0 or 1 success in the above loop:
+  // - 0, in the case that no master had elected itself yet
+  // - 1, in the case that one master had become leader by the time we connected.
+  EXPECT_LE(successes, 1);
+}
+
 
 } // namespace master
 } // namespace kudu

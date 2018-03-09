@@ -18,50 +18,60 @@
 #ifndef KUDU_CFILE_CFILE_READER_H
 #define KUDU_CFILE_CFILE_READER_H
 
+#include <cstddef>
+#include <cstdint>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/common/columnblock.h"
-#include "kudu/common/types.h"
-#include "kudu/cfile/block_cache.h"
+#include <glog/logging.h>
+
 #include "kudu/cfile/block_encodings.h"
 #include "kudu/cfile/block_handle.h"
-#include "kudu/cfile/block_compression.h"
-#include "kudu/cfile/cfile_util.h"
-#include "kudu/cfile/index_btree.h"
-#include "kudu/cfile/type_encodings.h"
+#include "kudu/cfile/block_pointer.h"
+#include "kudu/cfile/cfile.pb.h"
+#include "kudu/common/iterator_stats.h"
+#include "kudu/common/rowid.h"
 #include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/port.h"
+#include "kudu/util/compression/compression.pb.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/object_pool.h"
 #include "kudu/util/once.h"
 #include "kudu/util/rle-encoding.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
-#include "kudu/common/iterator_stats.h"
-#include "kudu/common/key_encoder.h"
 
 namespace kudu {
+
+class ColumnMaterializationContext;
+class CompressionCodec;
+class EncodedKey;
+class SelectionVector;
+class TypeInfo;
+
+template <typename T> class ArrayView;
+
 namespace cfile {
 
-class BlockCache;
-class BlockDecoder;
-class BlockPointer;
-class CFileHeaderPB;
-class CFileFooterPB;
-class CFileIterator;
 class BinaryPlainBlockDecoder;
+class CFileIterator;
+class IndexTreeIterator;
+class TypeEncodingInfo;
+struct ReaderOptions;
 
 class CFileReader {
  public:
   // Fully open a cfile using a previously opened block.
   //
   // After this call, the reader is safe for use.
-  static Status Open(gscoped_ptr<fs::ReadableBlock> block,
+  static Status Open(std::unique_ptr<fs::ReadableBlock> block,
                      ReaderOptions options,
-                     gscoped_ptr<CFileReader>* reader);
+                     std::unique_ptr<CFileReader>* reader);
 
   // Lazily open a cfile using a previously opened block. A lazy open does
   // not incur additional I/O, nor does it validate the contents of the
@@ -69,9 +79,9 @@ class CFileReader {
   //
   // Init() must be called before most methods; the exceptions are documented
   // below.
-  static Status OpenNoInit(gscoped_ptr<fs::ReadableBlock> block,
+  static Status OpenNoInit(std::unique_ptr<fs::ReadableBlock> block,
                            ReaderOptions options,
-                           gscoped_ptr<CFileReader>* reader);
+                           std::unique_ptr<CFileReader>* reader);
 
   // Fully opens a previously lazily opened cfile, parsing and validating
   // its contents.
@@ -109,7 +119,7 @@ class CFileReader {
   //
   // Note that this implementation is currently O(n), so should not be used
   // in a hot path.
-  bool GetMetadataEntry(const string &key, string *val);
+  bool GetMetadataEntry(const std::string &key, std::string *val) const;
 
   // Can be called before Init().
   uint64_t file_size() const {
@@ -122,12 +132,12 @@ class CFileReader {
   }
 
   const TypeInfo *type_info() const {
-    DCHECK(init_once_.initted());
+    DCHECK(init_once_.init_succeeded());
     return type_info_;
   }
 
   const TypeEncodingInfo *type_encoding_info() const {
-    DCHECK(init_once_.initted());
+    DCHECK(init_once_.init_succeeded());
     return type_encoding_info_;
   }
 
@@ -136,12 +146,12 @@ class CFileReader {
   }
 
   const CFileHeaderPB &header() const {
-    DCHECK(init_once_.initted());
+    DCHECK(init_once_.init_succeeded());
     return *DCHECK_NOTNULL(header_.get());
   }
 
   const CFileFooterPB &footer() const {
-    DCHECK(init_once_.initted());
+    DCHECK(init_once_.init_succeeded());
     return *DCHECK_NOTNULL(footer_.get());
   }
 
@@ -167,6 +177,9 @@ class CFileReader {
     return BlockPointer(footer().validx_info().root_block());
   }
 
+  // Returns true if the file has checksums on the header, footer, and data blocks.
+  bool has_checksums() const;
+
   // Can be called before Init().
   std::string ToString() const { return block_->id().ToString(); }
 
@@ -175,14 +188,14 @@ class CFileReader {
 
   CFileReader(ReaderOptions options,
               uint64_t file_size,
-              gscoped_ptr<fs::ReadableBlock> block);
+              std::unique_ptr<fs::ReadableBlock> block);
 
   // Callback used in 'init_once_' to initialize this cfile.
   Status InitOnce();
 
-  Status ReadMagicAndLength(uint64_t offset, uint32_t *len);
   Status ReadAndParseHeader();
   Status ReadAndParseFooter();
+  Status VerifyChecksum(ArrayView<const Slice> data, const Slice& checksum) const;
 
   // Returns the memory usage of the object including the object itself.
   size_t memory_footprint() const;
@@ -190,7 +203,7 @@ class CFileReader {
 #ifdef __clang__
   __attribute__((__unused__))
 #endif
-  const gscoped_ptr<fs::ReadableBlock> block_;
+  const std::unique_ptr<fs::ReadableBlock> block_;
   const uint64_t file_size_;
 
   uint8_t cfile_version_;
@@ -424,7 +437,7 @@ class CFileIterator : public ColumnIterator {
       return first_row_idx() + num_rows_in_block_ - 1;
     }
 
-    string ToString() const;
+    std::string ToString() const;
   };
 
   // Seek the given PreparedBlock to the given index within it.
@@ -464,7 +477,7 @@ class CFileIterator : public ColumnIterator {
   // Data blocks that contain data relevant to the currently Prepared
   // batch of rows.
   // These pointers are allocated from the prepared_block_pool_ below.
-  vector<PreparedBlock *> prepared_blocks_;
+  std::vector<PreparedBlock *> prepared_blocks_;
 
   ObjectPool<PreparedBlock> prepared_block_pool_;
   typedef ObjectPool<PreparedBlock>::scoped_ptr pblock_pool_scoped_ptr;

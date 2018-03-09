@@ -16,20 +16,31 @@
 // under the License.
 
 #include <algorithm>
-#include <cmath>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client.h"
-#include "kudu/gutil/stringprintf.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/scan_batch.h"
+#include "kudu/client/scan_predicate.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/value.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/escaping.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/cluster_verifier.h"
-#include "kudu/integration-tests/mini_cluster.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
+#include "kudu/util/decimal_util.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using std::count_if;
@@ -41,6 +52,8 @@ using std::vector;
 namespace kudu {
 namespace client {
 
+using cluster::InternalMiniCluster;
+using cluster::InternalMiniClusterOptions;
 using sp::shared_ptr;
 
 class PredicateTest : public KuduTest {
@@ -49,7 +62,7 @@ class PredicateTest : public KuduTest {
 
   void SetUp() override {
     // Set up the mini cluster
-    cluster_.reset(new MiniCluster(env_, MiniClusterOptions()));
+    cluster_.reset(new InternalMiniCluster(env_, InternalMiniClusterOptions()));
     ASSERT_OK(cluster_->Start());
     ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
   }
@@ -154,7 +167,7 @@ class PredicateTest : public KuduTest {
       numeric_limits<T>::min(),
       numeric_limits<T>::min() + 1,
       -51,
-      50,
+      -50,
       0,
       49,
       50,
@@ -217,10 +230,41 @@ class PredicateTest : public KuduTest {
     };
   }
 
+  // Returns a vector of decimal(4, 2) numbers from -50.50 (inclusive) to 50.50
+  // (exclusive) (100 values) and boundary values.
+  vector<int128_t> CreateDecimalValues() {
+    vector<int128_t> values;
+    for (int i = -50; i < 50; i++) {
+      values.push_back(i * 100 + i);
+    }
+
+    values.push_back(-9999);
+    values.push_back(-9998);
+    values.push_back(9998);
+    values.push_back(9999);
+
+    return values;
+  }
+
+  /// Returns a vector of decimal numbers for creating test predicates.
+  vector<int128_t> CreateDecimalTestValues() {
+    return {
+        -9999,
+        -9998,
+        -5100,
+        -5000,
+        0,
+        4900,
+        5000,
+        9998,
+        9999,
+    };
+  }
+
   // Returns a vector of string values.
   vector<string> CreateStringValues() {
     return {
-      string("", 0),
+      string(),
       string("\0", 1),
       string("\0\0", 2),
       string("a", 1),
@@ -350,9 +394,9 @@ class PredicateTest : public KuduTest {
 
     // Add some additional values to check against.
     vector<string> test_values = values;
-    test_values.push_back("aa");
-    test_values.push_back(string("\1", 1));
-    test_values.push_back(string("a\1", 1));
+    test_values.emplace_back("aa");
+    test_values.emplace_back("\1", 1);
+    test_values.emplace_back("a\1", 1);
 
     for (const string& v : test_values) {
       SCOPED_TRACE(strings::Substitute("test value: '$0'", strings::CHexEscape(v)));
@@ -459,7 +503,7 @@ class PredicateTest : public KuduTest {
   }
 
   shared_ptr<KuduClient> client_;
-  gscoped_ptr<MiniCluster> cluster_;
+  gscoped_ptr<InternalMiniCluster> cluster_;
 };
 
 TEST_F(PredicateTest, TestBoolPredicates) {
@@ -921,6 +965,148 @@ TEST_F(PredicateTest, TestDoublePredicates) {
     }
 
     int count = CountMatchedRows<double>(values, vector<double>(test_values.begin(), end));
+    ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
+  }
+
+  // IS NOT NULL predicate
+  ASSERT_EQ(values.size(),
+            CountRows(table, { table->NewIsNotNullPredicate("value") }));
+
+  // IS NULL predicate
+  ASSERT_EQ(1, CountRows(table, { table->NewIsNullPredicate("value") }));
+}
+
+TEST_F(PredicateTest, TestDecimalPredicates) {
+  KuduSchema schema;
+  {
+    KuduSchemaBuilder builder;
+    builder.AddColumn("key")->NotNull()->Type(KuduColumnSchema::INT64)->PrimaryKey();
+    builder.AddColumn("value")->Type(KuduColumnSchema::DECIMAL)
+        ->Precision(kMaxDecimal128Precision)->Scale(2);
+    CHECK_OK(builder.Build(&schema));
+  }
+  unique_ptr<client::KuduTableCreator> table_creator(client_->NewTableCreator());
+  CHECK_OK(table_creator->table_name("table")
+               .schema(&schema)
+               .set_range_partition_columns({ "key" })
+               .num_replicas(1)
+               .Create());
+
+  shared_ptr<KuduTable> table;
+  CHECK_OK(client_->OpenTable("table", &table));
+
+  shared_ptr<KuduSession> session = CreateSession();
+
+  vector<int128_t> values = CreateDecimalValues();
+  vector<int128_t> test_values = CreateDecimalTestValues();
+
+  int i = 0;
+  for (int128_t value : values) {
+    unique_ptr<KuduInsert> insert(table->NewInsert());
+    ASSERT_OK(insert->mutable_row()->SetInt64("key", i++));
+    ASSERT_OK(insert->mutable_row()->SetUnscaledDecimal("value", value));
+    ASSERT_OK(session->Apply(insert.release()));
+  }
+  unique_ptr<KuduInsert> null_insert(table->NewInsert());
+  ASSERT_OK(null_insert->mutable_row()->SetInt64("key", i++));
+  ASSERT_OK(null_insert->mutable_row()->SetNull("value"));
+  ASSERT_OK(session->Apply(null_insert.release()));
+  ASSERT_OK(session->Flush());
+
+  ASSERT_EQ(values.size() + 1, CountRows(table, {}));
+
+  for (int128_t v : test_values) {
+    SCOPED_TRACE(strings::Substitute("test value: $0", v));
+
+    { // value = v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value == v; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value", KuduPredicate::EQUAL,
+                                        KuduValue::FromDecimal(v, 2)),
+      }));
+    }
+
+    { // value >= v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value >= v; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::GREATER_EQUAL,
+                                        KuduValue::FromDecimal(v, 2)),
+      }));
+    }
+
+    { // value <= v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value <= v; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::LESS_EQUAL,
+                                        KuduValue::FromDecimal(v, 2)),
+      }));
+    }
+
+    { // value > v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value > v; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::GREATER,
+                                        KuduValue::FromDecimal(v, 2)),
+      }));
+    }
+
+    { // value < v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value < v; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::LESS,
+                                        KuduValue::FromDecimal(v, 2)),
+      }));
+    }
+
+    { // value >= 0
+      // value <= v
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value >= 0 && value <= v; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::GREATER_EQUAL,
+                                        KuduValue::FromDecimal(0, 2)),
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::LESS_EQUAL,
+                                        KuduValue::FromDecimal(v, 2)),
+      }));
+    }
+
+    { // value >= v
+      // value <= 0.0
+      int count = count_if(values.begin(), values.end(),
+                           [&] (int128_t value) { return value >= v && value <= 0; });
+      ASSERT_EQ(count, CountRows(table, {
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::GREATER_EQUAL,
+                                        KuduValue::FromDecimal(v, 2)),
+          table->NewComparisonPredicate("value",
+                                        KuduPredicate::LESS_EQUAL,
+                                        KuduValue::FromDecimal(0, 2)),
+      }));
+    }
+  }
+
+  // IN list predicates
+  std::random_shuffle(test_values.begin(), test_values.end());
+
+  for (auto end = test_values.begin(); end <= test_values.end(); end++) {
+    vector<KuduValue*> vals;
+
+    for (auto itr = test_values.begin(); itr != end; itr++) {
+      vals.push_back(KuduValue::FromDecimal(*itr, 2));
+    }
+
+    int count = CountMatchedRows<int128_t>(values, vector<int128_t>(test_values.begin(), end));
     ASSERT_EQ(count, CountRows(table, { table->NewInListPredicate("value", &vals) }));
   }
 

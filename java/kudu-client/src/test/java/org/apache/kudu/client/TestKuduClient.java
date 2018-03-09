@@ -21,10 +21,17 @@ import static org.apache.kudu.client.KuduPredicate.ComparisonOp.GREATER_EQUAL;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS;
 import static org.apache.kudu.client.KuduPredicate.ComparisonOp.LESS_EQUAL;
 import static org.apache.kudu.client.RowResult.timestampToString;
-import static org.junit.Assert.*;
-import static org.junit.matchers.JUnitMatchers.containsString;
+import static org.hamcrest.CoreMatchers.containsString;
+import static org.junit.Assert.assertArrayEquals;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertThat;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.io.Closeable;
+import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
@@ -33,17 +40,19 @@ import java.util.concurrent.atomic.AtomicInteger;
 
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Iterators;
+import com.stumbleupon.async.Deferred;
+
 import org.junit.Before;
 import org.junit.Test;
-import org.mockito.Mockito;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.ColumnTypeAttributes.ColumnTypeAttributesBuilder;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
 import org.apache.kudu.util.CapturingLogAppender;
-import org.apache.log4j.AppenderSkeleton;
+import org.apache.kudu.util.DecimalUtil;
 
 public class TestKuduClient extends BaseKuduTest {
   private static final Logger LOG = LoggerFactory.getLogger(TestKuduClient.class);
@@ -80,8 +89,47 @@ public class TestKuduClient extends BaseKuduTest {
     return new Schema(columns);
   }
 
+  private Schema createSchemaWithDecimalColumns() {
+    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>();
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("key", Type.DECIMAL).key(true)
+        .typeAttributes(
+            new ColumnTypeAttributesBuilder()
+                .precision(org.apache.kudu.util.DecimalUtil.MAX_DECIMAL64_PRECISION).build()
+        ).build());
+    columns.add(new ColumnSchema.ColumnSchemaBuilder("c1", Type.DECIMAL).nullable(true)
+        .typeAttributes(
+            new ColumnTypeAttributesBuilder()
+                .precision(org.apache.kudu.util.DecimalUtil.MAX_DECIMAL128_PRECISION).build()
+        ).build());
+    return new Schema(columns);
+  }
+
   private static CreateTableOptions createTableOptions() {
     return new CreateTableOptions().setRangePartitionColumns(ImmutableList.of("key"));
+  }
+
+  /**
+   * Test setting and reading the most recent propagated timestamp.
+   */
+  @Test(timeout = 100000)
+  public void testLastPropagatedTimestamps() throws Exception {
+    long initial_ts = syncClient.getLastPropagatedTimestamp();
+
+    // Check that the initial timestamp is consistent with the asynchronous client.
+    assertEquals(initial_ts, client.getLastPropagatedTimestamp());
+    assertEquals(initial_ts, syncClient.getLastPropagatedTimestamp());
+
+    // Attempt to change the timestamp to a lower value. This should not change
+    // the internal timestamp, as it must be monotonically increasing.
+    syncClient.updateLastPropagatedTimestamp(initial_ts - 1);
+    assertEquals(initial_ts, client.getLastPropagatedTimestamp());
+    assertEquals(initial_ts, syncClient.getLastPropagatedTimestamp());
+
+    // Use the synchronous client to update the last propagated timestamp and
+    // check with both clients that the timestamp was updated.
+    syncClient.updateLastPropagatedTimestamp(initial_ts + 1);
+    assertEquals(initial_ts + 1, client.getLastPropagatedTimestamp());
+    assertEquals(initial_ts + 1, syncClient.getLastPropagatedTimestamp());
   }
 
   /**
@@ -396,6 +444,48 @@ public class TestKuduClient extends BaseKuduTest {
   }
 
   /**
+   * Test inserting and retrieving decimal columns.
+   */
+  @Test(timeout = 100000)
+  public void testDecimalColumns() throws Exception {
+    Schema schema = createSchemaWithDecimalColumns();
+    syncClient.createTable(tableName, schema, createTableOptions());
+
+    List<Long> timestamps = new ArrayList<>();
+
+    KuduSession session = syncClient.newSession();
+    KuduTable table = syncClient.openTable(tableName);
+
+    // Verify ColumnTypeAttributes
+    assertEquals(DecimalUtil.MAX_DECIMAL128_PRECISION,
+        table.getSchema().getColumn("c1").getTypeAttributes().getPrecision());
+
+    for (int i = 0; i < 9; i++) {
+      Insert insert = table.newInsert();
+      PartialRow row = insert.getRow();
+      row.addDecimal("key", BigDecimal.valueOf(i));
+      if (i % 2 == 1) {
+        row.addDecimal("c1", BigDecimal.valueOf(i));
+      }
+      session.apply(insert);
+    }
+    session.flush();
+
+    List<String> rowStrings = scanTableToStrings(table);
+    assertEquals(9, rowStrings.size());
+    for (int i = 0; i < rowStrings.size(); i++) {
+      StringBuilder expectedRow = new StringBuilder();
+      expectedRow.append(String.format("DECIMAL key(18, 0)=%s, DECIMAL c1(38, 0)=", String.valueOf(i)));
+      if (i % 2 == 1) {
+        expectedRow.append(String.valueOf(i));
+      } else {
+        expectedRow.append("NULL");
+      }
+      assertEquals(expectedRow.toString(), rowStrings.get(i));
+    }
+  }
+
+  /**
    * Test scanning with predicates.
    */
   @Test
@@ -563,9 +653,18 @@ public class TestKuduClient extends BaseKuduTest {
       session.flush();
 
       KuduScanToken.KuduScanTokenBuilder tokenBuilder = syncClient.newScanTokenBuilder(table);
+      tokenBuilder.batchSizeBytes(0);
       tokenBuilder.setProjectedColumnIndexes(ImmutableList.<Integer>of());
       List<KuduScanToken> tokens = tokenBuilder.build();
       assertEquals(16, tokens.size());
+
+      // KUDU-1809, with batchSizeBytes configured to '0',
+      // the first call to the tablet server won't return
+      // any data.
+      {
+        KuduScanner scanner = tokens.get(0).intoScanner(syncClient);
+        assertEquals(0, scanner.nextRows().getNumRows());
+      }
 
       for (KuduScanToken token : tokens) {
         // Sanity check to make sure the debug printing does not throw.
@@ -660,7 +759,6 @@ public class TestKuduClient extends BaseKuduTest {
 
     // Drop a column
     syncClient.alterTable(tableName, new AlterTableOptions().dropColumn("a"));
-    assertTrue(syncClient.isAlterTableDone(tableName));
     try {
       token.intoScanner(syncClient);
       fail();
@@ -673,7 +771,6 @@ public class TestKuduClient extends BaseKuduTest {
         tableName,
         new AlterTableOptions().addColumn(
             new ColumnSchema.ColumnSchemaBuilder("a", Type.STRING).nullable(true).build()));
-    assertTrue(syncClient.isAlterTableDone(tableName));
     try {
       token.intoScanner(syncClient);
       fail();
@@ -688,7 +785,6 @@ public class TestKuduClient extends BaseKuduTest {
         new AlterTableOptions().dropColumn("a")
                                .addColumn(new ColumnSchema.ColumnSchemaBuilder("a", Type.INT64)
                                                           .nullable(true).build()));
-    assertTrue(syncClient.isAlterTableDone(tableName));
     try {
       token.intoScanner(syncClient);
       fail();
@@ -704,7 +800,6 @@ public class TestKuduClient extends BaseKuduTest {
                                .addColumn(new ColumnSchema.ColumnSchemaBuilder("a", Type.INT64)
                                                           .nullable(false)
                                                           .defaultValue(0L).build()));
-    assertTrue(syncClient.isAlterTableDone(tableName));
     token.intoScanner(syncClient);
   }
 
@@ -745,9 +840,7 @@ public class TestKuduClient extends BaseKuduTest {
    */
   @Test(timeout = 100000)
   public void testScanNonCoveredTable() throws Exception {
-
-    Schema schema = basicSchema;
-    syncClient.createTable(tableName, schema, getBasicTableOptionsWithNonCoveredRange());
+    syncClient.createTable(tableName, basicSchema, getBasicTableOptionsWithNonCoveredRange());
 
     KuduSession session = syncClient.newSession();
     session.setFlushMode(SessionConfiguration.FlushMode.AUTO_FLUSH_BACKGROUND);
@@ -802,11 +895,11 @@ public class TestKuduClient extends BaseKuduTest {
         // Force the client to connect to the masters.
         localClient.exportAuthenticationCredentials();
       }
-      // Wait a little bit since the "channel disconnected" exceptions could come
-      // from threads that don't get synchronously joined by client.close().
-      Thread.sleep(500);
     }
-    assertFalse(cla.getAppendedText(), cla.getAppendedText().contains("Exception"));
+    // Ensure there is no log spew due to an unexpected lost connection.
+    String exception_text = cla.getAppendedText();
+    assertFalse("Unexpected exception:\n" + exception_text,
+               exception_text.contains("lost connection to peer"));
   }
 
   @Test(timeout = 100000)
@@ -853,5 +946,96 @@ public class TestKuduClient extends BaseKuduTest {
     syncClient.createTable(tableName, basicSchema, new CreateTableOptions());
   }
 
+  @Test(timeout = 100000)
+  public void testOpenTableClearsNonCoveringRangePartitions() throws KuduException {
+    CreateTableOptions options = createTableOptions();
+    PartialRow lower = basicSchema.newPartialRow();
+    PartialRow upper = basicSchema.newPartialRow();
+    lower.addInt("key", 0);
+    upper.addInt("key", 1);
+    options.addRangePartition(lower, upper);
 
+    syncClient.createTable(tableName, basicSchema, options);
+    KuduTable table = syncClient.openTable(tableName);
+
+    // Count the number of tablets.
+    KuduScanToken.KuduScanTokenBuilder tokenBuilder = syncClient.newScanTokenBuilder(table);
+    List<KuduScanToken> tokens = tokenBuilder.build();
+    assertEquals(1, tokens.size());
+
+    // Add a range partition with a separate client. The new client is necessary
+    // in order to avoid clearing the meta cache as part of the alter operation.
+    try (KuduClient alterClient = new KuduClient.KuduClientBuilder(masterAddresses)
+                                                .defaultAdminOperationTimeoutMs(DEFAULT_SLEEP)
+                                                .build()) {
+      AlterTableOptions alter = new AlterTableOptions();
+      lower = basicSchema.newPartialRow();
+      upper = basicSchema.newPartialRow();
+      lower.addInt("key", 1);
+      alter.addRangePartition(lower, upper);
+      alterClient.alterTable(tableName, alter);
+    }
+
+    // Count the number of tablets.  The result should still be the same, since
+    // the new tablet is still cached as a non-covered range.
+    tokenBuilder = syncClient.newScanTokenBuilder(table);
+    tokens = tokenBuilder.build();
+    assertEquals(1, tokens.size());
+
+    // Reopen the table and count the tablets again. The new tablet should now show up.
+    table = syncClient.openTable(tableName);
+    tokenBuilder = syncClient.newScanTokenBuilder(table);
+    tokens = tokenBuilder.build();
+    assertEquals(2, tokens.size());
+  }
+
+  @Test(timeout = 100000)
+  public void testCreateTableWithConcurrentInsert() throws Exception {
+    KuduTable table = syncClient.createTable(
+        tableName, createManyStringsSchema(), createTableOptions().setWait(false));
+
+    // Insert a row.
+    //
+    // It's very likely that the tablets are still being created, but the client
+    // should transparently retry the insert (and associated master lookup)
+    // until the operation succeeds.
+    Insert insert = table.newInsert();
+    insert.getRow().addString("key", "key_0");
+    insert.getRow().addString("c1", "c1_0");
+    insert.getRow().addString("c2", "c2_0");
+    KuduSession session = syncClient.newSession();
+    OperationResponse resp = session.apply(insert);
+    assertFalse(resp.hasRowError());
+
+    // This won't do anything useful (i.e. if the insert succeeds, we know the
+    // table has been created), but it's here for additional code coverage.
+    assertTrue(syncClient.isCreateTableDone(tableName));
+  }
+
+  @Test(timeout = 100000)
+  public void testCreateTableWithConcurrentAlter() throws Exception {
+    // Kick off an asynchronous table creation.
+    Deferred<KuduTable> d = client.createTable(tableName,
+        createManyStringsSchema(), createTableOptions());
+
+    // Rename the table that's being created to make sure it doesn't interfere
+    // with the "wait for all tablets to be created" behavior of createTable().
+    //
+    // We have to retry this in a loop because we might run before the table
+    // actually exists.
+    while (true) {
+      try {
+        syncClient.alterTable(tableName,
+            new AlterTableOptions().renameTable("foo"));
+        break;
+      } catch (KuduException e) {
+        if (!e.getStatus().isNotFound()) {
+          throw e;
+        }
+      }
+    }
+
+    // If createTable() was disrupted by the alterTable(), this will throw.
+    d.join();
+  }
 }

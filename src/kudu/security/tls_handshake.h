@@ -19,12 +19,13 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
 #include <glog/logging.h>
 
+#include "kudu/gutil/port.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/openssl_util.h"
-#include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -128,6 +129,10 @@ class TlsHandshake {
   // Retrieve the negotiated TLS protocol version. Only valid to call after the
   // handshake is complete and before 'Finish()'.
   std::string GetProtocol() const;
+
+  // Retrive the description of the negotiated cipher.
+  // Only valid to call after the handshake is complete and before 'Finish()'.
+  std::string GetCipherDescription() const;
 
  private:
   friend class TlsContext;

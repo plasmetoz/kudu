@@ -22,7 +22,7 @@
 #
 # Environment variables may be used to customize operation:
 #   BUILD_TYPE: Default: DEBUG
-#     Maybe be one of ASAN|TSAN|DEBUG|RELEASE|COVERAGE|LINT
+#     Maybe be one of ASAN|TSAN|DEBUG|RELEASE|COVERAGE|LINT|IWYU
 #
 #   KUDU_ALLOW_SLOW_TESTS   Default: 1
 #     Runs the "slow" version of the unit tests. Set to 0 to
@@ -56,6 +56,10 @@
 #   BUILD_JAVA        Default: 1
 #     Build and test java code if this is set to 1.
 #
+#   BUILD_GRADLE      Default: 1
+#     When building java code, also build the gradle build if this is set
+#     to 1.
+#
 #   BUILD_PYTHON       Default: 1
 #     Build and test the Python wrapper of the client API.
 #
@@ -68,6 +72,9 @@
 #     Extra flags which are passed to 'mvn' when building and running Java
 #     tests. This can be useful, for example, to choose a different maven
 #     repository location.
+#
+#   GRADLE_FLAGS       Default: ""
+#     Extra flags which are passed to 'gradle' when running Gradle commands.
 
 # If a commit messages contains a line that says 'DONT_BUILD', exit
 # immediately.
@@ -103,6 +110,7 @@ export KUDU_ALLOW_SLOW_TESTS=${KUDU_ALLOW_SLOW_TESTS:-$DEFAULT_ALLOW_SLOW_TESTS}
 export KUDU_COMPRESS_TEST_OUTPUT=${KUDU_COMPRESS_TEST_OUTPUT:-1}
 export TEST_TMPDIR=${TEST_TMPDIR:-/tmp/kudutest-$UID}
 BUILD_JAVA=${BUILD_JAVA:-1}
+BUILD_GRADLE=${BUILD_GRADLE:-1}
 BUILD_PYTHON=${BUILD_PYTHON:-1}
 BUILD_PYTHON3=${BUILD_PYTHON3:-1}
 
@@ -125,6 +133,7 @@ mkdir -p $BUILD_ROOT
 
 # Same for the Java tests, which aren't inside BUILD_ROOT
 rm -rf $SOURCE_ROOT/java/*/target
+rm -rf $SOURCE_ROOT/java/*/build
 
 list_flaky_tests() {
   local url="http://$TEST_RESULT_SERVER/list_failed_tests?num_days=3&build_pattern=%25kudu-test%25"
@@ -192,9 +201,13 @@ elif [ "$BUILD_TYPE" = "COVERAGE" ]; then
 
   # We currently dont capture coverage for Java or Python.
   BUILD_JAVA=0
+  BUILD_GRADLE=0
   BUILD_PYTHON=0
   BUILD_PYTHON3=0
 elif [ "$BUILD_TYPE" = "LINT" ]; then
+  CMAKE_BUILD=debug
+elif [ "$BUILD_TYPE" = "IWYU" ]; then
+  USE_CLANG=1
   CMAKE_BUILD=debug
 else
   # Must be DEBUG or RELEASE
@@ -222,14 +235,21 @@ fi
 CMAKE="$CMAKE $SOURCE_ROOT"
 $CMAKE
 
+# Create empty test logs or else Jenkins fails to archive artifacts, which
+# results in the build failing.
+mkdir -p Testing/Temporary
+mkdir -p $TEST_LOGDIR
+
 # Short circuit for LINT builds.
 if [ "$BUILD_TYPE" = "LINT" ]; then
-  # Create empty test logs or else Jenkins fails to archive artifacts, which
-  # results in the build failing.
-  mkdir -p Testing/Temporary
-  mkdir -p $TEST_LOGDIR
-
   make lint | tee $TEST_LOGDIR/lint.log
+  exit $?
+fi
+
+# Short circuit for IWYU builds: run the include-what-you-use tool on the files
+# modified since the last committed changelist committed upstream.
+if [ "$BUILD_TYPE" = "IWYU" ]; then
+  make iwyu | tee $TEST_LOGDIR/iwyu.log
   exit $?
 fi
 
@@ -272,7 +292,6 @@ make -j$NUM_PROCS 2>&1 | tee build.log
 set +e
 
 # Run tests
-export GTEST_OUTPUT="xml:$TEST_LOGDIR/" # Enable JUnit-compatible XML output.
 if [ "$RUN_FLAKY_ONLY" == "1" ] ; then
   if [ -z "$TEST_RESULT_SERVER" ]; then
     echo Must set TEST_RESULT_SERVER to use RUN_FLAKY_ONLY
@@ -288,7 +307,7 @@ if [ "$RUN_FLAKY_ONLY" == "1" ] ; then
   fi
   test_regex=$(perl -e '
     chomp(my @lines = <>);
-    print join("|", map { "^" . quotemeta($_) . "\$" } @lines);
+    print join("|", map { "^" . quotemeta($_) } @lines);
    ' $BUILD_ROOT/flaky-tests.txt)
   if [ -z "$test_regex" ]; then
     echo No tests are flaky.
@@ -301,6 +320,7 @@ if [ "$RUN_FLAKY_ONLY" == "1" ] ; then
   BUILD_PYTHON=0
   BUILD_PYTHON3=0
   BUILD_JAVA=0
+  BUILD_GRADLE=0
 fi
 
 EXIT_STATUS=0
@@ -314,7 +334,7 @@ if [ "$ENABLE_DIST_TEST" == "1" ]; then
   echo ------------------------------------------------------------
   export DIST_TEST_JOB_PATH=$BUILD_ROOT/dist-test-job-id
   rm -f $DIST_TEST_JOB_PATH
-  if ! $SOURCE_ROOT/build-support/dist_test.py --no-wait run-all ; then
+  if ! $SOURCE_ROOT/build-support/dist_test.py --no-wait run ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Could not submit distributed test job\n'
   fi
@@ -347,26 +367,37 @@ if [ "$BUILD_JAVA" == "1" ]; then
   echo Building and testing java...
   echo ------------------------------------------------------------
 
-  # Make sure we use JDK7
-  export JAVA_HOME=$JAVA7_HOME
+  # Make sure we use JDK8
+  export JAVA_HOME=$JAVA8_HOME
   export PATH=$JAVA_HOME/bin:$PATH
   pushd $SOURCE_ROOT/java
   export TSAN_OPTIONS="$TSAN_OPTIONS suppressions=$SOURCE_ROOT/build-support/tsan-suppressions.txt history_size=7"
   set -x
-  if ! mvn $MVN_FLAGS \
-      -Dsurefire.rerunFailingTestsCount=3 \
-      -Dfailsafe.rerunFailingTestsCount=3 \
-      clean verify ; then
+
+  # Run the full Maven build.
+  MVN_FLAGS="$MVN_FLAGS -B"
+  MVN_FLAGS="$MVN_FLAGS -Dsurefire.rerunFailingTestsCount=3"
+  MVN_FLAGS="$MVN_FLAGS -Dfailsafe.rerunFailingTestsCount=3"
+  MVN_FLAGS="$MVN_FLAGS -Dmaven.javadoc.skip"
+  if ! mvn $MVN_FLAGS clean verify ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Java build/test failed\n'
   fi
-  # Test kudu-spark with Spark 2.x + Scala 2.11 profile
-  # This won't work if there are ever Spark integration tests!
-  rm -rf kudu-spark/target/
-  if ! mvn $MVN_FLAGS -Pspark2_2.11 -Dtest="org.apache.kudu.spark.kudu.*" test; then
-    EXIT_STATUS=1
-    FAILURES="$FAILURES"$'Java build/test failed\n'
+
+  # Rerun the build using the Gradle build.
+  # Note: We just ensure we can assemble and don't rerun the tests.
+  if [ "$BUILD_GRADLE" == "1" ]; then
+     GRADLE_FLAGS="$GRADLE_FLAGS --console=plain --no-daemon"
+     if ! ./gradlew $GRADLE_FLAGS clean assemble; then
+       EXIT_STATUS=1
+       FAILURES="$FAILURES"$'Java Gradle build failed\n'
+     fi
   fi
+
+  # Run a script to verify the contents of the JARs to ensure the shading and
+  # packaging is correct.
+  $SOURCE_ROOT/build-support/verify_jars.pl .
+
   set +x
   popd
 fi
@@ -377,31 +408,55 @@ if [ "$BUILD_PYTHON" == "1" ]; then
   echo Building and testing python.
   echo ------------------------------------------------------------
 
-  # Failing to compile the Python client should result in a build failure
+  # Failing to compile the Python client should result in a build failure.
   set -e
   export KUDU_HOME=$SOURCE_ROOT
   export KUDU_BUILD=$BUILD_ROOT
   pushd $SOURCE_ROOT/python
 
-  # Create a sane test environment
+  # Create a sane test environment.
   rm -Rf $KUDU_BUILD/py_env
   virtualenv $KUDU_BUILD/py_env
   source $KUDU_BUILD/py_env/bin/activate
-  pip install --upgrade pip
-  CC=$CLANG CXX=$CLANG++ pip install --disable-pip-version-check -r requirements.txt
+
+  # Old versions of pip (such as the one found in el6) default to pypi's http://
+  # endpoint which no longer exists. The -i option lets us switch to the
+  # https:// endpoint in such cases.
+  #
+  # Unfortunately, in these old versions of pip, -i doesn't appear to apply
+  # recursively to transitive dependencies installed via a direct dependency's
+  # "python setup.py" command. Therefore we have no choice but to upgrade to a
+  # new version of pip to proceed.
+  pip install -i https://pypi.python.org/simple --upgrade pip
+
+  # New versions of pip raise an exception when upgrading old versions of
+  # setuptools (such as the one found in el6). The workaround is to upgrade
+  # setuptools on its own, outside of requirements.txt, and with the pip version
+  # check disabled.
+  pip install --disable-pip-version-check --upgrade 'setuptools >= 0.8'
+
+  # We've got a new pip and new setuptools. We can now install the rest of the
+  # Python client's requirements.
+  #
+  # Installing the Cython dependency may involve some compiler work, so we must
+  # pass in the current values of CC and CXX.
+  CC=$CLANG CXX=$CLANG++ pip install -r requirements.txt
 
   # Delete old Cython extensions to force them to be rebuilt.
   rm -Rf build kudu_python.egg-info kudu/*.so
 
-  # Assuming we run this script from base dir
+  # Build the Python bindings. This assumes we run this script from base dir.
   CC=$CLANG CXX=$CLANG++ python setup.py build_ext
   set +e
+
+  # Run the Python tests.
   if ! python setup.py test \
-      --addopts="kudu --junit-xml=$KUDU_BUILD/test-logs/python_client.xml" \
-      2> $KUDU_BUILD/test-logs/python_client.log ; then
+      --addopts="kudu --junit-xml=$TEST_LOGDIR/python_client.xml" \
+      2> $TEST_LOGDIR/python_client.log ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Python tests failed\n'
   fi
+
   deactivate
   popd
 fi
@@ -411,31 +466,55 @@ if [ "$BUILD_PYTHON3" == "1" ]; then
   echo Building and testing python 3.
   echo ------------------------------------------------------------
 
-  # Failing to compile the Python client should result in a build failure
+  # Failing to compile the Python client should result in a build failure.
   set -e
   export KUDU_HOME=$SOURCE_ROOT
   export KUDU_BUILD=$BUILD_ROOT
   pushd $SOURCE_ROOT/python
 
-  # Create a sane test environment
+  # Create a sane test environment.
   rm -Rf $KUDU_BUILD/py_env
   virtualenv -p python3 $KUDU_BUILD/py_env
   source $KUDU_BUILD/py_env/bin/activate
-  pip install --upgrade pip
-  CC=$CLANG CXX=$CLANG++ pip install --disable-pip-version-check -r requirements.txt
+
+  # Old versions of pip (such as the one found in el6) default to pypi's http://
+  # endpoint which no longer exists. The -i option lets us switch to the
+  # https:// endpoint in such cases.
+  #
+  # Unfortunately, in these old versions of pip, -i doesn't appear to apply
+  # recursively to transitive dependencies installed via a direct dependency's
+  # "python setup.py" command. Therefore we have no choice but to upgrade to a
+  # new version of pip to proceed.
+  pip install -i https://pypi.python.org/simple --upgrade pip
+
+  # New versions of pip raise an exception when upgrading old versions of
+  # setuptools (such as the one found in el6). The workaround is to upgrade
+  # setuptools on its own, outside of requirements.txt, and with the pip version
+  # check disabled.
+  pip install --disable-pip-version-check --upgrade 'setuptools >= 0.8'
+
+  # We've got a new pip and new setuptools. We can now install the rest of the
+  # Python client's requirements.
+  #
+  # Installing the Cython dependency may involve some compiler work, so we must
+  # pass in the current values of CC and CXX.
+  CC=$CLANG CXX=$CLANG++ pip install -r requirements.txt
 
   # Delete old Cython extensions to force them to be rebuilt.
   rm -Rf build kudu_python.egg-info kudu/*.so
 
-  # Assuming we run this script from base dir
+  # Build the Python bindings. This assumes we run this script from base dir.
   CC=$CLANG CXX=$CLANG++ python setup.py build_ext
   set +e
+
+  # Run the Python tests.
   if ! python setup.py test \
-      --addopts="kudu --junit-xml=$KUDU_BUILD/test-logs/python3_client.xml" \
-      2> $KUDU_BUILD/test-logs/python3_client.log ; then
+      --addopts="kudu --junit-xml=$TEST_LOGDIR/python3_client.xml" \
+      2> $TEST_LOGDIR/python3_client.log ; then
     EXIT_STATUS=1
     FAILURES="$FAILURES"$'Python 3 tests failed\n'
   fi
+
   deactivate
   popd
 fi
@@ -456,19 +535,7 @@ if [ "$ENABLE_DIST_TEST" == "1" ]; then
   # Move them back into the main log directory
   rm -f $DT_DIR/*zip
   for arch_dir in $DT_DIR/* ; do
-    # In the case of sharded tests, we'll have multiple subdirs
-    # which contain files of the same name. We need to disambiguate
-    # when we move back. We can grab the shard index from the task name
-    # which is in the archive directory name.
-    shard_idx=$(echo $arch_dir | perl -ne '
-      if (/(\d+)$/) {
-        print $1;
-      } else {
-        print "unknown_shard";
-      }')
-    for log_file in $arch_dir/build/$BUILD_TYPE_LOWER/test-logs/* ; do
-      mv $log_file $TEST_LOGDIR/${shard_idx}_$(basename $log_file)
-    done
+    mv $arch_dir/build/$BUILD_TYPE_LOWER/test-logs/* $TEST_LOGDIR
     rm -Rf $arch_dir
   done
 fi
@@ -505,9 +572,14 @@ fi
 set -e
 
 if [ -n "$FAILURES" ]; then
+  echo
+  echo
+  echo ======================================================================
   echo Failure summary
-  echo ------------------------------------------------------------
+  echo ======================================================================
   echo $FAILURES
+  echo
+  echo
 fi
 
 exit $EXIT_STATUS

@@ -15,11 +15,14 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <string>
 #include <vector>
 
+#include <gtest/gtest.h>
+
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/request_tracker.h"
-#include "kudu/util/test_util.h"
+#include "kudu/util/test_macros.h"
 
 using std::vector;
 
@@ -33,7 +36,7 @@ TEST(RequestTrackerTest, TestSequenceNumberGeneration) {
 
   // A new tracker should have no incomplete RPCs
   RequestTracker::SequenceNumber seq_no = tracker_->FirstIncomplete();
-  ASSERT_EQ(seq_no, RequestTracker::NO_SEQ_NO);
+  ASSERT_EQ(seq_no, RequestTracker::kNoSeqNo);
 
   vector<RequestTracker::SequenceNumber> generated_seq_nos;
 
@@ -75,7 +78,7 @@ TEST(RequestTrackerTest, TestSequenceNumberGeneration) {
     tracker_->RpcCompleted(seq_no);
   }
 
-  ASSERT_EQ(tracker_->FirstIncomplete(), RequestTracker::NO_SEQ_NO);
+  ASSERT_EQ(tracker_->FirstIncomplete(), RequestTracker::kNoSeqNo);
 }
 
 } // namespace rpc

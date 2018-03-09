@@ -17,16 +17,24 @@
 #ifndef KUDU_TSERVER_TABLET_SERVICE_H
 #define KUDU_TSERVER_TABLET_SERVICE_H
 
-#include <memory>
+#include <cstdint>
 #include <string>
-#include <vector>
 
 #include "kudu/consensus/consensus.service.h"
-#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_admin.service.h"
 #include "kudu/tserver/tserver_service.service.h"
 
+namespace google {
+namespace protobuf {
+class Message;
+}
+}
+
 namespace kudu {
+
 class RowwiseIterator;
 class Schema;
 class Status;
@@ -36,16 +44,51 @@ namespace server {
 class ServerBase;
 } // namespace server
 
+namespace consensus {
+class BulkChangeConfigRequestPB;
+class ChangeConfigRequestPB;
+class ChangeConfigResponsePB;
+class ConsensusRequestPB;
+class ConsensusResponsePB;
+class GetConsensusStateRequestPB;
+class GetConsensusStateResponsePB;
+class GetLastOpIdRequestPB;
+class GetLastOpIdResponsePB;
+class GetNodeInstanceRequestPB;
+class GetNodeInstanceResponsePB;
+class LeaderStepDownRequestPB;
+class LeaderStepDownResponsePB;
+class RunLeaderElectionRequestPB;
+class RunLeaderElectionResponsePB;
+class StartTabletCopyRequestPB;
+class StartTabletCopyResponsePB;
+class UnsafeChangeConfigRequestPB;
+class UnsafeChangeConfigResponsePB;
+class VoteRequestPB;
+class VoteResponsePB;
+} // namespace consensus
+
+namespace rpc {
+class RpcContext;
+} // namespace rpc
+
 namespace tablet {
 class Tablet;
-class TabletPeer;
-class TransactionState;
+class TabletReplica;
 } // namespace tablet
 
 namespace tserver {
 
+class AlterSchemaRequestPB;
+class AlterSchemaResponsePB;
+class ChecksumRequestPB;
+class ChecksumResponsePB;
+class CreateTabletRequestPB;
+class CreateTabletResponsePB;
+class DeleteTabletRequestPB;
+class DeleteTabletResponsePB;
 class ScanResultCollector;
-class TabletPeerLookupIf;
+class TabletReplicaLookupIf;
 class TabletServer;
 
 class TabletServiceImpl : public TabletServerServiceIf {
@@ -88,7 +131,7 @@ class TabletServiceImpl : public TabletServerServiceIf {
   virtual void Shutdown() OVERRIDE;
 
  private:
-  Status HandleNewScanRequest(tablet::TabletPeer* tablet_peer,
+  Status HandleNewScanRequest(tablet::TabletReplica* tablet_replica,
                               const ScanRequestPB* req,
                               const rpc::RpcContext* rpc_context,
                               ScanResultCollector* result_collector,
@@ -105,9 +148,20 @@ class TabletServiceImpl : public TabletServerServiceIf {
   Status HandleScanAtSnapshot(const NewScanRequestPB& scan_pb,
                               const rpc::RpcContext* rpc_context,
                               const Schema& projection,
-                              tablet::TabletPeer* tablet_peer,
+                              tablet::TabletReplica* tablet_replica,
                               gscoped_ptr<RowwiseIterator>* iter,
                               Timestamp* snap_timestamp);
+
+  // Validates the given timestamp is not so far in the future that
+  // it exceeds the maximum allowed clock synchronization error time,
+  // as such a timestamp is invalid.
+  Status ValidateTimestamp(const Timestamp& snap_timestamp);
+
+  // Pick a timestamp according to the scan mode, and verify that the
+  // timestamp is after the tablet's ancient history mark.
+  Status PickAndVerifyTimestamp(const NewScanRequestPB& scan_pb,
+                                tablet::Tablet* tablet,
+                                Timestamp* snap_timestamp);
 
   TabletServer* server_;
 };
@@ -139,7 +193,7 @@ class TabletServiceAdminImpl : public TabletServerAdminServiceIf {
 class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
  public:
   ConsensusServiceImpl(server::ServerBase* server,
-                       TabletPeerLookupIf* tablet_manager);
+                       TabletReplicaLookupIf* tablet_manager);
 
   virtual ~ConsensusServiceImpl();
 
@@ -147,17 +201,25 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
                             google::protobuf::Message* resp,
                             rpc::RpcContext* rpc) override;
 
-  virtual void UpdateConsensus(const consensus::ConsensusRequestPB *req,
-                               consensus::ConsensusResponsePB *resp,
-                               rpc::RpcContext *context) OVERRIDE;
+  virtual void UpdateConsensus(const consensus::ConsensusRequestPB* req,
+                               consensus::ConsensusResponsePB* resp,
+                               rpc::RpcContext* context) OVERRIDE;
 
   virtual void RequestConsensusVote(const consensus::VoteRequestPB* req,
                                     consensus::VoteResponsePB* resp,
                                     rpc::RpcContext* context) OVERRIDE;
 
   virtual void ChangeConfig(const consensus::ChangeConfigRequestPB* req,
-                         consensus::ChangeConfigResponsePB* resp,
-                         rpc::RpcContext* context) OVERRIDE;
+                            consensus::ChangeConfigResponsePB* resp,
+                            rpc::RpcContext* context) OVERRIDE;
+
+  virtual void BulkChangeConfig(const consensus::BulkChangeConfigRequestPB* req,
+                                consensus::ChangeConfigResponsePB* resp,
+                                rpc::RpcContext* context) OVERRIDE;
+
+  virtual void UnsafeChangeConfig(const consensus::UnsafeChangeConfigRequestPB* req,
+                                  consensus::UnsafeChangeConfigResponsePB* resp,
+                                  rpc::RpcContext* context) OVERRIDE;
 
   virtual void GetNodeInstance(const consensus::GetNodeInstanceRequestPB* req,
                                consensus::GetNodeInstanceResponsePB* resp,
@@ -168,24 +230,24 @@ class ConsensusServiceImpl : public consensus::ConsensusServiceIf {
                                  rpc::RpcContext* context) OVERRIDE;
 
   virtual void LeaderStepDown(const consensus::LeaderStepDownRequestPB* req,
-                                 consensus::LeaderStepDownResponsePB* resp,
+                              consensus::LeaderStepDownResponsePB* resp,
+                              rpc::RpcContext* context) OVERRIDE;
+
+  virtual void GetLastOpId(const consensus::GetLastOpIdRequestPB* req,
+                           consensus::GetLastOpIdResponsePB* resp,
+                           rpc::RpcContext* context) OVERRIDE;
+
+  virtual void GetConsensusState(const consensus::GetConsensusStateRequestPB* req,
+                                 consensus::GetConsensusStateResponsePB* resp,
                                  rpc::RpcContext* context) OVERRIDE;
 
-  virtual void GetLastOpId(const consensus::GetLastOpIdRequestPB *req,
-                           consensus::GetLastOpIdResponsePB *resp,
-                           rpc::RpcContext *context) OVERRIDE;
-
-  virtual void GetConsensusState(const consensus::GetConsensusStateRequestPB *req,
-                                 consensus::GetConsensusStateResponsePB *resp,
-                                 rpc::RpcContext *context) OVERRIDE;
-
   virtual void StartTabletCopy(const consensus::StartTabletCopyRequestPB* req,
-                                    consensus::StartTabletCopyResponsePB* resp,
-                                    rpc::RpcContext* context) OVERRIDE;
+                               consensus::StartTabletCopyResponsePB* resp,
+                               rpc::RpcContext* context) OVERRIDE;
 
  private:
   server::ServerBase* server_;
-  TabletPeerLookupIf* tablet_manager_;
+  TabletReplicaLookupIf* tablet_manager_;
 };
 
 } // namespace tserver

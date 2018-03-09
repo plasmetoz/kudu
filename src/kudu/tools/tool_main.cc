@@ -16,6 +16,7 @@
 // under the License.
 
 #include <algorithm>
+#include <cstdlib>
 #include <deque>
 #include <iostream>
 #include <memory>
@@ -23,7 +24,9 @@
 #include <unordered_map>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/gutil/map-util.h"
@@ -32,6 +35,7 @@
 #include "kudu/tools/tool_action.h"
 #include "kudu/util/flags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/status.h"
 
 DECLARE_bool(help);
@@ -41,6 +45,7 @@ DECLARE_bool(helpxml);
 DECLARE_string(helpmatch);
 DECLARE_string(helpon);
 
+using std::cout;
 using std::cerr;
 using std::deque;
 using std::endl;
@@ -53,6 +58,24 @@ using strings::Substitute;
 namespace kudu {
 namespace tools {
 
+unique_ptr<Mode> RootMode(const string& name) {
+  return ModeBuilder(name)
+      .Description("Kudu Command Line Tools") // root mode description isn't printed
+      .AddMode(BuildClusterMode())
+      .AddMode(BuildFsMode())
+      .AddMode(BuildLocalReplicaMode())
+      .AddMode(BuildMasterMode())
+      .AddMode(BuildPbcMode())
+      .AddMode(BuildPerfMode())
+      .AddMode(BuildRemoteReplicaMode())
+      .AddMode(BuildTableMode())
+      .AddMode(BuildTabletMode())
+      .AddMode(BuildTestMode())
+      .AddMode(BuildTServerMode())
+      .AddMode(BuildWalMode())
+      .Build();
+}
+
 Status MarshalArgs(const vector<Mode*>& chain,
                    Action* action,
                    deque<string> input,
@@ -63,7 +86,7 @@ Status MarshalArgs(const vector<Mode*>& chain,
   // Marshal the required arguments from the command line.
   for (const auto& a : args.required) {
     if (input.empty()) {
-      return Status::InvalidArgument(Substitute("must provide $0", a.name));
+      return Status::InvalidArgument(Substitute("must provide positional argument $0", a.name));
     }
     InsertOrDie(required, a.name, input.front());
     input.pop_front();
@@ -73,7 +96,8 @@ Status MarshalArgs(const vector<Mode*>& chain,
   if (args.variadic) {
     const ActionArgsDescriptor::Arg& a = args.variadic.get();
     if (input.empty()) {
-      return Status::InvalidArgument(Substitute("must provide $0", a.name));
+      return Status::InvalidArgument(Substitute("must provide variadic positional argument $0",
+                                                a.name));
     }
 
     variadic->assign(input.begin(), input.end());
@@ -97,39 +121,39 @@ int DispatchCommand(const vector<Mode*>& chain,
   vector<string> variadic_args;
   Status s = MarshalArgs(chain, action, remaining_args,
                          &required_args, &variadic_args);
-  if (s.ok()) {
-    s = action->Run(chain, required_args, variadic_args);
-  }
-  if (s.ok()) {
-    return 0;
-  } else {
+  if (!s.ok()) {
     cerr << s.ToString() << endl;
+    cerr << endl;
+    cerr << action->BuildHelp(chain, Action::USAGE_ONLY) << endl;
     return 1;
   }
+  s = action->Run(chain, required_args, variadic_args);
+  if (s.ok()) {
+    return 0;
+  }
+  cerr << s.ToString() << endl;
+  return 1;
 }
 
 // Replace hyphens with underscores in a string and return a copy.
-string HyphensToUnderscores(string str) {
+static string HyphensToUnderscores(string str) {
   std::replace(str.begin(), str.end(), '-', '_');
   return str;
 }
 
-int RunTool(int argc, char** argv, bool show_help) {
-  unique_ptr<Mode> root = ModeBuilder(argv[0])
-    .Description("doesn't matter") // root mode description isn't printed
-    .AddMode(BuildClusterMode())
-    .AddMode(BuildFsMode())
-    .AddMode(BuildLocalReplicaMode())
-    .AddMode(BuildMasterMode())
-    .AddMode(BuildPbcMode())
-    .AddMode(BuildRemoteReplicaMode())
-    .AddMode(BuildTableMode())
-    .AddMode(BuildTabletMode())
-    .AddMode(BuildTestMode())
-    .AddMode(BuildTServerMode())
-    .AddMode(BuildWalMode())
-    .Build();
+void DumpToolXML(const string& path) {
+  unique_ptr<Mode> root = RootMode(BaseName(path));
+  cout << "<?xml version=\"1.0\"?>";
+  cout << "<AllModes>";
+  for (const auto& mode : root->modes()) {
+    vector<Mode*> chain = { root.get(), mode.get() };
+    cout << mode->BuildHelpXML(chain);
+  }
+  cout << "</AllModes>" << endl;
+}
 
+int RunTool(int argc, char** argv, bool show_help) {
+  unique_ptr<Mode> root = RootMode(argv[0]);
   // Initialize arg parsing state.
   vector<Mode*> chain = { root.get() };
 
@@ -173,7 +197,7 @@ int RunTool(int argc, char** argv, bool show_help) {
         // Invoke the action with whatever arguments remain, skipping this one.
         deque<string> remaining_args;
         for (int j = i + 1; j < argc; j++) {
-          remaining_args.push_back(argv[j]);
+          remaining_args.emplace_back(argv[j]);
         }
         return DispatchCommand(chain, next_action, remaining_args);
       }
@@ -202,18 +226,23 @@ static bool ParseCommandLineFlags(int* argc, char*** argv) {
   // Inspired by https://github.com/gflags/gflags/issues/43#issuecomment-168280647.
   bool show_help = false;
   gflags::ParseCommandLineNonHelpFlags(argc, argv, true);
+
+  // Leverage existing helpxml flag to print mode/action xml.
+  if (FLAGS_helpxml) {
+    kudu::tools::DumpToolXML(*argv[0]);
+    exit(1);
+  }
+
   if (FLAGS_help ||
       FLAGS_helpshort ||
       !FLAGS_helpon.empty() ||
       !FLAGS_helpmatch.empty() ||
-      FLAGS_helppackage ||
-      FLAGS_helpxml) {
+      FLAGS_helppackage) {
     FLAGS_help = false;
     FLAGS_helpshort = false;
     FLAGS_helpon = "";
     FLAGS_helpmatch = "";
     FLAGS_helppackage = false;
-    FLAGS_helpxml = false;
     show_help = true;
   }
   kudu::HandleCommonFlags();

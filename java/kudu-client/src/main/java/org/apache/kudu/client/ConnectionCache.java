@@ -17,265 +17,153 @@
 
 package org.apache.kudu.client;
 
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
-import java.net.UnknownHostException;
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.Iterator;
 import java.util.List;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
-import java.util.concurrent.locks.Lock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
-
+import java.util.Set;
 import javax.annotation.concurrent.GuardedBy;
 
 import com.google.common.annotations.VisibleForTesting;
+import com.google.common.collect.HashMultimap;
 import com.google.common.collect.ImmutableList;
-import com.google.common.net.HostAndPort;
 import com.stumbleupon.async.Deferred;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
-import org.jboss.netty.channel.DefaultChannelPipeline;
-import org.jboss.netty.channel.socket.SocketChannel;
-import org.jboss.netty.channel.socket.SocketChannelConfig;
-import org.jboss.netty.handler.codec.frame.LengthFieldBasedFrameDecoder;
-import org.jboss.netty.handler.timeout.ReadTimeoutHandler;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import org.apache.kudu.Common;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
-import org.apache.kudu.master.Master;
-import org.apache.kudu.util.NetUtil;
+import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
+import org.jboss.netty.util.HashedWheelTimer;
 
 /**
- * The ConnectionCache is responsible for managing connections to masters and tablet servers.
- * There should only be one instance per Kudu client, and can <strong>not</strong> be shared between
- * clients.
+ * The ConnectionCache is responsible for managing connections to Kudu masters and tablet servers.
+ * There should only be one instance of ConnectionCache per Kudu client, and it should not be
+ * shared between clients.
  * <p>
- * {@link TabletClient}s are currently never removed from this cache. Since the map is keyed by
- * UUID, it would require an ever-growing set of unique tablet servers to encounter memory issues.
- * The reason for keeping disconnected connections in the cache is two-fold: 1) it makes
- * reconnecting easier since only UUIDs are passed around so we can use the dead TabletClient's
- * host and port to reconnect (see {@link #getLiveClient(String)}) and 2) having the dead
- * connection prevents tight looping when hitting "Connection refused"-type of errors.
- * <p>
+ * Disconnected instances of the {@link Connection} class are replaced in the cache with new ones
+ * when {@link #getConnection(ServerInfo, Connection.CredentialsPolicy)} method is called with the
+ * same destination and matching credentials policy. Since the map is keyed by the UUID of the
+ * target server, the theoretical maximum number of elements in the cache is twice the number of
+ * all servers in the cluster (i.e. both masters and tablet servers). However, in practice it's
+ * 2 * number of masters + number of tablet servers since tablet servers do not require connections
+ * negotiated with primary credentials.
+ *
  * This class is thread-safe.
  */
 @InterfaceAudience.Private
 @InterfaceStability.Unstable
 class ConnectionCache {
 
-  private static final Logger LOG = LoggerFactory.getLogger(ConnectionCache.class);
+  /** Security context to use for connection negotiation. */
+  private final SecurityContext securityContext;
+
+  /** Read timeout for connections (used by Netty's ReadTimeoutHandler) */
+  private final long socketReadTimeoutMs;
+
+  /** Timer to monitor read timeouts for connections (used by Netty's ReadTimeoutHandler) */
+  private final HashedWheelTimer timer;
+
+  /** Netty's channel factory to use by connections. */
+  private final ClientSocketChannelFactory channelFactory;
 
   /**
-   * Cache that maps UUIDs to the clients connected to them.
-   * <p>
-   * This isn't a {@link ConcurrentHashMap} because we want to do an atomic get-and-put,
-   * {@code putIfAbsent} isn't a good fit for us since it requires creating
-   * an object that may be "wasted" in case another thread wins the insertion
-   * race, and we don't want to create unnecessary connections.
+   * Container mapping server UUID into the established connection from the client to the server.
+   * It may be up to two connections per server: one established with secondary credentials
+   * (e.g. authn token), another with primary ones (e.g. Kerberos credentials).
    */
-  @GuardedBy("lock")
-  private final HashMap<String, TabletClient> uuid2client = new HashMap<>();
+  @GuardedBy("uuid2connection")
+  private final HashMultimap<String, Connection> uuid2connection = HashMultimap.create();
 
-  private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
-
-  private final Lock readLock = lock.readLock();
-  private final Lock writeLock = lock.readLock();
-
-  private final AsyncKuduClient kuduClient;
-
-  /**
-   * Create a new empty ConnectionCache that will used the passed client to create connections.
-   * @param client a client that contains the information we need to create connections
-   */
-  ConnectionCache(AsyncKuduClient client) {
-    this.kuduClient = client;
-  }
-
-  /**
-   * Create a connection to a tablet server based on information provided by the master.
-   * @param tsInfoPB master-provided information for the tablet server
-   * @return an object that contains all the server's information
-   * @throws UnknownHostException if we cannot resolve the tablet server's IP address
-   */
-  ServerInfo connectTS(Master.TSInfoPB tsInfoPB) throws UnknownHostException {
-    List<Common.HostPortPB> addresses = tsInfoPB.getRpcAddressesList();
-    String uuid = tsInfoPB.getPermanentUuid().toStringUtf8();
-    if (addresses.isEmpty()) {
-      LOG.warn("Received a tablet server with no addresses, UUID: {}", uuid);
-      return null;
-    }
-
-    // from meta_cache.cc
-    // TODO: if the TS advertises multiple host/ports, pick the right one
-    // based on some kind of policy. For now just use the first always.
-    HostAndPort hostPort = ProtobufHelper.hostAndPortFromPB(addresses.get(0));
-    InetAddress inetAddress = NetUtil.getInetAddress(hostPort.getHostText());
-    if (inetAddress == null) {
-      throw new UnknownHostException(
-          "Failed to resolve the IP of `" + addresses.get(0).getHost() + "'");
-    }
-    return newClient(new ServerInfo(uuid, hostPort, inetAddress)).getServerInfo();
-  }
-
-  TabletClient newMasterClient(HostAndPort hostPort) {
-    // We should pass a UUID here but we have a chicken and egg problem, we first need to
-    // communicate with the masters to find out about them, and that's what we're trying to do.
-    // The UUID is just used for logging and cache key, so instead we just use a constructed
-    // string with the master host and port as.
-    return newClient("master-" + hostPort.toString(), hostPort);
-  }
-
-  TabletClient newClient(String uuid, HostAndPort hostPort) {
-    InetAddress inetAddress = NetUtil.getInetAddress(hostPort.getHostText());
-    if (inetAddress == null) {
-      // TODO(todd): should we log the resolution failure? throw an exception?
-      return null;
-    }
-
-    ServerInfo serverInfo = new ServerInfo(uuid, hostPort, inetAddress);
-    return newClient(serverInfo);
-  }
-
-  TabletClient newClient(ServerInfo serverInfo) {
-    TabletClient client;
-    SocketChannel chan;
-
-    writeLock.lock();
-    try {
-      client = uuid2client.get(serverInfo.getUuid());
-      if (client != null && client.isAlive()) {
-        return client;
-      }
-      final TabletClientPipeline pipeline = new TabletClientPipeline();
-      client = pipeline.init(serverInfo);
-      chan = this.kuduClient.getChannelFactory().newChannel(pipeline);
-      uuid2client.put(serverInfo.getUuid(), client);
-    } finally {
-      writeLock.unlock();
-    }
-
-    final SocketChannelConfig config = chan.getConfig();
-    config.setConnectTimeoutMillis(5000);
-    config.setTcpNoDelay(true);
-    // Unfortunately there is no way to override the keep-alive timeout in
-    // Java since the JRE doesn't expose any way to call setsockopt() with
-    // TCP_KEEPIDLE. And of course the default timeout is >2h. Sigh.
-    config.setKeepAlive(true);
-    chan.connect(new InetSocketAddress(serverInfo.getResolvedAddress(),
-                                       serverInfo.getPort())); // Won't block.
-    return client;
+  /** Create a new empty ConnectionCache given the specified parameters. */
+  ConnectionCache(SecurityContext securityContext,
+                  long socketReadTimeoutMs,
+                  HashedWheelTimer timer,
+                  ClientSocketChannelFactory channelFactory) {
+    this.securityContext = securityContext;
+    this.socketReadTimeoutMs = socketReadTimeoutMs;
+    this.timer = timer;
+    this.channelFactory = channelFactory;
   }
 
   /**
-   * Get a connection to a server for the given UUID. The returned connection can be down and its
-   * state can be queried via {@link TabletClient#isAlive()}. To automatically get a client that's
-   * gonna be re-connected automatically, use {@link #getLiveClient(String)}.
-   * @param uuid server's identifier
-   * @return a connection to a server, or null if the passed UUID isn't known
+   * Get connection to the specified server. If no connection exists or the existing connection
+   * is already disconnected, then create a new connection to the specified server. The newly
+   * created connection is not negotiated until enqueuing the first RPC to the target server.
+   *
+   * @param serverInfo the server end-point to connect to
+   * @param credentialsPolicy authentication credentials policy for the connection negotiation
+   * @return instance of this object with the specified destination
    */
-  TabletClient getClient(String uuid) {
-    readLock.lock();
-    try {
-      return uuid2client.get(uuid);
-    } finally {
-      readLock.unlock();
-    }
-  }
-
-  /**
-   * Get a connection to a server for the given UUID. This method will automatically call
-   * {@link #newClient(String, InetAddress, int)} if the cached connection is down.
-   * @param uuid server's identifier
-   * @return a connection to a server, or null if the passed UUID isn't known
-   */
-  TabletClient getLiveClient(String uuid) {
-    TabletClient client = getClient(uuid);
-
-    if (client == null) {
-      return null;
-    } else if (client.isAlive()) {
-      return client;
-    } else {
-      return newClient(client.getServerInfo());
-    }
-  }
-
-  /**
-   * Asynchronously closes every socket, which will also cancel all the RPCs in flight.
-   */
-  Deferred<ArrayList<Void>> disconnectEverything() {
-    readLock.lock();
-    try {
-      ArrayList<Deferred<Void>> deferreds = new ArrayList<>(uuid2client.size());
-      for (TabletClient ts : uuid2client.values()) {
-        deferreds.add(ts.shutdown());
-      }
-      return Deferred.group(deferreds);
-    } finally {
-      readLock.unlock();
-    }
-  }
-
-  /**
-   * The list returned by this method can't be modified,
-   * but calling certain methods on the returned TabletClients can have an effect. For example,
-   * it's possible to forcefully shutdown a connection to a tablet server by calling {@link
-   * TabletClient#shutdown()}.
-   * @return copy of the current TabletClients list
-   */
-  List<TabletClient> getImmutableTabletClientsList() {
-    readLock.lock();
-    try {
-      return ImmutableList.copyOf(uuid2client.values());
-    } finally {
-      readLock.unlock();
-    }
-  }
-
-  /**
-   * Queries all the cached connections if they are alive.
-   * @return true if all the connections are down, else false
-   */
-  @VisibleForTesting
-  boolean allConnectionsAreDead() {
-    readLock.lock();
-    try {
-      for (TabletClient tserver : uuid2client.values()) {
-        if (tserver.isAlive()) {
-          return false;
+  public Connection getConnection(final ServerInfo serverInfo,
+                                  Connection.CredentialsPolicy credentialsPolicy) {
+    Connection result = null;
+    synchronized (uuid2connection) {
+      // Create and register a new connection object into the cache if one of the following is true:
+      //
+      //  * There isn't a registered connection to the specified destination.
+      //
+      //  * There is a connection to the specified destination, but it's in TERMINATED state.
+      //    Such connections cannot be used again and should be recycled. The connection cache
+      //    lazily removes such entries.
+      //
+      //  * A connection negotiated with primary credentials is requested but the only registered
+      //    one does not have such property. In this case, the already existing connection
+      //    (negotiated with secondary credentials, i.e. authn token) is kept in the cache and
+      //    a new one is created to be open and negotiated with primary credentials. The newly
+      //    created connection is put into the cache along with old one. We don't do anything
+      //    special to the old connection to shut it down since it may be still in use. We rely
+      //    on the server to close inactive connections in accordance with their TTL settings.
+      //
+      final Set<Connection> connections = uuid2connection.get(serverInfo.getUuid());
+      Iterator<Connection> it = connections.iterator();
+      while (it.hasNext()) {
+        Connection c = it.next();
+        if (c.isTerminated()) {
+          // Lazy recycling of the terminated connections: removing them from the cache upon
+          // an attempt to connect to the same destination again.
+          it.remove();
+          continue;
+        }
+        if (credentialsPolicy == Connection.CredentialsPolicy.ANY_CREDENTIALS ||
+            credentialsPolicy == c.getCredentialsPolicy()) {
+          // If the connection policy allows for using any credentials or the connection is
+          // negotiated using the given credentials type, this is the connection we are looking for.
+          result = c;
         }
       }
-    } finally {
-      readLock.unlock();
+      if (result == null) {
+        result = new Connection(serverInfo, securityContext,
+            socketReadTimeoutMs, timer, channelFactory, credentialsPolicy);
+        connections.add(result);
+        // There can be at most 2 connections to the same destination: one with primary and another
+        // with secondary credentials.
+        assert connections.size() <= 2;
+      }
     }
-    return true;
+
+    return result;
   }
 
-  private final class TabletClientPipeline extends DefaultChannelPipeline {
-    TabletClient init(ServerInfo serverInfo) {
-      super.addFirst("decode-frames", new LengthFieldBasedFrameDecoder(
-          KuduRpc.MAX_RPC_SIZE,
-          0, // length comes at offset 0
-          4, // length prefix is 4 bytes long
-          0, // no "length adjustment"
-          4 /* strip the length prefix */));
-      super.addLast("decode-inbound", new CallResponse.Decoder());
-      super.addLast("encode-outbound", new RpcOutboundMessage.Encoder());
-      AsyncKuduClient kuduClient = ConnectionCache.this.kuduClient;
-      final TabletClient client = new TabletClient(kuduClient, serverInfo);
-      if (kuduClient.getDefaultSocketReadTimeoutMs() > 0) {
-        super.addLast("timeout-handler",
-            new ReadTimeoutHandler(kuduClient.getTimer(),
-                kuduClient.getDefaultSocketReadTimeoutMs(),
-                TimeUnit.MILLISECONDS));
+  /** Asynchronously terminate every connection. This cancels all the pending and in-flight RPCs. */
+  Deferred<ArrayList<Void>> disconnectEverything() {
+    synchronized (uuid2connection) {
+      List<Deferred<Void>> deferreds = new ArrayList<>(uuid2connection.size());
+      for (Connection c : uuid2connection.values()) {
+        deferreds.add(c.shutdown());
       }
-      super.addLast("kudu-handler", client);
+      return Deferred.group(deferreds);
+    }
+  }
 
-      return client;
+  /**
+   * Return a copy of the all-connections-list. This method is exposed only to allow
+   * {@link AsyncKuduClient} to forward it, so tests could get access to the underlying elements
+   * of the cache.
+   *
+   * @return a copy of the list of all connections in the connection cache
+   */
+  @VisibleForTesting
+  List<Connection> getConnectionListCopy() {
+    synchronized (uuid2connection) {
+      return ImmutableList.copyOf(uuid2connection.values());
     }
   }
 }

@@ -17,20 +17,37 @@
 #include "kudu/tserver/tablet_copy_source_session.h"
 
 #include <algorithm>
-#include <mutex>
+#include <cstdint>
+#include <cstring>
+#include <ostream>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
+
+#include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/log.h"
+#include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_reader.h"
-#include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/consensus/opid_util.h"
+#include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/block_manager.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/fs.pb.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/type_traits.h"
 #include "kudu/rpc/transfer.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/util/flag_tags.h"
-#include "kudu/util/mutex.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/stopwatch.h"
 #include "kudu/util/trace.h"
 
@@ -38,6 +55,22 @@ DEFINE_int32(tablet_copy_transfer_chunk_size_bytes, 4 * 1024 * 1024,
              "Size of chunks to transfer when copying tablets between "
              "tablet servers.");
 TAG_FLAG(tablet_copy_transfer_chunk_size_bytes, hidden);
+
+METRIC_DEFINE_counter(server, tablet_copy_bytes_sent,
+                      "Bytes Sent For Tablet Copy",
+                      kudu::MetricUnit::kBytes,
+                      "Number of bytes sent during tablet copy operations since server start");
+
+METRIC_DEFINE_gauge_int32(server, tablet_copy_open_source_sessions,
+                          "Open Table Copy Source Sessions",
+                          kudu::MetricUnit::kSessions,
+                          "Number of currently open tablet copy source sessions on this server");
+
+DEFINE_int32(tablet_copy_session_inject_latency_on_init_ms, 0,
+             "How much latency (in ms) to inject when a tablet copy session is initialized. "
+             "(For testing only!)");
+TAG_FLAG(tablet_copy_session_inject_latency_on_init_ms, unsafe);
+TAG_FLAG(tablet_copy_session_inject_latency_on_init_ms, hidden);
 
 namespace kudu {
 namespace tserver {
@@ -47,40 +80,66 @@ using consensus::OpId;
 using fs::ReadableBlock;
 using log::ReadableLogSegment;
 using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 using tablet::TabletMetadata;
-using tablet::TabletPeer;
+using tablet::TabletReplica;
+
+TabletCopySourceMetrics::TabletCopySourceMetrics(const scoped_refptr<MetricEntity>& metric_entity)
+    : bytes_sent(METRIC_tablet_copy_bytes_sent.Instantiate(metric_entity)),
+      open_source_sessions(METRIC_tablet_copy_open_source_sessions.Instantiate(metric_entity, 0)) {
+}
 
 TabletCopySourceSession::TabletCopySourceSession(
-    const scoped_refptr<TabletPeer>& tablet_peer, std::string session_id,
-    std::string requestor_uuid, FsManager* fs_manager)
-    : tablet_peer_(tablet_peer),
+    const scoped_refptr<TabletReplica>& tablet_replica, std::string session_id,
+    std::string requestor_uuid, FsManager* fs_manager,
+    TabletCopySourceMetrics* tablet_copy_metrics)
+    : tablet_replica_(tablet_replica),
       session_id_(std::move(session_id)),
       requestor_uuid_(std::move(requestor_uuid)),
       fs_manager_(fs_manager),
       blocks_deleter_(&blocks_),
-      logs_deleter_(&logs_) {}
+      logs_deleter_(&logs_),
+      tablet_copy_metrics_(tablet_copy_metrics) {
+  if (tablet_copy_metrics_) {
+    tablet_copy_metrics_->open_source_sessions->Increment();
+  }
+}
 
 TabletCopySourceSession::~TabletCopySourceSession() {
   // No lock taken in the destructor, should only be 1 thread with access now.
   CHECK_OK(UnregisterAnchorIfNeededUnlocked());
+  if (tablet_copy_metrics_) {
+    tablet_copy_metrics_->open_source_sessions->IncrementBy(-1);
+  }
 }
 
 Status TabletCopySourceSession::Init() {
-  MutexLock l(session_lock_);
-  CHECK(!initted_);
+  return init_once_.Init(&TabletCopySourceSession::InitOnce, this);
+}
 
-  RETURN_NOT_OK(tablet_peer_->CheckRunning());
+Status TabletCopySourceSession::InitOnce() {
+  // Inject latency during Init() for testing purposes.
+  if (PREDICT_FALSE(FLAGS_tablet_copy_session_inject_latency_on_init_ms > 0)) {
+    TRACE("Injecting $0ms of latency due to --tablet_copy_session_inject_latency_on_init_ms",
+          FLAGS_tablet_copy_session_inject_latency_on_init_ms);
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_tablet_copy_session_inject_latency_on_init_ms));
+  }
 
-  const string& tablet_id = tablet_peer_->tablet_id();
+  RETURN_NOT_OK(tablet_replica_->CheckRunning());
+  RETURN_NOT_OK(CheckHealthyDirGroup());
+
+  const string& tablet_id = tablet_replica_->tablet_id();
 
   // Prevent log GC while we grab log segments and Tablet metadata.
   string anchor_owner_token = Substitute("TabletCopy-$0", session_id_);
-  tablet_peer_->log_anchor_registry()->Register(
+  tablet_replica_->log_anchor_registry()->Register(
       MinimumOpId().index(), anchor_owner_token, &log_anchor_);
 
   // Read the SuperBlock from disk.
-  const scoped_refptr<TabletMetadata>& metadata = tablet_peer_->tablet_metadata();
+  const scoped_refptr<TabletMetadata>& metadata = tablet_replica_->tablet_metadata();
   RETURN_NOT_OK_PREPEND(metadata->ReadSuperBlockFromDisk(&tablet_superblock_),
                         Substitute("Unable to access superblock for tablet $0",
                                    tablet_id));
@@ -91,20 +150,22 @@ Status TabletCopySourceSession::Init() {
   vector<BlockIdPB> data_blocks =
       TabletMetadata::CollectBlockIdPBs(tablet_superblock_);
   for (const BlockIdPB& block_id : data_blocks) {
-    VLOG(1) << "Opening block " << SecureDebugString(block_id);
-    RETURN_NOT_OK(OpenBlockUnlocked(BlockId::FromPB(block_id)));
+    VLOG(1) << "Opening block " << pb_util::SecureDebugString(block_id);
+    RETURN_NOT_OK(OpenBlock(BlockId::FromPB(block_id)));
   }
 
   // Get the latest opid in the log at this point in time so we can re-anchor.
-  OpId last_logged_opid;
-  CHECK_NOTNULL(tablet_peer_->log())->GetLatestEntryOpId(&last_logged_opid);
+  // TODO(mpercy): Do we need special handling for boost::none case?
+  boost::optional<OpId> last_logged_opid =
+      tablet_replica_->consensus()->GetLastOpId(consensus::RECEIVED_OPID);
+  if (!last_logged_opid) last_logged_opid = MinimumOpId();
 
   // Get the current segments from the log, including the active segment.
   // The Log doesn't add the active segment to the log reader's list until
   // a header has been written to it (but it will not have a footer).
-  shared_ptr<log::LogReader> reader = tablet_peer_->log()->reader();
+  shared_ptr<log::LogReader> reader = tablet_replica_->log()->reader();
   if (!reader) {
-    tablet::TabletStatePB tablet_state = tablet_peer_->state();
+    tablet::TabletStatePB tablet_state = tablet_replica_->state();
     return Status::IllegalState(Substitute(
         "Unable to initialize tablet copy session for tablet $0. "
         "Log reader is not available. Tablet state: $1 ($2)",
@@ -112,45 +173,43 @@ Status TabletCopySourceSession::Init() {
   }
   reader->GetSegmentsSnapshot(&log_segments_);
   for (const scoped_refptr<ReadableLogSegment>& segment : log_segments_) {
-    RETURN_NOT_OK(OpenLogSegmentUnlocked(segment->header().sequence_number()));
+    RETURN_NOT_OK(OpenLogSegment(segment->header().sequence_number()));
   }
 
   // Look up the committed consensus state.
   // We do this after snapshotting the log to avoid a scenario where the latest
   // entry in the log has a term higher than the term stored in the consensus
   // metadata, which will results in a CHECK failure on RaftConsensus init.
-  scoped_refptr<consensus::Consensus> consensus = tablet_peer_->shared_consensus();
+  shared_ptr<consensus::RaftConsensus> consensus = tablet_replica_->shared_consensus();
   if (!consensus) {
-    tablet::TabletStatePB tablet_state = tablet_peer_->state();
+    tablet::TabletStatePB tablet_state = tablet_replica_->state();
     return Status::IllegalState(Substitute(
         "Unable to initialize tablet copy session for tablet $0. "
-        "Consensus is not available. Tablet state: $1 ($2)",
+        "Raft Consensus is not available. Tablet state: $1 ($2)",
         tablet_id, tablet::TabletStatePB_Name(tablet_state), tablet_state));
   }
-  initial_committed_cstate_ = consensus->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED);
+  RETURN_NOT_OK_PREPEND(consensus->ConsensusState(&initial_cstate_),
+                        "Consensus state not available");
 
   // Re-anchor on the highest OpId that was in the log right before we
   // snapshotted the log segments. This helps ensure that we don't end up in a
   // tablet copy loop due to a follower falling too far behind the
   // leader's log when tablet copy is slow. The remote controls when
   // this anchor is released by ending the tablet copy session.
-  RETURN_NOT_OK(tablet_peer_->log_anchor_registry()->UpdateRegistration(
-      last_logged_opid.index(), anchor_owner_token, &log_anchor_));
+  RETURN_NOT_OK(tablet_replica_->log_anchor_registry()->UpdateRegistration(
+      last_logged_opid->index(), anchor_owner_token, &log_anchor_));
 
   LOG(INFO) << Substitute(
       "T $0 P $1: Tablet Copy: opened $2 blocks and $3 log segments",
       tablet_id, consensus->peer_uuid(), data_blocks.size(), log_segments_.size());
-  initted_ = true;
   return Status::OK();
 }
 
 const std::string& TabletCopySourceSession::tablet_id() const {
-  DCHECK(initted_);
-  return tablet_peer_->tablet_id();
+  return tablet_replica_->tablet_id();
 }
 
 const std::string& TabletCopySourceSession::requestor_uuid() const {
-  DCHECK(initted_);
   return requestor_uuid_;
 }
 
@@ -216,8 +275,8 @@ static Status ReadFileChunkToBuf(const Info* info,
   // Violates the API contract, but avoids excessive copies.
   data->resize(response_data_size);
   uint8_t* buf = reinterpret_cast<uint8_t*>(const_cast<char*>(data->data()));
-  Slice slice;
-  Status s = info->ReadFully(offset, response_data_size, &slice, buf);
+  Slice slice(buf, response_data_size);
+  Status s = info->Read(offset, slice);
   if (PREDICT_FALSE(!s.ok())) {
     s = s.CloneAndPrepend(
         Substitute("Unable to read existing file for $0", data_name));
@@ -242,6 +301,9 @@ Status TabletCopySourceSession::GetBlockPiece(const BlockId& block_id,
                                              uint64_t offset, int64_t client_maxlen,
                                              string* data, int64_t* block_file_size,
                                              TabletCopyErrorPB::Code* error_code) {
+  DCHECK(init_once_.init_succeeded());
+  RETURN_NOT_OK_PREPEND(CheckHealthyDirGroup(error_code),
+                        "Tablet copy source could not get block");
   ImmutableReadableBlockInfo* block_info;
   RETURN_NOT_OK(FindBlock(block_id, &block_info, error_code));
 
@@ -261,6 +323,9 @@ Status TabletCopySourceSession::GetLogSegmentPiece(uint64_t segment_seqno,
                                                    uint64_t offset, int64_t client_maxlen,
                                                    std::string* data, int64_t* log_file_size,
                                                    TabletCopyErrorPB::Code* error_code) {
+  DCHECK(init_once_.init_succeeded());
+  RETURN_NOT_OK_PREPEND(CheckHealthyDirGroup(error_code),
+                        "Tablet copy source could not get log segment");
   ImmutableRandomAccessFileInfo* file_info;
   RETURN_NOT_OK(FindLogSegment(segment_seqno, &file_info, error_code));
   RETURN_NOT_OK(ReadFileChunkToBuf(file_info, offset, client_maxlen,
@@ -273,7 +338,7 @@ Status TabletCopySourceSession::GetLogSegmentPiece(uint64_t segment_seqno,
 }
 
 bool TabletCopySourceSession::IsBlockOpenForTests(const BlockId& block_id) const {
-  MutexLock l(session_lock_);
+  DCHECK(init_once_.init_succeeded());
   return ContainsKey(blocks_, block_id);
 }
 
@@ -297,10 +362,19 @@ static Status AddImmutableFileToMap(Collection* const cache,
   return Status::OK();
 }
 
-Status TabletCopySourceSession::OpenBlockUnlocked(const BlockId& block_id) {
-  session_lock_.AssertAcquired();
+Status TabletCopySourceSession::CheckHealthyDirGroup(TabletCopyErrorPB::Code* error_code) const {
+  if (fs_manager_->dd_manager()->IsTabletInFailedDir(tablet_id())) {
+    if (error_code) {
+      *error_code = TabletCopyErrorPB::IO_ERROR;
+    }
+    return Status::IOError(
+        Substitute("Tablet $0 is in a failed directory", tablet_id()));
+  }
+  return Status::OK();
+}
 
-  gscoped_ptr<ReadableBlock> block;
+Status TabletCopySourceSession::OpenBlock(const BlockId& block_id) {
+  unique_ptr<ReadableBlock> block;
   Status s = fs_manager_->OpenBlock(block_id, &block);
   if (PREDICT_FALSE(!s.ok())) {
     LOG(WARNING) << "Unable to open requested (existing) block file: "
@@ -328,18 +402,14 @@ Status TabletCopySourceSession::OpenBlockUnlocked(const BlockId& block_id) {
 Status TabletCopySourceSession::FindBlock(const BlockId& block_id,
                                          ImmutableReadableBlockInfo** block_info,
                                          TabletCopyErrorPB::Code* error_code) {
-  Status s;
-  MutexLock l(session_lock_);
   if (!FindCopy(blocks_, block_id, block_info)) {
     *error_code = TabletCopyErrorPB::BLOCK_NOT_FOUND;
-    s = Status::NotFound("Block not found", block_id.ToString());
+    return Status::NotFound("Block not found", block_id.ToString());
   }
-  return s;
+  return Status::OK();
 }
 
-Status TabletCopySourceSession::OpenLogSegmentUnlocked(uint64_t segment_seqno) {
-  session_lock_.AssertAcquired();
-
+Status TabletCopySourceSession::OpenLogSegment(uint64_t segment_seqno) {
   scoped_refptr<log::ReadableLogSegment> log_segment;
   int position = -1;
   if (!log_segments_.empty()) {
@@ -366,7 +436,6 @@ Status TabletCopySourceSession::OpenLogSegmentUnlocked(uint64_t segment_seqno) {
 Status TabletCopySourceSession::FindLogSegment(uint64_t segment_seqno,
                                               ImmutableRandomAccessFileInfo** file_info,
                                               TabletCopyErrorPB::Code* error_code) {
-  MutexLock l(session_lock_);
   if (!FindCopy(logs_, segment_seqno, file_info)) {
     *error_code = TabletCopyErrorPB::WAL_SEGMENT_NOT_FOUND;
     return Status::NotFound(Substitute("Segment with sequence number $0 not found",
@@ -376,7 +445,7 @@ Status TabletCopySourceSession::FindLogSegment(uint64_t segment_seqno,
 }
 
 Status TabletCopySourceSession::UnregisterAnchorIfNeededUnlocked() {
-  return tablet_peer_->log_anchor_registry()->UnregisterIfAnchored(&log_anchor_);
+  return tablet_replica_->log_anchor_registry()->UnregisterIfAnchored(&log_anchor_);
 }
 
 } // namespace tserver

@@ -18,22 +18,27 @@
 #include "kudu/consensus/leader_election.h"
 
 #include <algorithm>
-#include <boost/bind.hpp>
 #include <mutex>
+#include <ostream>
+#include <type_traits>
 
+#include <boost/bind.hpp> // IWYU pragma: keep
+#include <glog/logging.h>
+
+#include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus_peers.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/consensus/opid_util.h"
 #include "kudu/gutil/bind.h"
+#include "kudu/gutil/callback.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/move.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/common/wire_protocol.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/logging.h"
-#include "kudu/util/net/net_util.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/status.h"
 
@@ -130,9 +135,9 @@ bool VoteCounter::AreAllVotesIn() const {
 // ElectionResult
 ///////////////////////////////////////////////////
 
-ElectionResult::ElectionResult(const VoteRequestPB& vote_request, ElectionVote decision,
+ElectionResult::ElectionResult(VoteRequestPB vote_request, ElectionVote decision,
                                ConsensusTerm highest_voter_term, const std::string& message)
-  : vote_request(vote_request),
+  : vote_request(std::move(vote_request)),
     decision(decision),
     highest_voter_term(highest_voter_term),
     message(message) {
@@ -156,8 +161,18 @@ LeaderElection::LeaderElection(const RaftConfigPB& config,
       decision_callback_(std::move(decision_callback)),
       highest_voter_term_(0) {
   for (const RaftPeerPB& peer : config.peers()) {
-    if (request.candidate_uuid() == peer.permanent_uuid()) continue;
-    follower_uuids_.push_back(peer.permanent_uuid());
+    if (request.candidate_uuid() == peer.permanent_uuid()) {
+      DCHECK_EQ(peer.member_type(), RaftPeerPB::VOTER)
+          << Substitute("non-voter member $0 tried to start an election; "
+                        "Raft config {$1}",
+                        peer.permanent_uuid(),
+                        pb_util::SecureShortDebugString(config));
+      continue;
+    }
+    if (peer.member_type() != RaftPeerPB::VOTER) {
+      continue;
+    }
+    other_voter_uuids_.push_back(peer.permanent_uuid());
 
     gscoped_ptr<VoterState> state(new VoterState());
     state->proxy_status = proxy_factory->NewProxy(peer, &state->proxy);
@@ -168,11 +183,11 @@ LeaderElection::LeaderElection(const RaftConfigPB& config,
   CHECK_EQ(1, vote_counter_->GetTotalVotesCounted()) << "Candidate must vote for itself first";
 
   // Ensure that existing votes + future votes add up to the expected total.
-  CHECK_EQ(vote_counter_->GetTotalVotesCounted() + follower_uuids_.size(),
+  CHECK_EQ(vote_counter_->GetTotalVotesCounted() + other_voter_uuids_.size(),
            vote_counter_->GetTotalExpectedVotes())
-      << "Expected different number of followers. Follower UUIDs: ["
-      << JoinStringsIterator(follower_uuids_.begin(), follower_uuids_.end(), ", ")
-      << "]; RaftConfig: {" << SecureShortDebugString(config) << "}";
+      << "Expected different number of voters. Voter UUIDs: ["
+      << JoinStringsIterator(other_voter_uuids_.begin(), other_voter_uuids_.end(), ", ")
+      << "]; RaftConfig: {" << pb_util::SecureShortDebugString(config) << "}";
 }
 
 LeaderElection::~LeaderElection() {
@@ -189,7 +204,7 @@ void LeaderElection::Run() {
   CheckForDecision();
 
   // The rest of the code below is for a typical multi-node configuration.
-  for (const std::string& voter_uuid : follower_uuids_) {
+  for (const std::string& voter_uuid : other_voter_uuids_) {
     VoterState* state = nullptr;
     {
       std::lock_guard<Lock> guard(lock_);
@@ -258,7 +273,7 @@ void LeaderElection::CheckForDecision() {
   // Respond outside of the lock.
   if (to_respond) {
     // This is thread-safe since result_ is write-once.
-    decision_callback_.Run(*result_);
+    decision_callback_(*result_);
   }
 }
 

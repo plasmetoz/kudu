@@ -15,17 +15,42 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gflags/gflags.h>
-#include <gtest/gtest.h>
+#include <cstdint>
+#include <cstdlib>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <vector>
+
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/codegen/compilation_manager.h"
-#include "kudu/gutil/macros.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/iterator.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/rowid.h"
+#include "kudu/common/schema.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/local_tablet_writer.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet-test-base.h"
+#include "kudu/tablet/tablet.h"
 #include "kudu/util/countdown_latch.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
 #include "kudu/util/test_graph.h"
+#include "kudu/util/test_util.h"
 #include "kudu/util/thread.h"
 
 DECLARE_int32(tablet_history_max_age_sec);
@@ -34,11 +59,11 @@ DECLARE_int32(tablet_delta_store_minor_compact_max);
 DEFINE_int32(num_insert_threads, 8, "Number of inserting threads to launch");
 DEFINE_int32(num_counter_threads, 8, "Number of counting threads to launch");
 DEFINE_int32(num_summer_threads, 1, "Number of summing threads to launch");
-DEFINE_int32(num_updater_threads, 1, "Number of updating threads to launch");
 DEFINE_int32(num_slowreader_threads, 1, "Number of 'slow' reader threads to launch");
 DEFINE_int32(num_flush_threads, 1, "Number of flusher reader threads to launch");
 DEFINE_int32(num_compact_threads, 1, "Number of compactor threads to launch");
 DEFINE_int32(num_undo_delta_gc_threads, 1, "Number of undo delta gc threads to launch");
+DEFINE_int32(num_updater_threads, 1, "Number of updating threads to launch");
 DEFINE_int32(num_flush_delta_threads, 1, "Number of delta flusher reader threads to launch");
 DEFINE_int32(num_minor_compact_deltas_threads, 1,
              "Number of delta minor compactor threads to launch");
@@ -116,7 +141,7 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
 
     LocalTabletWriter writer(this->tablet().get(), &this->client_schema_);
 
-    Arena tmp_arena(1024, 1024);
+    Arena tmp_arena(1024);
     RowBlock block(schema_, 1, &tmp_arena);
     faststring update_buf;
 
@@ -185,8 +210,8 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
   // Thread which iterates slowly over the first 10% of the data.
   // This is meant to test that outstanding iterators don't end up
   // trying to reference already-freed memrowset memory.
-  void SlowReaderThread(int tid) {
-    Arena arena(32*1024, 256*1024);
+  void SlowReaderThread(int /*tid*/) {
+    Arena arena(32*1024);
     RowBlock block(schema_, 1, &arena);
 
     uint64_t max_rows = this->ClampRowCount(FLAGS_inserts_per_thread * FLAGS_num_insert_threads)
@@ -219,7 +244,7 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
   }
 
   uint64_t CountSum(const shared_ptr<TimeSeries> &scanned_ts) {
-    Arena arena(1024, 1024); // unused, just scanning ints
+    Arena arena(1024); // unused, just scanning ints
 
     static const int kBufInts = 1024*1024 / 8;
     RowBlock block(valcol_projection_, kBufInts, &arena);
@@ -227,7 +252,7 @@ class MultiThreadedTabletTest : public TabletTestBase<SETUP> {
 
     uint64_t count_since_report = 0;
 
-    uint64_t sum = 0;
+    int64_t sum = 0;
 
     gscoped_ptr<RowwiseIterator> iter;
     CHECK_OK(tablet()->NewRowIterator(valcol_projection_, &iter));

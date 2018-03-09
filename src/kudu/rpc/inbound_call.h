@@ -17,16 +17,22 @@
 #ifndef KUDU_RPC_INBOUND_CALL_H
 #define KUDU_RPC_INBOUND_CALL_H
 
-#include <glog/logging.h>
+#include <cstddef>
+#include <cstdint>
+#include <memory>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
+
+#include <glog/logging.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/remote_method.h"
-#include "kudu/rpc/service_if.h"
 #include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/rpc/service_if.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/monotime.h"
@@ -35,13 +41,14 @@
 
 namespace google {
 namespace protobuf {
-class Message;
+class MessageLite;
 } // namespace protobuf
 } // namespace google
 
 namespace kudu {
 
 class Histogram;
+class Sockaddr;
 class Trace;
 
 namespace rpc {
@@ -50,7 +57,6 @@ class Connection;
 class DumpRunningRpcsRequestPB;
 class RemoteUser;
 class RpcCallInProgressPB;
-struct RpcMethodInfo;
 class RpcSidecar;
 
 struct InboundCallTiming {
@@ -119,9 +125,10 @@ class InboundCall {
                                    const google::protobuf::MessageLite& app_error_pb,
                                    ErrorStatusPB* err);
 
-  // Serialize the response packet for the finished call.
+  // Serialize the response packet for the finished call into 'slices'.
   // The resulting slices refer to memory in this object.
-  void SerializeResponseTo(std::vector<Slice>* slices) const;
+  // Returns the number of slices in the serialized response.
+  size_t SerializeResponseTo(TransferPayload* slices) const;
 
   // See RpcContext::AddRpcSidecar()
   Status AddOutboundSidecar(std::unique_ptr<RpcSidecar> car, int* idx);

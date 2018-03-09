@@ -16,12 +16,15 @@
 // under the License.
 #pragma once
 
+#include <cstdint>
 #include <memory>
 #include <string>
 
+#include <gtest/gtest_prod.h>
+
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/security/crypto.h"
-#include "kudu/security/openssl_util.h"
 #include "kudu/security/token.pb.h"
 #include "kudu/util/status.h"
 
@@ -34,7 +37,7 @@ namespace security {
 // This represents a standalone public key useful for token verification.
 class TokenSigningPublicKey {
  public:
-  explicit TokenSigningPublicKey(const TokenSigningPublicKeyPB& pb);
+  explicit TokenSigningPublicKey(TokenSigningPublicKeyPB pb);
   ~TokenSigningPublicKey();
 
   const TokenSigningPublicKeyPB& pb() const {
@@ -81,6 +84,8 @@ class TokenSigningPrivateKey {
   int64_t expire_time() const { return expire_time_; }
 
  private:
+  FRIEND_TEST(TokenTest, TestAddKeyConstraints);
+
   std::unique_ptr<PrivateKey> key_;
   // The 'private_key_der_' is a serialized 'key_' in DER format: just a cache.
   std::string private_key_der_;

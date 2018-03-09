@@ -17,15 +17,25 @@
 
 #include "kudu/common/column_predicate.h"
 
+#include <cmath>
+#include <cstdint>
+#include <string>
 #include <vector>
 
-#include <gflags/gflags_declare.h>
-#include <glog/logging.h>
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
 #include <gtest/gtest.h>
 
+#include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/test_util.h"
+
+using std::vector;
 
 namespace kudu {
 
@@ -794,7 +804,7 @@ TEST_F(TestColumnPredicate, TestRangeConstructor) {
 // Test that the inclusive range constructor handles transforming to exclusive
 // upper bound correctly.
 TEST_F(TestColumnPredicate, TestInclusiveRange) {
-  Arena arena(1024, 1024 * 1024);
+  Arena arena(1024);
   {
     ColumnSchema column("c", INT32);
     int32_t zero = 0;
@@ -838,7 +848,7 @@ TEST_F(TestColumnPredicate, TestInclusiveRange) {
 // Test that the exclusive range constructor handles transforming to inclusive
 // lower bound correctly.
 TEST_F(TestColumnPredicate, TestExclusive) {
-  Arena arena(1024, 1024 * 1024);
+  Arena arena(1024);
   {
     ColumnSchema column("c", INT32);
     int32_t zero = 0;
@@ -880,6 +890,9 @@ TEST_F(TestColumnPredicate, TestLess) {
     ColumnSchema micros("micros", UNIXTIME_MICROS);
     ColumnSchema f32("f32", FLOAT);
     ColumnSchema f64("f64", DOUBLE);
+    ColumnSchema d32("d32", DECIMAL32);
+    ColumnSchema d64("d64", DECIMAL64);
+    ColumnSchema d128("d128", DECIMAL128);
     ColumnSchema string("string", STRING);
     ColumnSchema binary("binary", BINARY);
 
@@ -905,6 +918,15 @@ TEST_F(TestColumnPredicate, TestLess) {
               ColumnPredicate::Range(f64, nullptr, TypeTraits<DOUBLE>::min_value())
                               .predicate_type());
     ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::Range(d32, nullptr, TypeTraits<DECIMAL32>::min_value())
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::Range(d64, nullptr, TypeTraits<DECIMAL64>::min_value())
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::None,
+              ColumnPredicate::Range(d128, nullptr, TypeTraits<DECIMAL128>::min_value())
+                               .predicate_type());
+    ASSERT_EQ(PredicateType::None,
               ColumnPredicate::Range(string, nullptr, TypeTraits<STRING>::min_value())
                               .predicate_type());
     ASSERT_EQ(PredicateType::None,
@@ -920,6 +942,9 @@ TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
     ColumnSchema micros("micros", UNIXTIME_MICROS);
     ColumnSchema f32("f32", FLOAT);
     ColumnSchema f64("f64", DOUBLE);
+    ColumnSchema d32("d32", DECIMAL32);
+    ColumnSchema d64("d64", DECIMAL64);
+    ColumnSchema d128("d128", DECIMAL128);
     ColumnSchema string("string", STRING);
     ColumnSchema binary("binary", BINARY);
 
@@ -943,6 +968,15 @@ TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
                               .predicate_type());
     ASSERT_EQ(PredicateType::IsNotNull,
               ColumnPredicate::Range(f64, TypeTraits<DOUBLE>::min_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::IsNotNull,
+              ColumnPredicate::Range(d32, TypeTraits<DECIMAL32>::min_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::IsNotNull,
+              ColumnPredicate::Range(d64, TypeTraits<DECIMAL64>::min_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::IsNotNull,
+              ColumnPredicate::Range(d128, TypeTraits<DECIMAL128>::min_value(), nullptr)
                               .predicate_type());
     ASSERT_EQ(PredicateType::IsNotNull,
               ColumnPredicate::Range(string, TypeTraits<STRING>::min_value(), nullptr)
@@ -971,6 +1005,15 @@ TEST_F(TestColumnPredicate, TestGreaterThanEquals) {
                               .predicate_type());
     ASSERT_EQ(PredicateType::Equality,
               ColumnPredicate::Range(f64, TypeTraits<DOUBLE>::max_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::Equality,
+              ColumnPredicate::Range(d32, TypeTraits<DECIMAL32>::max_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::Equality,
+              ColumnPredicate::Range(d64, TypeTraits<DECIMAL64>::max_value(), nullptr)
+                              .predicate_type());
+    ASSERT_EQ(PredicateType::Equality,
+              ColumnPredicate::Range(d128, TypeTraits<DECIMAL128>::max_value(), nullptr)
                               .predicate_type());
 
     Slice s = "foo";
@@ -1045,11 +1088,15 @@ TEST_F(TestColumnPredicate, TestSelectivity) {
   int64_t one_64 = 1;
   double_t one_d = 1.0;
   Slice one_s("one", 3);
+  int128_t one_dec = 1;
 
   ColumnSchema column_i32("a", INT32, true);
   ColumnSchema column_i64("b", INT64, true);
   ColumnSchema column_d("c", DOUBLE, true);
   ColumnSchema column_s("d", STRING, true);
+  ColumnSchema column_d32("e", DECIMAL32, true);
+  ColumnSchema column_d64("f", DECIMAL64, true);
+  ColumnSchema column_d128("g", DECIMAL128, true);
 
   // Predicate type
   ASSERT_LT(SelectivityComparator(ColumnPredicate::IsNull(column_i32),
@@ -1063,6 +1110,15 @@ TEST_F(TestColumnPredicate, TestSelectivity) {
             0);
   ASSERT_LT(SelectivityComparator(ColumnPredicate::Range(column_i32, &one_32, nullptr),
                                   ColumnPredicate::IsNotNull(column_i32)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Range(column_d32, &one_dec, nullptr),
+                                  ColumnPredicate::IsNotNull(column_d32)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Range(column_d64, &one_dec, nullptr),
+                                  ColumnPredicate::IsNotNull(column_d64)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Range(column_d128, &one_dec, nullptr),
+                                  ColumnPredicate::IsNotNull(column_d128)),
             0);
 
   // Size of column type
@@ -1081,13 +1137,28 @@ TEST_F(TestColumnPredicate, TestSelectivity) {
   ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_d, &one_d),
                                   ColumnPredicate::Equality(column_s, &one_s)),
             0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_d32, &one_dec),
+                                  ColumnPredicate::Equality(column_i64, &one_64)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_d32, &one_dec),
+                                  ColumnPredicate::Equality(column_d, &one_d)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_i32, &one_32),
+                                  ColumnPredicate::Equality(column_s, &one_s)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_d32, &one_dec),
+                                  ColumnPredicate::Equality(column_d64, &one_dec)),
+            0);
+  ASSERT_LT(SelectivityComparator(ColumnPredicate::Equality(column_d64, &one_dec),
+                                  ColumnPredicate::Equality(column_d128, &one_dec)),
+            0);
 }
 
 TEST_F(TestColumnPredicate, TestRedaction) {
   ASSERT_NE("", gflags::SetCommandLineOption("redact", "log"));
   ColumnSchema column_i32("a", INT32, true);
   int32_t one_32 = 1;
-  ASSERT_EQ("`a` = <redacted>", ColumnPredicate::Equality(column_i32, &one_32).ToString());
+  ASSERT_EQ("a = <redacted>", ColumnPredicate::Equality(column_i32, &one_32).ToString());
 }
 
 } // namespace kudu

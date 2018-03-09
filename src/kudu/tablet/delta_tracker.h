@@ -17,27 +17,42 @@
 #ifndef KUDU_TABLET_DELTATRACKER_H
 #define KUDU_TABLET_DELTATRACKER_H
 
-#include <gtest/gtest_prod.h>
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/common/iterator.h"
+#include <gtest/gtest_prod.h>
+
 #include "kudu/common/rowid.h"
-#include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/tablet/cfile_set.h"
+#include "kudu/tablet/delta_key.h"
 #include "kudu/tablet/delta_store.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
 #include "kudu/util/atomic.h"
+#include "kudu/util/locks.h"
+#include "kudu/util/mutex.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
-class MemTracker;
+class BlockId;
+class ColumnwiseIterator;
+class MonoTime;
+class RowChangeList;
+class Schema;
+class Timestamp;
+struct ColumnId;
 
 namespace consensus {
 class OpId;
+}
+
+namespace fs {
+class WritableBlock;
 }
 
 namespace log {
@@ -46,10 +61,12 @@ class LogAnchorRegistry;
 
 namespace tablet {
 
-class DeltaMemStore;
 class DeltaFileReader;
+class DeltaMemStore;
+class MvccSnapshot;
 class OperationResultPB;
-class MemStoreTargetPB;
+class RowSetMetadata;
+class RowSetMetadataUpdate;
 struct ProbeStats;
 
 // The DeltaTracker is the part of a DiskRowSet which is responsible for
@@ -66,7 +83,6 @@ class DeltaTracker {
   };
 
   static Status Open(const std::shared_ptr<RowSetMetadata>& rowset_metadata,
-                     rowid_t num_rows,
                      log::LogAnchorRegistry* log_anchor_registry,
                      const TabletMemTrackers& mem_trackers,
                      gscoped_ptr<DeltaTracker>* delta_tracker);
@@ -144,14 +160,15 @@ class DeltaTracker {
   // and if so, compact the stores.
   Status Compact();
 
-  // Persist the given delta updates to disk and then make them visible via the
-  // DeltaTracker. The 'compact_flush_lock_' should be acquired before calling
-  // this method. This method should only be used for compactions or ancient
-  // history data GC, not when adding mutations, since it makes the updated
-  // stores visible before attempting to flush the metadata to disk.
+  // Updates the in-memory list of delta stores and then persists the updated
+  // metadata. This should only be used for compactions or ancient history
+  // data GC, not when adding mutations, since it makes the updated stores
+  // visible before attempting to flush the metadata to disk.
+  //
+  // The 'compact_flush_lock_' should be acquired before calling this method.
   Status CommitDeltaStoreMetadataUpdate(const RowSetMetadataUpdate& update,
                                         const SharedDeltaStoreVector& to_remove,
-                                        const vector<BlockId>& new_delta_blocks,
+                                        const std::vector<BlockId>& new_delta_blocks,
                                         DeltaType type,
                                         MetadataFlushType flush_type);
 
@@ -175,29 +192,35 @@ class DeltaTracker {
   Status DeleteAncientUndoDeltas(Timestamp ancient_history_mark,
                                  int64_t* blocks_deleted, int64_t* bytes_deleted);
 
-  // Validate that 'first' may precede 'second' in an ordered list of deltas,
-  // given a delta type of 'type'. This should only be run in DEBUG mode.
-  void ValidateDeltaOrder(const std::shared_ptr<DeltaStore>& first,
-                          const std::shared_ptr<DeltaStore>& second,
+  // Opens the input 'blocks' of type 'type' and returns the opened delta file
+  // readers in 'stores'.
+  Status OpenDeltaReaders(const std::vector<BlockId>& blocks,
+                          std::vector<std::shared_ptr<DeltaStore> >* stores,
                           DeltaType type);
 
-  // Validate the relative ordering of the deltas in the specified list. This
-  // should only be run in DEBUG mode.
-  void ValidateDeltasOrdered(const SharedDeltaStoreVector& list, DeltaType type);
+  // Validates that 'first' may precede 'second' in an ordered list of deltas,
+  // given a delta type of 'type'. This should only be run in DEBUG mode.
+  //
+  // Crashes if there is an ordering violation, and returns an error if the
+  // validation could not be performed.
+  Status ValidateDeltaOrder(const std::shared_ptr<DeltaStore>& first,
+                            const std::shared_ptr<DeltaStore>& second,
+                            DeltaType type);
 
-  // Replace the subsequence of stores that matches 'stores_to_replace' with
+  // Validates the relative ordering of the deltas in the specified list. This
+  // should only be run in DEBUG mode.
+  //
+  // Crashes if there is an ordering violation, and returns an error if the
+  // validation could not be performed.
+  Status ValidateDeltasOrdered(const SharedDeltaStoreVector& list, DeltaType type);
+
+  // Replaces the subsequence of stores that matches 'stores_to_replace' with
   // delta file readers corresponding to 'new_delta_blocks', which may be empty.
   // If 'stores_to_replace' is empty then the stores represented by
   // 'new_delta_blocks' are prepended to the relevant delta stores list.
-  Status AtomicUpdateStores(const SharedDeltaStoreVector& stores_to_replace,
-                            const std::vector<BlockId>& new_delta_blocks,
-                            DeltaType type);
-
-  // Return the number of rows encompassed by this DeltaTracker. Note that
-  // this is _not_ the number of updated rows, but rather the number of rows
-  // in the associated CFileSet base data. All updates must have a rowid
-  // strictly less than num_rows().
-  int64_t num_rows() const { return num_rows_; }
+  void AtomicUpdateStores(const SharedDeltaStoreVector& stores_to_replace,
+                          const SharedDeltaStoreVector& new_stores,
+                          DeltaType type);
 
   // Get the delta MemStore's size in bytes, including pre-allocation.
   size_t DeltaMemStoreSize() const;
@@ -216,7 +239,11 @@ class DeltaTracker {
   // Return the number of redo delta stores, not including the DeltaMemStore.
   size_t CountRedoDeltaStores() const;
 
-  uint64_t EstimateOnDiskSize() const;
+  // Return the size on-disk of UNDO deltas, in bytes.
+  uint64_t UndoDeltaOnDiskSize() const;
+
+  // Return the size on-disk of REDO deltas, in bytes.
+  uint64_t RedoDeltaOnDiskSize() const;
 
   // Retrieves the list of column indexes that currently have updates.
   void GetColumnIdsWithUpdates(std::vector<ColumnId>* col_ids) const;
@@ -224,6 +251,12 @@ class DeltaTracker {
   Mutex* compact_flush_lock() {
     return &compact_flush_lock_;
   }
+
+  // Returns an error if the delta tracker has been marked read-only.
+  // Else, returns OK.
+  //
+  // 'compact_flush_lock_' must be held when this is called.
+  Status CheckWritableUnlocked() const;
 
   // Init() all of the specified delta stores. For tests only.
   Status InitAllDeltaStoresForTests(WhichStores stores);
@@ -236,21 +269,17 @@ class DeltaTracker {
   FRIEND_TEST(TestMajorDeltaCompaction, TestCompact);
 
   DeltaTracker(std::shared_ptr<RowSetMetadata> rowset_metadata,
-               rowid_t num_rows, log::LogAnchorRegistry* log_anchor_registry,
-               const TabletMemTrackers& mem_trackers);
+               log::LogAnchorRegistry* log_anchor_registry,
+               TabletMemTrackers mem_trackers);
 
   Status DoOpen();
-
-  Status OpenDeltaReaders(const std::vector<BlockId>& blocks,
-                          std::vector<std::shared_ptr<DeltaStore> >* stores,
-                          DeltaType type);
 
   Status FlushDMS(DeltaMemStore* dms,
                   std::shared_ptr<DeltaFileReader>* dfr,
                   MetadataFlushType flush_type);
 
   // This collects undo and/or redo stores into '*stores'.
-  void CollectStores(vector<std::shared_ptr<DeltaStore>>* stores,
+  void CollectStores(std::vector<std::shared_ptr<DeltaStore>>* stores,
                      WhichStores which) const;
 
   // Performs the actual compaction. Results of compaction are written to "block",
@@ -261,8 +290,8 @@ class DeltaTracker {
   // exclusive lock on 'compact_flush_lock_' before calling this
   // method in order to protect 'redo_delta_stores_'.
   Status DoCompactStores(size_t start_idx, size_t end_idx,
-                         gscoped_ptr<fs::WritableBlock> block,
-                         vector<std::shared_ptr<DeltaStore> > *compacted_stores,
+                         std::unique_ptr<fs::WritableBlock> block,
+                         std::vector<std::shared_ptr<DeltaStore>>* compacted_stores,
                          std::vector<BlockId>* compacted_blocks);
 
   // Creates a merge delta iterator and captures the delta stores and
@@ -276,20 +305,22 @@ class DeltaTracker {
   // race on 'redo_delta_stores_'.
   Status MakeDeltaIteratorMergerUnlocked(size_t start_idx, size_t end_idx,
                                          const Schema* schema,
-                                         vector<std::shared_ptr<DeltaStore > > *target_stores,
-                                         vector<BlockId> *target_blocks,
+                                         std::vector<std::shared_ptr<DeltaStore > > *target_stores,
+                                         std::vector<BlockId> *target_blocks,
                                          std::unique_ptr<DeltaIterator> *out);
 
   std::string LogPrefix() const;
 
   std::shared_ptr<RowSetMetadata> rowset_metadata_;
 
-  // The number of rows in the DiskRowSet that this tracker is associated with.
-  // This is just used for assertions to make sure that we don't update a row
-  // which doesn't exist.
-  rowid_t num_rows_;
-
   bool open_;
+
+  // Certain errors (e.g. failed delta tracker flushes) may leave the delta
+  // store lists in a state such that it would be unsafe to run further
+  // maintenance ops.
+  //
+  // Must be checked immediately after locking compact_flush_lock_.
+  bool read_only_;
 
   log::LogAnchorRegistry* log_anchor_registry_;
 

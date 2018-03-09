@@ -15,14 +15,17 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include "kudu/cfile/block_compression.h"
+
+#include <cstring>
+
 #include <glog/logging.h>
-#include <algorithm>
 #include <gflags/gflags.h>
 
-#include "kudu/cfile/block_compression.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/coding-inl.h"
 #include "kudu/util/coding.h"
+#include "kudu/util/coding-inl.h"
 #include "kudu/util/compression/compression_codec.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
@@ -164,7 +167,7 @@ Status CompressedBlockDecoder::Init() {
   if (uncompressed_size_ > FLAGS_max_cfile_block_size) {
     return Status::Corruption(
       Substitute("uncompressed size $0 overflows the maximum length $1, buffer",
-                 compressed_size, FLAGS_max_cfile_block_size),
+                 uncompressed_size_, FLAGS_max_cfile_block_size),
       KUDU_REDACT(data_.ToDebugString(50)));
   }
 

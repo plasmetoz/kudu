@@ -15,22 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <sys/statvfs.h>
 #include <sys/time.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cstdint>
+#include <cerrno>
 #include <memory>
+#include <string>
 #include <unordered_set>
+#include <vector>
 
-#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <glog/stl_logging.h>
+#include <gtest/gtest.h>
 
-#include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/gutil/walltime.h"
+#include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
 #include "kudu/util/path_util.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
@@ -39,6 +45,7 @@ DECLARE_int64(disk_reserved_bytes_free_for_testing);
 using std::string;
 using std::unique_ptr;
 using std::unordered_set;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
@@ -63,7 +70,7 @@ TEST_F(EnvUtilTest, TestDiskSpaceCheck) {
 
   // Check 1% reservation logic. We loop this in case there are other FS
   // operations happening concurrent with this test.
-  AssertEventually([&] {
+  ASSERT_EVENTUALLY([&] {
     SpaceInfo space_info;
     ASSERT_OK(env_->GetSpaceInfo(test_dir_, &space_info));
     // Try for 1 less byte than 1% free. This request should be rejected.
@@ -163,6 +170,22 @@ TEST_F(EnvUtilTest, TestDeleteExcessFilesByPattern) {
   unordered_set<string> children_set(children.begin(), children.end());
   unordered_set<string> expected_set({".", "..", "c", "d"});
   ASSERT_EQ(expected_set, children_set) << children;
+}
+
+TEST_F(EnvUtilTest, TestIsDirectoryEmpty) {
+  const string kDir = JoinPathSegments(test_dir_, "foo");
+  const string kFile = JoinPathSegments(kDir, "bar");
+
+  bool is_empty;
+  ASSERT_TRUE(env_util::IsDirectoryEmpty(env_, kDir, &is_empty).IsNotFound());
+  ASSERT_OK(env_->CreateDir(kDir));
+  ASSERT_OK(env_util::IsDirectoryEmpty(env_, kDir, &is_empty));
+  ASSERT_TRUE(is_empty);
+
+  unique_ptr<WritableFile> file;
+  ASSERT_OK(env_->NewWritableFile(WritableFileOptions(), kFile, &file));
+  ASSERT_OK(env_util::IsDirectoryEmpty(env_, kDir, &is_empty));
+  ASSERT_FALSE(is_empty);
 }
 
 } // namespace env_util

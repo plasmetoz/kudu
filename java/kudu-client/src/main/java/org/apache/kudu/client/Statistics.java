@@ -17,18 +17,14 @@
 
 package org.apache.kudu.client;
 
-import java.nio.charset.Charset;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.atomic.AtomicLongArray;
 
 import com.google.common.collect.Sets;
-
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
-import org.apache.kudu.util.Slice;
-import org.apache.kudu.util.Slices;
-
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 /**
  * A Statistics belongs to a specific AsyncKuduClient. It stores client-level
@@ -101,8 +97,7 @@ public class Statistics {
    * @return the value of the statistic
    */
   public long getTabletStatistic(String tabletId, Statistic statistic) {
-    Slice tabletIdAsSlice = Slices.copiedBuffer(tabletId, Charset.defaultCharset());
-    TabletStatistics tabletStatistics = stsMap.get(tabletIdAsSlice);
+    TabletStatistics tabletStatistics = stsMap.get(tabletId);
     if (tabletStatistics == null) {
       return 0;
     } else {
@@ -147,7 +142,17 @@ public class Statistics {
    */
   public Set<String> getTabletSet() {
     Set<String> tablets = Sets.newHashSet();
-    for (String tablet : stsMap.keySet()) {
+    // This cast forces the compiler to invoke Map.keySet() rather than
+    // ConcurrentHashMap's override, which is critical because when this code
+    // is built with JDK8, ConcurrentHashMap.keySet() introduces a dependency
+    // on a Java 8 only API.
+    //
+    // Note: an alternative would be to always access stsMap as a Map, but that
+    // just moves the problem to the putIfAbsent() call in getTabletStatistics(),
+    // which is only a Map method in Java 8.
+    //
+    // See KUDU-2188 for details.
+    for (String tablet : ((Map<String, Statistics.TabletStatistics>) stsMap).keySet()) {
       tablets.add(tablet);
     }
     return tablets;
@@ -173,8 +178,7 @@ public class Statistics {
    * @return table name
    */
   public String getTableName(String tabletId) {
-    Slice tabletIdAsSlice = Slices.copiedBuffer(tabletId, Charset.defaultCharset());
-    TabletStatistics tabletStatistics = stsMap.get(tabletIdAsSlice);
+    TabletStatistics tabletStatistics = stsMap.get(tabletId);
     if (tabletStatistics == null) {
       return null;
     } else {

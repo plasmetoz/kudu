@@ -17,33 +17,42 @@
 
 #include "kudu/consensus/peer_manager.h"
 
+#include <memory>
 #include <mutex>
+#include <ostream>
+#include <type_traits>
+#include <utility>
+
+#include <glog/logging.h>
 
 #include "kudu/consensus/consensus_peers.h"
 #include "kudu/consensus/log.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
-#include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/threadpool.h"
+
+using kudu::log::Log;
+using kudu::pb_util::SecureShortDebugString;
+using strings::Substitute;
 
 namespace kudu {
 namespace consensus {
-
-using log::Log;
-using strings::Substitute;
 
 PeerManager::PeerManager(std::string tablet_id,
                          std::string local_uuid,
                          PeerProxyFactory* peer_proxy_factory,
                          PeerMessageQueue* queue,
-                         ThreadPool* request_thread_pool,
+                         ThreadPoolToken* raft_pool_token,
                          const scoped_refptr<log::Log>& log)
     : tablet_id_(std::move(tablet_id)),
       local_uuid_(std::move(local_uuid)),
       peer_proxy_factory_(peer_proxy_factory),
       queue_(queue),
-      thread_pool_(request_thread_pool),
+      raft_pool_token_(raft_pool_token),
       log_(log) {
 }
 
@@ -74,8 +83,9 @@ Status PeerManager::UpdateRaftConfig(const RaftConfigPB& config) {
                                       tablet_id_,
                                       local_uuid_,
                                       queue_,
-                                      thread_pool_,
+                                      raft_pool_token_,
                                       std::move(peer_proxy),
+                                      peer_proxy_factory_->messenger(),
                                       &remote_peer));
     peers_.emplace(peer_pb.permanent_uuid(), std::move(remote_peer));
   }

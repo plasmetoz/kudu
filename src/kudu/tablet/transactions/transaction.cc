@@ -17,6 +17,8 @@
 
 #include "kudu/tablet/transactions/transaction.h"
 
+#include "kudu/rpc/result_tracker.h"
+
 namespace kudu {
 namespace tablet {
 
@@ -28,11 +30,11 @@ Transaction::Transaction(TransactionState* state, DriverType type, TransactionTy
       tx_type_(tx_type) {
 }
 
-TransactionState::TransactionState(TabletPeer* tablet_peer)
-    : tablet_peer_(tablet_peer),
+TransactionState::TransactionState(TabletReplica* tablet_replica)
+    : tablet_replica_(tablet_replica),
       completion_clbk_(new TransactionCompletionCallback()),
       timestamp_error_(0),
-      arena_(1024, 4 * 1024 * 1024),
+      arena_(1024),
       external_consistency_mode_(CLIENT_PROPAGATED) {
 }
 

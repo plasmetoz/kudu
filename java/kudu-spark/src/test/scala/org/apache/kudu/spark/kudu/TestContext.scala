@@ -16,30 +16,34 @@
  */
 package org.apache.kudu.spark.kudu
 
+import java.math.BigDecimal
 import java.util.Date
 
 import scala.collection.JavaConverters._
 import scala.collection.immutable.IndexedSeq
 
 import com.google.common.collect.ImmutableList
-import org.apache.spark.{SparkConf, SparkContext}
+import org.apache.spark.SparkConf
 import org.scalatest.{BeforeAndAfterAll, Suite}
 
 import org.apache.kudu.ColumnSchema.ColumnSchemaBuilder
+import org.apache.kudu.ColumnTypeAttributes.ColumnTypeAttributesBuilder
 import org.apache.kudu.client.KuduClient.KuduClientBuilder
 import org.apache.kudu.client.MiniKuduCluster.MiniKuduClusterBuilder
 import org.apache.kudu.client.{CreateTableOptions, KuduClient, KuduTable, MiniKuduCluster}
 import org.apache.kudu.{Schema, Type}
+import org.apache.kudu.util.DecimalUtil
+import org.apache.spark.sql.SparkSession
 
 trait TestContext extends BeforeAndAfterAll { self: Suite =>
 
-  var sc: SparkContext = null
-  var miniCluster: MiniKuduCluster = null
-  var kuduClient: KuduClient = null
-  var table: KuduTable = null
-  var kuduContext: KuduContext = null
+  var ss: SparkSession = _
+  var miniCluster: MiniKuduCluster = _
+  var kuduClient: KuduClient = _
+  var table: KuduTable = _
+  var kuduContext: KuduContext = _
 
-  val tableName = "test"
+  val tableName: String = "test"
 
   lazy val schema: Schema = {
     val columns = ImmutableList.of(
@@ -53,13 +57,25 @@ trait TestContext extends BeforeAndAfterAll { self: Suite =>
       new ColumnSchemaBuilder("c7_float", Type.FLOAT).build(),
       new ColumnSchemaBuilder("c8_binary", Type.BINARY).build(),
       new ColumnSchemaBuilder("c9_unixtime_micros", Type.UNIXTIME_MICROS).build(),
-      new ColumnSchemaBuilder("c10_byte", Type.INT8).build())
-    new Schema(columns)
+      new ColumnSchemaBuilder("c10_byte", Type.INT8).build(),
+      new ColumnSchemaBuilder("c11_decimal32", Type.DECIMAL)
+        .typeAttributes(
+          new ColumnTypeAttributesBuilder().precision(DecimalUtil.MAX_DECIMAL32_PRECISION).build()
+        ).build(),
+      new ColumnSchemaBuilder("c12_decimal64", Type.DECIMAL)
+        .typeAttributes(
+          new ColumnTypeAttributesBuilder().precision(DecimalUtil.MAX_DECIMAL64_PRECISION).build()
+        ).build(),
+      new ColumnSchemaBuilder("c13_decimal128", Type.DECIMAL)
+        .typeAttributes(
+          new ColumnTypeAttributesBuilder().precision(DecimalUtil.MAX_DECIMAL128_PRECISION).build()
+        ).build())
+      new Schema(columns)
   }
 
-  val appID = new Date().toString + math.floor(math.random * 10E4).toLong.toString
+  val appID: String = new Date().toString + math.floor(math.random * 10E4).toLong.toString
 
-  val conf = new SparkConf().
+  val conf: SparkConf = new SparkConf().
     setMaster("local[*]").
     setAppName("test").
     set("spark.ui.enabled", "false").
@@ -70,14 +86,12 @@ trait TestContext extends BeforeAndAfterAll { self: Suite =>
       .numMasters(1)
       .numTservers(1)
       .build()
-    val envMap = Map[String,String](("Xmx", "512m"))
 
-    sc = new SparkContext(conf)
+    ss = SparkSession.builder().config(conf).getOrCreate()
 
     kuduClient = new KuduClientBuilder(miniCluster.getMasterAddresses).build()
-    assert(miniCluster.waitForTabletServers(1))
 
-    kuduContext = new KuduContext(miniCluster.getMasterAddresses)
+    kuduContext = new KuduContext(miniCluster.getMasterAddresses, ss.sparkContext)
 
     val tableOptions = new CreateTableOptions().setRangePartitionColumns(List("key").asJava)
                                                .setNumReplicas(1)
@@ -87,7 +101,7 @@ trait TestContext extends BeforeAndAfterAll { self: Suite =>
   override def afterAll() {
     if (kuduClient != null) kuduClient.shutdown()
     if (miniCluster != null) miniCluster.shutdown()
-    if (sc != null) sc.stop()
+    if (ss != null) ss.stop()
   }
 
   def deleteRow(key: Int): Unit = {
@@ -110,10 +124,13 @@ trait TestContext extends BeforeAndAfterAll { self: Suite =>
       row.addBoolean(5, i%2==1)
       row.addShort(6, i.toShort)
       row.addFloat(7, i.toFloat)
-      row.addBinary(8, s"bytes ${i}".getBytes())
+      row.addBinary(8, s"bytes $i".getBytes())
       val ts = System.currentTimeMillis() * 1000
       row.addLong(9, ts)
       row.addByte(10, i.toByte)
+      row.addDecimal(11, BigDecimal.valueOf(i))
+      row.addDecimal(12, BigDecimal.valueOf(i))
+      row.addDecimal(13, BigDecimal.valueOf(i))
 
       // Sprinkling some nulls so that queries see them.
       val s = if (i % 2 == 0) {

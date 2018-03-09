@@ -17,34 +17,45 @@
 
 #include "kudu/codegen/module_builder.h"
 
-#include <cstdlib>
+#include <cstdint>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
+
+// NOTE: among the headers below, the MCJIT.h header file is needed
+//       for successful run-time operation of the code generator.
 #include <glog/logging.h>
+#include <llvm/ADT/StringMap.h>
 #include <llvm/ADT/StringRef.h>
-#include <llvm/Analysis/Passes.h>
 #include <llvm/ExecutionEngine/ExecutionEngine.h>
-#include <llvm/ExecutionEngine/MCJIT.h>
+#include <llvm/ExecutionEngine/MCJIT.h> // IWYU pragma: keep
+#include <llvm/IR/Constant.h>
+#include <llvm/IR/Constants.h>
 #include <llvm/IR/DerivedTypes.h>
 #include <llvm/IR/Function.h>
 #include <llvm/IR/GlobalValue.h>
-#include <llvm/IR/IRBuilder.h>
-#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/LLVMContext.h>
+#include <llvm/IR/LegacyPassManager.h>
 #include <llvm/IR/Module.h>
 #include <llvm/IR/Type.h>
 #include <llvm/IRReader/IRReader.h>
+#include <llvm/Pass.h>
+#include <llvm/Support/CodeGen.h>
+#include <llvm/Support/Host.h>
 #include <llvm/Support/MemoryBuffer.h>
-#include <llvm/Support/raw_os_ostream.h>
 #include <llvm/Support/SourceMgr.h>
+#include <llvm/Support/raw_os_ostream.h>
+#include <llvm/Support/raw_ostream.h>
+#include <llvm/Target/TargetMachine.h>
 #include <llvm/Transforms/IPO.h>
+#include <llvm/Transforms/IPO/AlwaysInliner.h>
 #include <llvm/Transforms/IPO/PassManagerBuilder.h>
 
 #include "kudu/codegen/precompiled.ll.h"
-#include "kudu/gutil/macros.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/status.h"
@@ -210,16 +221,33 @@ void ModuleBuilder::AddJITPromise(llvm::Function* llvm_f,
 
 namespace {
 
-#if CODEGEN_MODULE_BUILDER_DO_OPTIMIZATIONS
-
-void DoOptimizations(ExecutionEngine* engine,
-                     Module* module,
+void DoOptimizations(Module* module,
                      const unordered_set<string>& external_functions) {
   PassManagerBuilder pass_builder;
-  pass_builder.OptLevel = 2;
   // Don't optimize for code size (this corresponds to -O2/-O3)
   pass_builder.SizeLevel = 0;
-  pass_builder.Inliner = llvm::createFunctionInliningPass();
+#if CODEGEN_MODULE_BUILDER_DO_OPTIMIZATIONS
+  pass_builder.OptLevel = 2;
+  pass_builder.Inliner = llvm::createFunctionInliningPass(pass_builder.OptLevel,
+                                                          pass_builder.SizeLevel);
+#else
+  // Even if we don't want to do optimizations, we have to run the "AlwaysInliner" pass.
+  // This pass ensures that any functions marked 'always_inline' are inlined, but nothing
+  // else.
+  //
+  // If we don't, the following happens:
+  // - symbols in libc++ (eg _ZNKSt3__19basic_iosIcNS_11char_traitsIcEEE5rdbufEv) are
+  //   marked as __attribute__((always_inline)) in the header.
+  // - those symbols end up included with 'local' visibility in libc++.so, since the compiler
+  //   knows that all call sites should inline them.
+  // - if we don't run any inliner at all, then our generated code generates LLVM
+  //   'invoke' instructions to try to call these external functions, despite them
+  //   being marked 'always_inline'.
+  // - these 'invoke' instructions fail to link at runtime since they can't find the
+  //   dynamic symbol (due to its local visibility)
+  pass_builder.OptLevel = 0;
+  pass_builder.Inliner = llvm::createAlwaysInlinerLegacyPass();
+#endif
 
   FunctionPassManager fpm(module);
   pass_builder.populateFunctionPassManager(fpm);
@@ -239,14 +267,22 @@ void DoOptimizations(ExecutionEngine* engine,
   module_passes.add(llvm::createInternalizePass([&](const GlobalValue& v) {
     return ContainsKey(external_functions, v.getGlobalIdentifier());
   }));
+
+  // Run Global Dead Code Elimination.
+  //
+  // This is responsible for removing any unreferenced functions. This is
+  // important to do even in -O0 to workaround an issue we see when our generated
+  // functions are actually empty. In that case, for whatever reason (perhaps a bug in LLVM?)
+  // the compiled module would try to include versions of functions with calls to
+  // other functions marked "alwaysinline". The latter functions would not get linked
+  // in our compiled module, and then the module would fail to load.
+  module_passes.add(llvm::createGlobalDCEPass());
   pass_builder.populateModulePassManager(module_passes);
 
   // Same as above, the result here just indicates whether optimization made any changes.
   // Don't need to check it.
   ignore_result(module_passes.run(*module));
 }
-
-#endif
 
 vector<string> GetHostCPUAttrs() {
   // LLVM's ExecutionEngine expects features to be enabled or disabled with a list
@@ -288,9 +324,7 @@ Status ModuleBuilder::Compile(unique_ptr<ExecutionEngine>* out) {
   }
   module->setDataLayout(target_->createDataLayout());
 
-#if CODEGEN_MODULE_BUILDER_DO_OPTIMIZATIONS
-  DoOptimizations(local_engine.get(), module, GetFunctionNames());
-#endif
+  DoOptimizations(module, GetFunctionNames());
 
   // Compile the module
   local_engine->finalizeObject();

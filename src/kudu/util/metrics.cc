@@ -16,25 +16,22 @@
 // under the License.
 #include "kudu/util/metrics.h"
 
+#include <cstdlib>
 #include <iostream>
-#include <sstream>
 #include <map>
-#include <set>
+#include <utility>
 
 #include <gflags/gflags.h>
+#include <glog/logging.h>
 
-#include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/casts.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/singleton.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/hdr_histogram.h"
 #include "kudu/util/histogram.pb.h"
-#include "kudu/util/jsonwriter.h"
-#include "kudu/util/locks.h"
 #include "kudu/util/status.h"
+#include "kudu/util/string_case.h"
 
 DEFINE_int32(metrics_retirement_age_ms, 120 * 1000,
              "The minimum number of milliseconds a metric will be kept for after it is "
@@ -98,6 +95,8 @@ const char* MetricUnit::Name(Type unit) {
       return "operations";
     case kBlocks:
       return "blocks";
+    case kHoles:
+      return "holes";
     case kLogBlockContainers:
       return "log block containers";
     case kTasks:
@@ -108,6 +107,12 @@ const char* MetricUnit::Name(Type unit) {
       return "context switches";
     case kDataDirectories:
       return "data directories";
+    case kState:
+      return "state";
+    case kSessions:
+      return "sessions";
+    case kTablets:
+      return "tablets";
     default:
       DCHECK(false) << "Unknown unit with type = " << unit;
       return "UNKNOWN UNIT";
@@ -162,7 +167,8 @@ MetricEntity::MetricEntity(const MetricEntityPrototype* prototype,
                            std::string id, AttributeMap attributes)
     : prototype_(prototype),
       id_(std::move(id)),
-      attributes_(std::move(attributes)) {}
+      attributes_(std::move(attributes)),
+      published_(true) {}
 
 MetricEntity::~MetricEntity() {
 }
@@ -182,11 +188,16 @@ namespace {
 
 bool MatchMetricInList(const string& metric_name,
                        const vector<string>& match_params) {
+  string metric_name_uc;
+  ToUpperCase(metric_name, &metric_name_uc);
+
   for (const string& param : match_params) {
     // Handle wildcard.
     if (param == "*") return true;
-    // The parameter is a substring match of the metric name.
-    if (metric_name.find(param) != std::string::npos) {
+    // The parameter is a case-insensitive substring match of the metric name.
+    string param_uc;
+    ToUpperCase(param, &param_uc);
+    if (metric_name_uc.find(param_uc) != std::string::npos) {
       return true;
     }
   }
@@ -233,20 +244,27 @@ Status MetricEntity::WriteAsJson(JsonWriter* writer,
   writer->String("id");
   writer->String(id_);
 
-  writer->String("attributes");
-  writer->StartObject();
-  for (const AttributeMap::value_type& val : attrs) {
-    writer->String(val.first);
-    writer->String(val.second);
+  if (opts.include_entity_attributes) {
+    writer->String("attributes");
+    writer->StartObject();
+    for (const AttributeMap::value_type& val : attrs) {
+      writer->String(val.first);
+      writer->String(val.second);
+    }
+    writer->EndObject();
   }
-  writer->EndObject();
 
   writer->String("metrics");
   writer->StartArray();
   for (OrderedMetricMap::value_type& val : metrics) {
-    WARN_NOT_OK(val.second->WriteAsJson(writer, opts),
-                strings::Substitute("Failed to write $0 as JSON", val.first));
-
+    const auto& m = val.second;
+    if (m->ModifiedInOrAfterEpoch(opts.only_modified_in_or_after_epoch)) {
+      if (!opts.include_untouched_metrics && m->IsUntouched()) {
+        continue;
+      }
+      WARN_NOT_OK(m->WriteAsJson(writer, opts),
+                  strings::Substitute("Failed to write $0 as JSON", val.first));
+    }
   }
   writer->EndArray();
 
@@ -262,7 +280,7 @@ void MetricEntity::RetireOldMetrics() {
   for (auto it = metric_map_.begin(); it != metric_map_.end();) {
     const scoped_refptr<Metric>& metric = it->second;
 
-    if (PREDICT_TRUE(!metric->HasOneRef())) {
+    if (PREDICT_TRUE(!metric->HasOneRef() && published_)) {
       // The metric is still in use. Note that, in the case of "NeverRetire()", the metric
       // will have a ref-count of 2 because it is reffed by the 'never_retire_metrics_'
       // collection.
@@ -276,8 +294,8 @@ void MetricEntity::RetireOldMetrics() {
     }
 
     if (!metric->retire_time_.Initialized()) {
-      VLOG(3) << "Metric " << it->first << " has become un-referenced. Will retire after "
-              << "the retention interval";
+      VLOG(3) << "Metric " << it->first << " has become un-referenced or unpublished. "
+              << "Will retire after the retention interval";
       // This is the first time we've seen this metric as retirable.
       metric->retire_time_ =
           now + MonoDelta::FromMilliseconds(FLAGS_metrics_retirement_age_ms);
@@ -356,8 +374,10 @@ void MetricRegistry::RetireOldMetrics() {
   for (auto it = entities_.begin(); it != entities_.end();) {
     it->second->RetireOldMetrics();
 
-    if (it->second->num_metrics() == 0 && it->second->HasOneRef()) {
-      // No metrics and no external references to this entity, so we can retire it.
+    if (it->second->num_metrics() == 0 &&
+        (it->second->HasOneRef() || !it->second->published())) {
+      // This entity has no metrics and either has no more external references or has
+      // been marked as unpublished, so we can remove it.
       // Unlike retiring the metrics themselves, we don't wait for any timeout
       // to retire them -- we assume that that timed retention has been satisfied
       // by holding onto the metrics inside the entity.
@@ -428,7 +448,7 @@ void MetricPrototypeRegistry::WriteAsJsonAndExit() const {
 //
 // MetricPrototype
 //
-MetricPrototype::MetricPrototype(CtorArgs args) : args_(std::move(args)) {
+MetricPrototype::MetricPrototype(CtorArgs args) : args_(args) {
   MetricPrototypeRegistry::get()->AddMetric(this);
 }
 
@@ -474,6 +494,9 @@ scoped_refptr<MetricEntity> MetricRegistry::FindOrCreateEntity(
   if (!e) {
     e = new MetricEntity(prototype, id, initial_attributes);
     InsertOrDie(&entities_, id, e);
+  } else if (!e->published()) {
+    e = new MetricEntity(prototype, id, initial_attributes);
+    entities_[id] = e;
   } else {
     e->SetAttributes(initial_attributes);
   }
@@ -483,11 +506,30 @@ scoped_refptr<MetricEntity> MetricRegistry::FindOrCreateEntity(
 //
 // Metric
 //
+
+std::atomic<int64_t> Metric::g_epoch_;
+
 Metric::Metric(const MetricPrototype* prototype)
-  : prototype_(prototype) {
+    : prototype_(prototype),
+      m_epoch_(current_epoch()) {
 }
 
 Metric::~Metric() {
+}
+
+void Metric::IncrementEpoch() {
+  g_epoch_++;
+}
+
+void Metric::UpdateModificationEpochSlowPath() {
+  int64_t new_epoch, old_epoch;
+  // CAS loop to ensure that we never transition a metric's epoch backwards
+  // even if multiple threads race to update it.
+  do {
+    old_epoch = m_epoch_;
+    new_epoch = g_epoch_;
+  } while (old_epoch < new_epoch &&
+           !m_epoch_.compare_exchange_weak(old_epoch, new_epoch));
 }
 
 //
@@ -521,6 +563,7 @@ std::string StringGauge::value() const {
 }
 
 void StringGauge::set_value(const std::string& value) {
+  UpdateModificationEpoch();
   std::lock_guard<simple_spinlock> l(lock_);
   value_ = value;
 }
@@ -550,6 +593,7 @@ void Counter::Increment() {
 }
 
 void Counter::IncrementBy(int64_t amount) {
+  UpdateModificationEpoch();
   value_.IncrementBy(amount);
 }
 
@@ -599,10 +643,12 @@ Histogram::Histogram(const HistogramPrototype* proto)
 }
 
 void Histogram::Increment(int64_t value) {
+  UpdateModificationEpoch();
   histogram_->Increment(value);
 }
 
 void Histogram::IncrementBy(int64_t value, int64_t amount) {
+  UpdateModificationEpoch();
   histogram_->IncrementBy(value, amount);
 }
 
@@ -617,34 +663,50 @@ Status Histogram::WriteAsJson(JsonWriter* writer,
 
 Status Histogram::GetHistogramSnapshotPB(HistogramSnapshotPB* snapshot_pb,
                                          const MetricJsonOptions& opts) const {
-  HdrHistogram snapshot(*histogram_);
   snapshot_pb->set_name(prototype_->name());
   if (opts.include_schema_info) {
     snapshot_pb->set_type(MetricType::Name(prototype_->type()));
     snapshot_pb->set_label(prototype_->label());
     snapshot_pb->set_unit(MetricUnit::Name(prototype_->unit()));
     snapshot_pb->set_description(prototype_->description());
-    snapshot_pb->set_max_trackable_value(snapshot.highest_trackable_value());
-    snapshot_pb->set_num_significant_digits(snapshot.num_significant_digits());
+    snapshot_pb->set_max_trackable_value(histogram_->highest_trackable_value());
+    snapshot_pb->set_num_significant_digits(histogram_->num_significant_digits());
   }
-  snapshot_pb->set_total_count(snapshot.TotalCount());
-  snapshot_pb->set_total_sum(snapshot.TotalSum());
-  snapshot_pb->set_min(snapshot.MinValue());
-  snapshot_pb->set_mean(snapshot.MeanValue());
-  snapshot_pb->set_percentile_75(snapshot.ValueAtPercentile(75));
-  snapshot_pb->set_percentile_95(snapshot.ValueAtPercentile(95));
-  snapshot_pb->set_percentile_99(snapshot.ValueAtPercentile(99));
-  snapshot_pb->set_percentile_99_9(snapshot.ValueAtPercentile(99.9));
-  snapshot_pb->set_percentile_99_99(snapshot.ValueAtPercentile(99.99));
-  snapshot_pb->set_max(snapshot.MaxValue());
+  // Fast-path for a reasonably common case of an empty histogram. This occurs
+  // when a histogram is tracking some information about a feature not in
+  // use, for example.
+  if (histogram_->TotalCount() == 0) {
+    snapshot_pb->set_total_count(0);
+    snapshot_pb->set_total_sum(0);
+    snapshot_pb->set_min(0);
+    snapshot_pb->set_mean(0);
+    snapshot_pb->set_percentile_75(0);
+    snapshot_pb->set_percentile_95(0);
+    snapshot_pb->set_percentile_99(0);
+    snapshot_pb->set_percentile_99_9(0);
+    snapshot_pb->set_percentile_99_99(0);
+    snapshot_pb->set_max(0);
+  } else {
+    HdrHistogram snapshot(*histogram_);
+    snapshot_pb->set_total_count(snapshot.TotalCount());
+    snapshot_pb->set_total_sum(snapshot.TotalSum());
+    snapshot_pb->set_min(snapshot.MinValue());
+    snapshot_pb->set_mean(snapshot.MeanValue());
+    snapshot_pb->set_percentile_75(snapshot.ValueAtPercentile(75));
+    snapshot_pb->set_percentile_95(snapshot.ValueAtPercentile(95));
+    snapshot_pb->set_percentile_99(snapshot.ValueAtPercentile(99));
+    snapshot_pb->set_percentile_99_9(snapshot.ValueAtPercentile(99.9));
+    snapshot_pb->set_percentile_99_99(snapshot.ValueAtPercentile(99.99));
+    snapshot_pb->set_max(snapshot.MaxValue());
 
-  if (opts.include_raw_histograms) {
-    RecordedValuesIterator iter(&snapshot);
-    while (iter.HasNext()) {
-      HistogramIterationValue value;
-      RETURN_NOT_OK(iter.Next(&value));
-      snapshot_pb->add_values(value.value_iterated_to);
-      snapshot_pb->add_counts(value.count_at_value_iterated_to);
+    if (opts.include_raw_histograms) {
+      RecordedValuesIterator iter(&snapshot);
+      while (iter.HasNext()) {
+        HistogramIterationValue value;
+        RETURN_NOT_OK(iter.Next(&value));
+        snapshot_pb->add_values(value.value_iterated_to);
+        snapshot_pb->add_counts(value.count_at_value_iterated_to);
+      }
     }
   }
   return Status::OK();

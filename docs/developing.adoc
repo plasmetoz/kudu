@@ -122,7 +122,7 @@ df.registerTempTable("kudu_table")
 val filteredDF = sqlContext.sql("select id from kudu_table where id >= 5").show()
 
 // Use KuduContext to create, delete, or write to Kudu tables
-val kuduContext = new KuduContext("kudu.master:7051")
+val kuduContext = new KuduContext("kudu.master:7051", sqlContext.sparkContext)
 
 // Create a new Kudu table from a dataframe schema
 // NB: No rows from the dataframe are inserted into the table
@@ -157,17 +157,33 @@ kuduContext.tableExists("another_table")
 kuduContext.deleteTable("unwanted_table")
 ----
 
+=== Using Spark with a Secure Kudu Cluster
+
+The Kudu Spark integration is able to operate on secure Kudu clusters which have
+authentication and encryption enabled, but the submitter of the Spark job must
+provide the proper credentials. For Spark jobs using the default 'client' deploy
+mode, the submitting user must have an active Kerberos ticket granted through
+`kinit`. For Spark jobs using the 'cluster' deploy mode, a Kerberos principal
+name and keytab location must be provided through the `--principal` and
+`--keytab` arguments to `spark2-submit`.
+
 === Spark Integration Known Issues and Limitations
 
+- Spark 2.2+ requires Java 8 at runtime even though Kudu Spark 2.x integration
+  is Java 7 compatible. Spark 2.2 is the default dependency version as of
+  Kudu 1.5.0.
 - Kudu tables with a name containing upper case or non-ascii characters must be
   assigned an alternate name when registered as a temporary table.
 - Kudu tables with a column name containing upper case or non-ascii characters
-  may not be used with SparkSQL. Non-primary key columns may be renamed in Kudu
-  to work around this issue.
-- `NULL`, `NOT NULL`, `<>`, `OR`, `LIKE`, and `IN` predicates are not pushed to
-  Kudu, and instead will be evaluated by the Spark task.
+  may not be used with SparkSQL. Columns may be renamed in Kudu to work around
+  this issue.
+- `<>` and `OR` predicates are not pushed to Kudu, and instead will be evaluated
+  by the Spark task. Only `LIKE` predicates with a suffix wildcard are pushed to
+  Kudu, meaning that `LIKE "FOO%"` is pushed down but `LIKE "FOO%BAR"` isn't.
 - Kudu does not support all types supported by Spark SQL, such as `Date`,
   `Decimal` and complex types.
+- Kudu tables may only be registered as temporary tables in SparkSQL.
+  Kudu tables may not be queried using HiveContext.
 
 
 == Kudu Python Client

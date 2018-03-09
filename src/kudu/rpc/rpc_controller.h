@@ -17,14 +17,12 @@
 #ifndef KUDU_RPC_RPC_CONTROLLER_H
 #define KUDU_RPC_RPC_CONTROLLER_H
 
-#include <functional>
-#include <glog/logging.h>
+#include <cstdint>
 #include <memory>
 #include <unordered_set>
 #include <vector>
 
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/stl_util.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/status.h"
@@ -37,12 +35,33 @@ class Message;
 
 namespace kudu {
 
+class Slice;
+
 namespace rpc {
 
 class ErrorStatusPB;
+class Messenger;
 class OutboundCall;
 class RequestIdPB;
 class RpcSidecar;
+
+// Authentication credentials policy for outbound RPCs. Some RPC methods
+// (e.g. MasterService::ConnectToMaster) behave differently depending on the
+// type of credentials used for authentication when establishing the connection.
+// The client expecting some particular results from the call should specify
+// the required policy on a per-call basis using RpcController. By default,
+// RpcController uses ANY_CREDENTIALS.
+enum class CredentialsPolicy {
+  // It's acceptable to use authentication credentials of any type, primary or
+  // secondary ones.
+  ANY_CREDENTIALS,
+
+  // Only primary credentials are acceptable. Primary credentials are Kerberos
+  // tickets, TLS certificate. Secondary credentials are authentication tokens:
+  // they are 'derived' in the sense that it's possible to acquire them using
+  // 'primary' credentials.
+  PRIMARY_CREDENTIALS,
+};
 
 // Controller for managing properties of a single RPC call, on the client side.
 //
@@ -70,6 +89,9 @@ class RpcController {
   // A call is finished if the server has responded, or if the call
   // has timed out.
   bool finished() const;
+
+  // Whether the call failed due to connection negotiation error.
+  bool negotiation_failed() const;
 
   // Return the current status of a call.
   //
@@ -115,7 +137,7 @@ class RpcController {
   // Using an uninitialized deadline means the call won't time out.
   void set_deadline(const MonoTime& deadline);
 
-  // Allows settting the request id for the next request sent to the server.
+  // Allows setting the request id for the next request sent to the server.
   // A request id allows the server to identify each request sent by the client uniquely,
   // in some cases even when sent to multiple servers, enabling exactly once semantics.
   void SetRequestIdPB(std::unique_ptr<RequestIdPB> request_id);
@@ -180,6 +202,14 @@ class RpcController {
   // Return the configured timeout.
   MonoDelta timeout() const;
 
+  CredentialsPolicy credentials_policy() const {
+    return credentials_policy_;
+  }
+
+  void set_credentials_policy(CredentialsPolicy policy) {
+    credentials_policy_ = policy;
+  }
+
   // Fills the 'sidecar' parameter with the slice pointing to the i-th
   // sidecar upon success.
   //
@@ -194,6 +224,19 @@ class RpcController {
   // to this request.
   Status AddOutboundSidecar(std::unique_ptr<RpcSidecar> car, int* idx);
 
+  // Cancel the call associated with the RpcController. This function should only be
+  // called when there is an outstanding outbound call. It's always safe to call
+  // Cancel() after you've sent a call, so long as you haven't called Reset() yet.
+  // Caller is not responsible for synchronization between cancellation and the
+  // callback. (i.e. the callback may or may not be invoked yet when Cancel()
+  // is called).
+  //
+  // Cancellation is "best effort" - i.e. it's still possible the callback passed
+  // to the call will be fired with a success status. If cancellation succeeds,
+  // the callback will be invoked with a Aborted status. Cancellation is asynchronous
+  // so the callback will still be invoked from the reactor thread.
+  void Cancel();
+
  private:
   friend class OutboundCall;
   friend class Proxy;
@@ -202,14 +245,24 @@ class RpcController {
   // outbound_sidecars_ to call_ in preparation for serialization.
   void SetRequestParam(const google::protobuf::Message& req);
 
+  // Set the messenger which contains the reactor thread handling the outbound call.
+  void SetMessenger(Messenger* messenger) { messenger_ = messenger; }
+
   MonoDelta timeout_;
   std::unordered_set<uint32_t> required_server_features_;
+
+  // RPC authentication policy for outbound calls.
+  CredentialsPolicy credentials_policy_;
 
   mutable simple_spinlock lock_;
 
   // The id of this request.
-  // Ownership is transfered to OutboundCall once the call is sent.
+  // Ownership is transferred to OutboundCall once the call is sent.
   std::unique_ptr<RequestIdPB> request_id_;
+
+  // The messenger which contains the reactor thread for 'call_'.
+  // Set only when 'call_' is set.
+  Messenger* messenger_;
 
   // Once the call is sent, it is tracked here.
   std::shared_ptr<OutboundCall> call_;

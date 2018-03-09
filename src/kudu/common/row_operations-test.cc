@@ -15,17 +15,35 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <gtest/gtest.h>
+#include <cstdint>
+#include <cstdlib>
+#include <ostream>
 #include <memory>
 #include <string>
+#include <vector>
 
+#include <gtest/gtest.h>
+#include <glog/logging.h>
+
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/dynamic_annotations.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using std::shared_ptr;
+using std::string;
+using std::vector;
 using strings::Substitute;
 using strings::SubstituteAndAppend;
 
@@ -34,7 +52,7 @@ namespace kudu {
 class RowOperationsTest : public KuduTest {
  public:
   RowOperationsTest()
-    : arena_(1024, 128 * 1024) {
+    : arena_(1024) {
     SeedRandom();
 
     SchemaBuilder builder;
@@ -336,7 +354,7 @@ string TestProjection(RowOperationsPB::Type type,
   enc.Add(type, client_row);
 
   // Decode it
-  Arena arena(1024, 1024*1024);
+  Arena arena(1024);
   vector<DecodedRowOperation> ops;
   RowOperationsPBDecoder dec(&pb, client_row.schema(), &server_schema, &arena);
   Status s = dec.DecodeOperations(&ops);

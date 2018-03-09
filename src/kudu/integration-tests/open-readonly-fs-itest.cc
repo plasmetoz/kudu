@@ -15,15 +15,30 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
 #include <memory>
+#include <ostream>
+#include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
-#include "kudu/client/client-test-util.h"
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/integration-tests/cluster_itest_util.h"
-#include "kudu/integration-tests/cluster_verifier.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/util/env.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using kudu::client::KuduClient;
@@ -35,6 +50,8 @@ using kudu::client::KuduTable;
 using kudu::client::KuduTableCreator;
 using kudu::client::KuduWriteOperation;
 using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
 
 using std::unique_ptr;
 
@@ -59,11 +76,11 @@ class OpenReadonlyFsITest : public KuduTest {
     // threads to encourage frequent compactions. The net effect of both of
     // these changes: more blocks are written to disk. Turning off container
     // file preallocation forces every append to increase the file size.
-    opts.extra_tserver_flags.push_back("--log_container_preallocate_bytes=0");
-    opts.extra_tserver_flags.push_back("--maintenance_manager_num_threads=16");
-    opts.extra_tserver_flags.push_back("--flush_threshold_mb=1");
+    opts.extra_tserver_flags.emplace_back("--log_container_preallocate_bytes=0");
+    opts.extra_tserver_flags.emplace_back("--maintenance_manager_num_threads=16");
+    opts.extra_tserver_flags.emplace_back("--flush_threshold_mb=1");
 
-    cluster_.reset(new ExternalMiniCluster(opts));
+    cluster_.reset(new ExternalMiniCluster(std::move(opts)));
     ASSERT_OK(cluster_->Start());
 
     ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
@@ -114,8 +131,8 @@ TEST_F(OpenReadonlyFsITest, TestWriteAndVerify) {
   auto t = std::thread([this, deadline] () {
       FsManagerOpts fs_opts;
       fs_opts.read_only = true;
-      fs_opts.wal_path = cluster_->tablet_server(0)->data_dir();
-      fs_opts.data_paths = { cluster_->tablet_server(0)->data_dir() };
+      fs_opts.wal_root = cluster_->tablet_server(0)->wal_dir();
+      fs_opts.data_roots = cluster_->tablet_server(0)->data_dirs();
       while (MonoTime::Now() < deadline) {
         FsManager fs(Env::Default(), fs_opts);
         CHECK_OK(fs.Open());

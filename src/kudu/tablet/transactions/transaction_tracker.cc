@@ -19,11 +19,21 @@
 
 #include <algorithm>
 #include <limits>
+#include <mutex>
+#include <ostream>
+#include <string>
 #include <vector>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+#include <google/protobuf/message.h>
+
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_replica.h"
+#include "kudu/tablet/transactions/transaction.h"
 #include "kudu/tablet/transactions/transaction_driver.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
@@ -59,6 +69,7 @@ METRIC_DEFINE_counter(tablet, transaction_memory_pressure_rejections,
                       "transaction memory limit was reached.");
 
 using std::shared_ptr;
+using std::string;
 using std::vector;
 
 namespace kudu {
@@ -97,12 +108,12 @@ Status TransactionTracker::Add(TransactionDriver* driver) {
     }
 
     // May be null in unit tests.
-    TabletPeer* peer = driver->state()->tablet_peer();
+    TabletReplica* replica = driver->state()->tablet_replica();
 
     string msg = Substitute(
         "Transaction failed, tablet $0 transaction memory consumption ($1) "
         "has exceeded its limit ($2) or the limit of an ancestral tracker",
-        peer ? peer->tablet()->tablet_id() : "(unknown)",
+        replica ? replica->tablet()->tablet_id() : "(unknown)",
         mem_tracker_->consumption(), mem_tracker_->limit());
 
     KLOG_EVERY_N_SECS(WARNING, 1) << msg << THROTTLE_MSG;
@@ -159,20 +170,15 @@ void TransactionTracker::DecrementCounters(const TransactionDriver& driver) cons
 void TransactionTracker::Release(TransactionDriver* driver) {
   DecrementCounters(*driver);
 
-  State st;
-  {
-    // Remove the transaction from the map, retaining the state for use
-    // below.
-    std::lock_guard<simple_spinlock> l(lock_);
-    st = FindOrDie(pending_txns_, driver);
-    if (PREDICT_FALSE(pending_txns_.erase(driver) != 1)) {
-      LOG(FATAL) << "Could not remove pending transaction from map: "
-          << driver->ToStringUnlocked();
-    }
-  }
-
+  // Remove the transaction from the map updating memory consumption if needed.
+  std::lock_guard<simple_spinlock> l(lock_);
+  State st = FindOrDie(pending_txns_, driver);
   if (mem_tracker_) {
     mem_tracker_->Release(st.memory_footprint);
+  }
+  if (PREDICT_FALSE(pending_txns_.erase(driver) != 1)) {
+    LOG(FATAL) << "Could not remove pending transaction from map: "
+        << driver->ToStringUnlocked();
   }
 }
 

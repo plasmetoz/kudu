@@ -17,24 +17,28 @@
 
 #pragma once
 
-#include <stdint.h>
-
+#include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
-#include <set>
+#include <mutex>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/util/atomic.h"
 #include "kudu/util/condition_variable.h"
-#include "kudu/util/countdown_latch.h"
-#include "kudu/util/maintenance_manager.pb.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/random.h"
-#include "kudu/util/thread.h"
-#include "kudu/util/threadpool.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -42,7 +46,10 @@ template<class T>
 class AtomicGauge;
 class Histogram;
 class MaintenanceManager;
-class MemTracker;
+class MaintenanceManagerStatusPB;
+class MaintenanceManagerStatusPB_OpInstancePB;
+class Thread;
+class ThreadPool;
 
 class MaintenanceOpStats {
  public:
@@ -145,6 +152,19 @@ class MaintenanceOpStats {
   MonoTime last_modified_;
 };
 
+// Represents an instance of a maintenance operation.
+struct OpInstance {
+  // Id of thread the instance ran on.
+  int64_t thread_id;
+  // Name of operation.
+  std::string name;
+  // Time the operation took to run. Value is unitialized if instance is still running.
+  MonoDelta duration;
+  MonoTime start_mono_time;
+
+  MaintenanceManagerStatusPB_OpInstancePB DumpToPB() const;
+};
+
 // MaintenanceOp objects represent background operations that the
 // MaintenanceManager can schedule.  Once a MaintenanceOp is registered, the
 // manager will periodically poll it for statistics.  The registrant is
@@ -242,13 +262,6 @@ struct MaintenanceOpComparator {
   }
 };
 
-// Holds the information regarding a recently completed operation.
-struct CompletedOp {
-  std::string name;
-  MonoDelta duration;
-  MonoTime start_mono_time;
-};
-
 // The MaintenanceManager manages the scheduling of background operations such
 // as flushes or compactions.  It runs these operations in the background, in a
 // thread pool.  It uses information provided in MaintenanceOpStats objects to
@@ -259,7 +272,6 @@ class MaintenanceManager : public std::enable_shared_from_this<MaintenanceManage
     int32_t num_threads;
     int32_t polling_interval_ms;
     uint32_t history_size;
-    std::shared_ptr<MemTracker> parent_mem_tracker;
   };
 
   explicit MaintenanceManager(const Options& options);
@@ -278,17 +290,29 @@ class MaintenanceManager : public std::enable_shared_from_this<MaintenanceManage
 
   void GetMaintenanceManagerStatusDump(MaintenanceManagerStatusPB* out_pb);
 
-  static const Options DEFAULT_OPTIONS;
+  void set_memory_pressure_func_for_tests(std::function<bool(double*)> f) {
+    std::lock_guard<Mutex> guard(lock_);
+    memory_pressure_func_ = std::move(f);
+  }
+
+  static const Options kDefaultOptions;
 
  private:
   FRIEND_TEST(MaintenanceManagerTest, TestLogRetentionPrioritization);
   typedef std::map<MaintenanceOp*, MaintenanceOpStats,
           MaintenanceOpComparator> OpMapTy;
 
+  // Return true if tests have currently disabled the maintenance
+  // manager by way of changing the gflags at runtime.
+  bool disabled_for_tests() const;
+
   void RunSchedulerThread();
 
-  // find the best op, or null if there is nothing we want to run
-  MaintenanceOp* FindBestOp();
+  // Find the best op, or null if there is nothing we want to run.
+  //
+  // Returns the op, as well as a string explanation of why that op was chosen,
+  // suitable for logging.
+  std::pair<MaintenanceOp*, std::string> FindBestOp();
 
   void LaunchOp(MaintenanceOp* op);
 
@@ -301,15 +325,33 @@ class MaintenanceManager : public std::enable_shared_from_this<MaintenanceManage
   gscoped_ptr<ThreadPool> thread_pool_;
   ConditionVariable cond_;
   bool shutdown_;
-  uint64_t running_ops_;
   int32_t polling_interval_ms_;
+  uint64_t running_ops_;
   // Vector used as a circular buffer for recently completed ops. Elements need to be added at
   // the completed_ops_count_ % the vector's size and then the count needs to be incremented.
-  std::vector<CompletedOp> completed_ops_;
+  std::vector<OpInstance> completed_ops_;
   int64_t completed_ops_count_;
-  std::shared_ptr<MemTracker> parent_mem_tracker_;
   std::string server_uuid_;
   Random rand_;
+
+  // Function which should return true if the server is under global memory pressure.
+  // This is indirected for testing purposes.
+  std::function<bool(double*)> memory_pressure_func_;
+
+  // Running instances lock.
+  //
+  // This is separate of lock_ so that worker threads don't need to take the
+  // global MM lock when beginning operations. When taking both
+  // running_instances_lock_ and lock_, lock_ must be acquired first.
+  Mutex running_instances_lock_;
+
+  // Maps thread ids to instances of an op that they're running. Instances should be added
+  // right before MaintenanceOp::Perform() is called, and should be removed right after
+  // MaintenanceOp::Perform() completes. Any thread that adds an instance to this map
+  // owns that instance, and the instance should exist until the same thread removes it.
+  //
+  // Protected by running_instances_lock_;
+  std::unordered_map<int64_t, OpInstance*> running_instances_;
 
   DISALLOW_COPY_AND_ASSIGN(MaintenanceManager);
 };

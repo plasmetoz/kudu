@@ -15,23 +15,44 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstddef>
 #include <memory>
+#include <string>
+#include <type_traits>
+#include <utility>
 
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/common/wire_protocol-test-util.h"
-#include "kudu/consensus/consensus_peers.h"
+#include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus-test-util.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/consensus_peers.h"
+#include "kudu/consensus/consensus_queue.h"
 #include "kudu/consensus/log.h"
-#include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/log_util.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/consensus/time_manager.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/server/hybrid_clock.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/threadpool.h"
 
 METRIC_DECLARE_entity(tablet);
 
@@ -40,7 +61,11 @@ namespace consensus {
 
 using log::Log;
 using log::LogOptions;
+using rpc::Messenger;
+using rpc::MessengerBuilder;
 using std::shared_ptr;
+using std::string;
+using std::unique_ptr;
 
 const char* kTabletId = "test-peers-tablet";
 const char* kLeaderUuid = "peer-0";
@@ -51,7 +76,8 @@ class ConsensusPeersTest : public KuduTest {
   ConsensusPeersTest()
     : metric_entity_(METRIC_ENTITY_tablet.Instantiate(&metric_registry_, "peer-test")),
       schema_(GetSimpleTestSchema()) {
-    CHECK_OK(ThreadPoolBuilder("test-peer-pool").set_max_threads(1).Build(&pool_));
+    CHECK_OK(ThreadPoolBuilder("test-raft-pool").Build(&raft_pool_));
+    raft_pool_token_ = raft_pool_->NewToken(ThreadPool::ExecutionMode::CONCURRENT);
   }
 
   virtual void SetUp() OVERRIDE {
@@ -66,20 +92,33 @@ class ConsensusPeersTest : public KuduTest {
                        0, // schema_version
                        NULL,
                        &log_));
-    clock_.reset(new server::HybridClock());
+    clock_.reset(new clock::HybridClock());
     ASSERT_OK(clock_->Init());
 
     scoped_refptr<TimeManager> time_manager(new TimeManager(clock_, Timestamp::kMin));
 
-    message_queue_.reset(new PeerMessageQueue(metric_entity_,
-                                              log_.get(),
-                                              time_manager,
-                                              FakeRaftPeerPB(kLeaderUuid),
-                                              kTabletId));
+    message_queue_.reset(new PeerMessageQueue(
+        metric_entity_,
+        log_.get(),
+        time_manager,
+        FakeRaftPeerPB(kLeaderUuid),
+        kTabletId,
+        raft_pool_->NewToken(ThreadPool::ExecutionMode::SERIAL),
+        MinimumOpId(),
+        MinimumOpId()));
+
+    MessengerBuilder bld("test");
+    ASSERT_OK(bld.Build(&messenger_));
   }
 
   virtual void TearDown() OVERRIDE {
     ASSERT_OK(log_->WaitUntilAllFlushed());
+    messenger_->Shutdown();
+    if (raft_pool_) {
+      // Make sure to drain any tasks from the pool we're using for our delayable
+      // proxy before destructing the queue.
+      raft_pool_->Wait();
+    }
   }
 
   DelayablePeerProxy<NoOpTestPeerProxy>* NewRemotePeer(
@@ -87,24 +126,19 @@ class ConsensusPeersTest : public KuduTest {
       shared_ptr<Peer>* peer) {
     RaftPeerPB peer_pb;
     peer_pb.set_permanent_uuid(peer_name);
+    peer_pb.set_member_type(RaftPeerPB::VOTER);
     auto proxy_ptr = new DelayablePeerProxy<NoOpTestPeerProxy>(
-        pool_.get(), new NoOpTestPeerProxy(pool_.get(), peer_pb));
+        raft_pool_.get(), new NoOpTestPeerProxy(raft_pool_.get(), peer_pb));
     gscoped_ptr<PeerProxy> proxy(proxy_ptr);
-    CHECK_OK(Peer::NewRemotePeer(peer_pb,
+    CHECK_OK(Peer::NewRemotePeer(std::move(peer_pb),
                                  kTabletId,
                                  kLeaderUuid,
                                  message_queue_.get(),
-                                 pool_.get(),
+                                 raft_pool_token_.get(),
                                  std::move(proxy),
+                                 messenger_,
                                  peer));
     return proxy_ptr;
-  }
-
-  void CheckLastLogEntry(int term, int index) {
-    OpId id;
-    log_->GetLatestEntryOpId(&id);
-    ASSERT_EQ(id.term(), term);
-    ASSERT_EQ(id.index(), index);
   }
 
   void CheckLastRemoteEntry(DelayablePeerProxy<NoOpTestPeerProxy>* proxy, int term, int index) {
@@ -118,7 +152,7 @@ class ConsensusPeersTest : public KuduTest {
   // is committed in the test consensus impl.
   // This must be called _before_ the operation is committed.
   void WaitForCommitIndex(int index) {
-    AssertEventually([&]() {
+    ASSERT_EVENTUALLY([&]() {
         ASSERT_GE(message_queue_->GetCommittedIndex(), index);
       });
   }
@@ -128,11 +162,13 @@ class ConsensusPeersTest : public KuduTest {
   scoped_refptr<MetricEntity> metric_entity_;
   gscoped_ptr<FsManager> fs_manager_;
   scoped_refptr<Log> log_;
+  gscoped_ptr<ThreadPool> raft_pool_;
   gscoped_ptr<PeerMessageQueue> message_queue_;
   const Schema schema_;
   LogOptions options_;
-  gscoped_ptr<ThreadPool> pool_;
-  scoped_refptr<server::Clock> clock_;
+  unique_ptr<ThreadPoolToken> raft_pool_token_;
+  scoped_refptr<clock::Clock> clock_;
+  shared_ptr<Messenger> messenger_;
 };
 
 
@@ -144,7 +180,6 @@ class ConsensusPeersTest : public KuduTest {
 TEST_F(ConsensusPeersTest, TestRemotePeer) {
   // We use a majority size of 2 since we make one fake remote peer
   // in addition to our real local log.
-  message_queue_->Init(MinimumOpId(), MinimumOpId());
   message_queue_->SetLeaderMode(kMinimumOpIdIndex,
                                 kMinimumTerm,
                                 BuildRaftConfigPBForTests(3));
@@ -168,7 +203,6 @@ TEST_F(ConsensusPeersTest, TestRemotePeer) {
 }
 
 TEST_F(ConsensusPeersTest, TestRemotePeers) {
-  message_queue_->Init(MinimumOpId(), MinimumOpId());
   message_queue_->SetLeaderMode(kMinimumOpIdIndex,
                                 kMinimumTerm,
                                 BuildRaftConfigPBForTests(3));
@@ -198,7 +232,7 @@ TEST_F(ConsensusPeersTest, TestRemotePeers) {
   // of remote-peer1 and the local log.
   WaitForCommitIndex(first.index());
 
-  CheckLastLogEntry(first.term(), first.index());
+  ASSERT_OPID_EQ(first, message_queue_->GetLastOpIdInLog());
   CheckLastRemoteEntry(remote_peer1_proxy, first.term(), first.index());
 
   remote_peer2_proxy->Respond(TestPeerProxy::kUpdate);
@@ -227,19 +261,19 @@ TEST_F(ConsensusPeersTest, TestRemotePeers) {
 // Regression test for KUDU-699: even if a peer isn't making progress,
 // and thus always has data pending, we should be able to close the peer.
 TEST_F(ConsensusPeersTest, TestCloseWhenRemotePeerDoesntMakeProgress) {
-  message_queue_->Init(MinimumOpId(), MinimumOpId());
   message_queue_->SetLeaderMode(kMinimumOpIdIndex,
                                 kMinimumTerm,
                                 BuildRaftConfigPBForTests(3));
 
-  auto mock_proxy = new MockedPeerProxy(pool_.get());
+  auto mock_proxy = new MockedPeerProxy(raft_pool_.get());
   shared_ptr<Peer> peer;
   ASSERT_OK(Peer::NewRemotePeer(FakeRaftPeerPB(kFollowerUuid),
                                 kTabletId,
                                 kLeaderUuid,
                                 message_queue_.get(),
-                                pool_.get(),
+                                raft_pool_token_.get(),
                                 gscoped_ptr<PeerProxy>(mock_proxy),
+                                messenger_,
                                 &peer));
 
   // Make the peer respond without making any progress -- it always returns
@@ -265,19 +299,19 @@ TEST_F(ConsensusPeersTest, TestCloseWhenRemotePeerDoesntMakeProgress) {
 }
 
 TEST_F(ConsensusPeersTest, TestDontSendOneRpcPerWriteWhenPeerIsDown) {
-  message_queue_->Init(MinimumOpId(), MinimumOpId());
   message_queue_->SetLeaderMode(kMinimumOpIdIndex,
                                 kMinimumTerm,
                                 BuildRaftConfigPBForTests(3));
 
-  auto mock_proxy = new MockedPeerProxy(pool_.get());
+  auto mock_proxy = new MockedPeerProxy(raft_pool_.get());
   shared_ptr<Peer> peer;
   ASSERT_OK(Peer::NewRemotePeer(FakeRaftPeerPB(kFollowerUuid),
                                 kTabletId,
                                 kLeaderUuid,
                                 message_queue_.get(),
-                                pool_.get(),
+                                raft_pool_token_.get(),
                                 gscoped_ptr<PeerProxy>(mock_proxy),
+                                messenger_,
                                 &peer));
 
   // Initial response has to be successful -- otherwise we'll consider the peer

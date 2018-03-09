@@ -18,31 +18,46 @@
 #include "kudu/common/partition.h"
 
 #include <algorithm>
+#include <cstring>
+#include <memory>
 #include <set>
 #include <string>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+
+#include "kudu/common/common.pb.h"
+#include "kudu/common/key_encoder.h"
 #include "kudu/common/partial_row.h"
-#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/common/row.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/endian.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/bitmap.h"
+#include "kudu/util/decimal_util.h"
 #include "kudu/util/hash_util.h"
+#include "kudu/util/int128.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/pb_util.h"
 #include "kudu/util/url-coding.h"
 
+using google::protobuf::RepeatedPtrField;
+using kudu::pb_util::SecureDebugString;
 using std::pair;
 using std::set;
 using std::string;
 using std::vector;
+using strings::Substitute;
+using strings::SubstituteAndAppend;
 
 namespace kudu {
 
-using google::protobuf::RepeatedPtrField;
-using strings::Substitute;
-using strings::SubstituteAndAppend;
+class faststring;
 
 // The encoded size of a hash bucket in a partition key.
 static const size_t kEncodedBucketSize = sizeof(uint32_t);
@@ -68,8 +83,8 @@ Slice Partition::range_key(const string& partition_key) const {
 
 bool Partition::Equals(const Partition& other) const {
   if (this == &other) return true;
-  if (partition_key_start().compare(other.partition_key_start()) != 0) return false;
-  if (partition_key_end().compare(other.partition_key_end()) != 0) return false;
+  if (partition_key_start() != other.partition_key_start()) return false;
+  if (partition_key_end() != other.partition_key_end()) return false;
   if (hash_buckets_ != other.hash_buckets_) return false;
   return true;
 }
@@ -272,7 +287,7 @@ Status PartitionSchema::EncodeRangeBounds(const vector<pair<KuduPartialRow,
 
     if (!lower.empty() && !upper.empty() && lower >= upper) {
       return Status::InvalidArgument(
-          "range partition lower bound must be less than or equal to the upper bound",
+          "range partition lower bound must be less than the upper bound",
           RangePartitionDebugString(bound.first, bound.second));
     }
     range_partitions->emplace_back(std::move(lower), std::move(upper));
@@ -330,7 +345,7 @@ Status PartitionSchema::SplitRangeBounds(const Schema& schema,
       lower = std::move(*split);
     }
 
-    new_bounds.emplace_back(std::move(lower), std::move(upper));
+    new_bounds.emplace_back(std::move(lower), upper);
   }
 
   if (split != splits.end()) {
@@ -367,7 +382,7 @@ Status PartitionSchema::CreatePartitions(const vector<KuduPartialRow>& split_row
     partitions->swap(new_partitions);
   }
 
-  unordered_set<int> range_column_idxs;
+  std::unordered_set<int> range_column_idxs;
   for (const ColumnId& column_id : range_schema_.column_ids) {
     int column_idx = schema.find_column_by_id(column_id);
     if (column_idx == Schema::kColumnNotFound) {
@@ -418,7 +433,7 @@ Status PartitionSchema::CreatePartitions(const vector<KuduPartialRow>& split_row
   // see PartitionTest::TestCreatePartitions.
   for (Partition& partition : *partitions) {
     if (partition.range_key_start().empty()) {
-      for (int i = partition.hash_buckets().size() - 1; i >= 0; i--) {
+      for (int i = static_cast<int>(partition.hash_buckets().size()) - 1; i >= 0; i--) {
         if (partition.hash_buckets()[i] != 0) {
           break;
         }
@@ -426,7 +441,7 @@ Status PartitionSchema::CreatePartitions(const vector<KuduPartialRow>& split_row
       }
     }
     if (partition.range_key_end().empty()) {
-      for (int i = partition.hash_buckets().size() - 1; i >= 0; i--) {
+      for (int i = static_cast<int>(partition.hash_buckets().size()) - 1; i >= 0; i--) {
         partition.partition_key_end_.erase(kEncodedBucketSize * i);
         int32_t hash_bucket = partition.hash_buckets()[i] + 1;
         if (hash_bucket != hash_bucket_schemas_[i].num_buckets) {
@@ -707,7 +722,7 @@ string PartitionSchema::RangePartitionDebugString(Slice lower_bound,
   // Partitions are considered metadata, so don't redact them.
   ScopedDisableRedaction no_redaction;
 
-  Arena arena(1024, 128 * 1024);
+  Arena arena(256);
   KuduPartialRow lower(&schema);
   KuduPartialRow upper(&schema);
 
@@ -724,7 +739,7 @@ string PartitionSchema::RangePartitionDebugString(Slice lower_bound,
 }
 
 string PartitionSchema::RangeKeyDebugString(Slice range_key, const Schema& schema) const {
-  Arena arena(1024, 128 * 1024);
+  Arena arena(256);
   KuduPartialRow row(&schema);
 
   Status s = DecodeRangeKey(&range_key, &row, &arena);
@@ -751,7 +766,7 @@ string PartitionSchema::RangeKeyDebugString(const ConstContiguousRow& key) const
     string column;
     int32_t column_idx = key.schema()->find_column_by_id(column_id);
     if (column_idx == Schema::kColumnNotFound) {
-      components.push_back("<unknown-column>");
+      components.emplace_back("<unknown-column>");
       break;
     }
     key.schema()->column(column_idx).DebugCellAppend(key.cell(column_idx), &column);
@@ -987,7 +1002,8 @@ namespace {
   // Increments an unset column in the row.
   Status IncrementUnsetColumn(KuduPartialRow* row, int32_t idx) {
     DCHECK(!row->IsColumnSet(idx));
-    switch (row->schema()->column(idx).type_info()->type()) {
+    const ColumnSchema& col = row->schema()->column(idx);
+    switch (col.type_info()->type()) {
       case INT8:
         RETURN_NOT_OK(row->SetInt8(idx, INT8_MIN + 1));
         break;
@@ -1007,6 +1023,12 @@ namespace {
       case BINARY:
         RETURN_NOT_OK(row->SetBinaryCopy(idx, Slice("\0", 1)));
         break;
+      case DECIMAL32:
+      case DECIMAL64:
+      case DECIMAL128:
+        RETURN_NOT_OK(row->SetUnscaledDecimal(idx,
+            MinUnscaledDecimal(col.type_attributes().precision) + 1));
+        break;
       default:
         return Status::InvalidArgument("Invalid column type in range partition",
                                        row->schema()->column(idx).ToString());
@@ -1018,8 +1040,9 @@ namespace {
   // succeeds, or false if the column is already the maximum value.
   Status IncrementColumn(KuduPartialRow* row, int32_t idx, bool* success) {
     DCHECK(row->IsColumnSet(idx));
+    const ColumnSchema& col = row->schema()->column(idx);
     *success = true;
-    switch (row->schema()->column(idx).type_info()->type()) {
+    switch (col.type_info()->type()) {
       case INT8: {
         int8_t value;
         RETURN_NOT_OK(row->GetInt8(idx, &value));
@@ -1065,6 +1088,18 @@ namespace {
         RETURN_NOT_OK(row->GetUnixTimeMicros(idx, &value));
         if (value < INT64_MAX) {
           RETURN_NOT_OK(row->SetUnixTimeMicros(idx, value + 1));
+        } else {
+          *success = false;
+        }
+        break;
+      }
+      case DECIMAL32:
+      case DECIMAL64:
+      case DECIMAL128: {
+        int128_t value;
+        RETURN_NOT_OK(row->GetUnscaledDecimal(idx, &value));
+        if (value < MaxUnscaledDecimal(col.type_attributes().precision)) {
+          RETURN_NOT_OK(row->SetUnscaledDecimal(idx, value + 1));
         } else {
           *success = false;
         }

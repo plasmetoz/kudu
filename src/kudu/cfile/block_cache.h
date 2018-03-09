@@ -17,20 +17,28 @@
 #ifndef KUDU_CFILE_BLOCK_CACHE_H
 #define KUDU_CFILE_BLOCK_CACHE_H
 
-#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <utility>
+
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 
 #include "kudu/fs/block_id.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/singleton.h"
 #include "kudu/util/cache.h"
+#include "kudu/util/slice.h"
 
 DECLARE_string(block_cache_type);
 
+template <class T> class scoped_refptr;
+
 namespace kudu {
 
-class MetricRegistry;
+class MetricEntity;
 
 namespace cfile {
 
@@ -73,7 +81,7 @@ class BlockCache {
     PendingEntry(Cache* cache, Cache::PendingHandle* handle)
         : cache_(cache), handle_(handle) {
     }
-    PendingEntry(PendingEntry&& other) : PendingEntry() {
+    PendingEntry(PendingEntry&& other) noexcept : PendingEntry() {
       *this = std::move(other);
     }
 
@@ -81,7 +89,7 @@ class BlockCache {
       reset();
     }
 
-    PendingEntry& operator=(PendingEntry&& other);
+    PendingEntry& operator=(PendingEntry&& other) noexcept;
     PendingEntry& operator=(const PendingEntry& other) = delete;
 
     // Free the pending entry back to the block cache.
@@ -216,7 +224,7 @@ class BlockCacheHandle {
 
 
 inline BlockCache::PendingEntry& BlockCache::PendingEntry::operator=(
-    BlockCache::PendingEntry&& other) {
+    BlockCache::PendingEntry&& other) noexcept {
   reset();
   cache_ = other.cache_;
   handle_ = other.handle_;

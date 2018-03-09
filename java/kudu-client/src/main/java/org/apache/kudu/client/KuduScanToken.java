@@ -21,17 +21,18 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableList;
 import com.google.protobuf.CodedInputStream;
 import com.google.protobuf.CodedOutputStream;
-import com.google.protobuf.ZeroCopyLiteralByteString;
+import com.google.protobuf.UnsafeByteOperations;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Common;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.Client.ScanTokenPB;
 import org.apache.kudu.util.Pair;
 
@@ -88,6 +89,16 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
    * @throws IOException
    */
   public byte[] serialize() throws IOException {
+    return serialize(message);
+  }
+
+  /**
+   * Serializes a {@code KuduScanToken} into a byte array.
+   * @return the serialized scan token
+   * @throws IOException
+   */
+  @VisibleForTesting
+  static byte[] serialize(ScanTokenPB message) throws IOException {
     byte[] buf = new byte[message.getSerializedSize()];
     CodedOutputStream cos = CodedOutputStream.newInstance(buf);
     message.writeTo(cos);
@@ -157,7 +168,7 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
     for (Common.ColumnSchemaPB column : message.getProjectedColumnsList()) {
       int columnIdx = table.getSchema().getColumnIndex(column.getName());
       ColumnSchema schema = table.getSchema().getColumnByIndex(columnIdx);
-      if (column.getType() != schema.getType().getDataType()) {
+      if (column.getType() != schema.getType().getDataType(schema.getTypeAttributes())) {
         throw new IllegalStateException(String.format(
             "invalid type %s for column '%s' in scan token, expected: %s",
             column.getType().name(), column.getName(), schema.getType().name()));
@@ -195,10 +206,6 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       builder.limit(message.getLimit());
     }
 
-    if (message.hasFaultTolerant()) {
-      // TODO(KUDU-1040)
-    }
-
     if (message.hasReadMode()) {
       switch (message.getReadMode()) {
         case READ_AT_SNAPSHOT: {
@@ -216,12 +223,35 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       }
     }
 
-    if (message.hasPropagatedTimestamp()) {
-      // TODO (KUDU-1411)
+    if (message.hasReplicaSelection()) {
+      switch (message.getReplicaSelection()) {
+        case LEADER_ONLY: {
+          builder.replicaSelection(ReplicaSelection.LEADER_ONLY);
+          break;
+        }
+        case CLOSEST_REPLICA: {
+          builder.replicaSelection(ReplicaSelection.CLOSEST_REPLICA);
+          break;
+        }
+        default: throw new IllegalArgumentException("unknown replica selection policy");
+      }
+    }
+
+    if (message.hasPropagatedTimestamp() &&
+        message.getPropagatedTimestamp() != AsyncKuduClient.NO_TIMESTAMP) {
+      client.updateLastPropagatedTimestamp(message.getPropagatedTimestamp());
     }
 
     if (message.hasCacheBlocks()) {
       builder.cacheBlocks(message.getCacheBlocks());
+    }
+
+    if (message.hasFaultTolerant()) {
+      builder.setFaultTolerant(message.getFaultTolerant());
+    }
+
+    if (message.hasBatchSizeBytes()) {
+      builder.batchSizeBytes(message.getBatchSizeBytes());
     }
 
     return builder.build();
@@ -305,14 +335,20 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       }
 
       if (lowerBoundPrimaryKey.length > 0) {
-        proto.setLowerBoundPrimaryKey(ZeroCopyLiteralByteString.copyFrom(lowerBoundPrimaryKey));
+        proto.setLowerBoundPrimaryKey(UnsafeByteOperations.unsafeWrap(lowerBoundPrimaryKey));
       }
       if (upperBoundPrimaryKey.length > 0) {
-        proto.setUpperBoundPrimaryKey(ZeroCopyLiteralByteString.copyFrom(upperBoundPrimaryKey));
+        proto.setUpperBoundPrimaryKey(UnsafeByteOperations.unsafeWrap(upperBoundPrimaryKey));
       }
 
       proto.setLimit(limit);
       proto.setReadMode(readMode.pbVersion());
+
+      if (replicaSelection == ReplicaSelection.LEADER_ONLY) {
+        proto.setReplicaSelection(Common.ReplicaSelection.LEADER_ONLY);
+      } else if (replicaSelection == ReplicaSelection.CLOSEST_REPLICA) {
+        proto.setReplicaSelection(Common.ReplicaSelection.CLOSEST_REPLICA);
+      }
 
       // If the last propagated timestamp is set send it with the scan.
       if (table.getAsyncClient().getLastPropagatedTimestamp() != AsyncKuduClient.NO_TIMESTAMP) {
@@ -326,6 +362,8 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
       }
 
       proto.setCacheBlocks(cacheBlocks);
+      proto.setFaultTolerant(isFaultTolerant);
+      proto.setBatchSizeBytes(batchSizeBytes);
 
       try {
         PartitionPruner pruner = PartitionPruner.create(this);
@@ -351,9 +389,9 @@ public class KuduScanToken implements Comparable<KuduScanToken> {
         for (LocatedTablet tablet : tablets) {
           Client.ScanTokenPB.Builder builder = proto.clone();
           builder.setLowerBoundPartitionKey(
-              ZeroCopyLiteralByteString.wrap(tablet.getPartition().getPartitionKeyStart()));
+              UnsafeByteOperations.unsafeWrap(tablet.getPartition().getPartitionKeyStart()));
           builder.setUpperBoundPartitionKey(
-              ZeroCopyLiteralByteString.wrap(tablet.getPartition().getPartitionKeyEnd()));
+              UnsafeByteOperations.unsafeWrap(tablet.getPartition().getPartitionKeyEnd()));
           tokens.add(new KuduScanToken(tablet, builder.build()));
         }
         return tokens;

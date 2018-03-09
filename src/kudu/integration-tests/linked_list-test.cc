@@ -30,31 +30,37 @@
 // To verify, the table is scanned, and we ensure that every key is linked to
 // either zero or one times, and no link_to refers to a missing key.
 
+#include <cstdint>
+#include <ostream>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <boost/bind.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
-#include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
-#include "kudu/client/row_result.h"
-#include "kudu/gutil/map-util.h"
-#include "kudu/gutil/stl_util.h"
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/strings/split.h"
-#include "kudu/gutil/walltime.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/linked_list-test-util.h"
 #include "kudu/integration-tests/ts_itest-base.h"
-#include "kudu/util/random.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/mini-cluster/mini_cluster.h"
+#include "kudu/tserver/tablet_server-test-base.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
-#include "kudu/util/hdr_histogram.h"
 
-using kudu::client::KuduClient;
-using kudu::client::KuduClientBuilder;
-using kudu::client::KuduSchema;
-using kudu::client::sp::shared_ptr;
-using kudu::itest::TServerDetails;
-
+DECLARE_int32(num_replicas);
+DECLARE_int32(num_tablet_servers);
+DECLARE_string(ts_flags);
 DEFINE_int32(seconds_to_run, 5, "Number of seconds for which to run the test");
 
 DEFINE_int32(num_chains, 50, "Number of parallel chains to generate");
@@ -67,7 +73,17 @@ DEFINE_bool(stress_flush_compact, false,
 DEFINE_bool(stress_wal_gc, false,
             "Set WAL segment size small so that logs will be GCed during the test");
 
+using kudu::client::sp::shared_ptr;
+using kudu::cluster::ClusterNodes;
+using kudu::itest::TServerDetails;
+using std::string;
+using std::vector;
+
 namespace kudu {
+
+namespace client {
+class KuduClient;
+} // namespace client
 
 class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
  public:
@@ -87,27 +103,27 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
   void BuildAndStart() {
     vector<string> common_flags;
 
-    common_flags.push_back("--skip_remove_old_recovery_dir");
+    common_flags.emplace_back("--skip_remove_old_recovery_dir");
 
     // Set history retention to one day, so that we don't GC history in this test.
     // We rely on verifying "back in time" with snapshot scans.
-    common_flags.push_back("--tablet_history_max_age_sec=86400");
+    common_flags.emplace_back("--tablet_history_max_age_sec=86400");
 
     vector<string> ts_flags(common_flags);
     if (FLAGS_stress_flush_compact) {
       // Set the flush threshold low so that we have a mix of flushed and unflushed
       // operations in the WAL, when we bootstrap.
-      ts_flags.push_back("--flush_threshold_mb=1");
+      ts_flags.emplace_back("--flush_threshold_mb=1");
       // Set the compaction budget to be low so that we get multiple passes of compaction
       // instead of selecting all of the rowsets in a single compaction of the whole
       // tablet.
-      ts_flags.push_back("--tablet_compaction_budget_mb=4");
+      ts_flags.emplace_back("--tablet_compaction_budget_mb=4");
       // Set the major delta compaction ratio low enough that we trigger a lot of them.
-      ts_flags.push_back("--tablet_delta_store_major_compact_min_ratio=0.001");
+      ts_flags.emplace_back("--tablet_delta_store_major_compact_min_ratio=0.001");
     }
     if (FLAGS_stress_wal_gc) {
       // Set the size of the WAL segments low so that some can be GC'd.
-      ts_flags.push_back("--log_segment_size_mb=1");
+      ts_flags.emplace_back("--log_segment_size_mb=1");
     }
 
     CreateCluster("linked-list-cluster", ts_flags, common_flags);
@@ -133,7 +149,7 @@ class LinkedListTest : public tserver::TabletServerIntegrationTestBase {
   }
 
  protected:
-  shared_ptr<KuduClient> client_;
+  shared_ptr<client::KuduClient> client_;
   gscoped_ptr<LinkedListTester> tester_;
 };
 

@@ -17,20 +17,26 @@
 
 package org.apache.kudu.client;
 
+import java.math.BigDecimal;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.ArrayList;
 import java.util.List;
 
 import com.google.common.base.Charsets;
+import com.google.common.base.Joiner;
 import com.google.common.collect.ImmutableList;
 import com.google.common.net.HostAndPort;
 import com.google.protobuf.ByteString;
-import com.google.protobuf.ZeroCopyLiteralByteString;
+import com.google.protobuf.UnsafeByteOperations;
+import org.apache.yetus.audience.InterfaceAudience;
 
 import org.apache.kudu.ColumnSchema;
+import org.apache.kudu.ColumnTypeAttributes;
 import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
-import org.apache.kudu.annotations.InterfaceAudience;
+import org.apache.kudu.util.DecimalUtil;
 
 @InterfaceAudience.Private
 public class ProtobufHelper {
@@ -65,7 +71,7 @@ public class ProtobufHelper {
                                                  ColumnSchema column) {
     schemaBuilder
         .setName(column.getName())
-        .setType(column.getType().getDataType())
+        .setType(column.getType().getDataType(column.getTypeAttributes()))
         .setIsKey(column.isKey())
         .setIsNullable(column.isNullable())
         .setCfileBlockSize(column.getDesiredBlockSize());
@@ -76,16 +82,34 @@ public class ProtobufHelper {
       schemaBuilder.setCompression(column.getCompressionAlgorithm().getInternalPbType());
     }
     if (column.getDefaultValue() != null) {
-      schemaBuilder.setReadDefaultValue(ZeroCopyLiteralByteString.wrap(
+      schemaBuilder.setReadDefaultValue(UnsafeByteOperations.unsafeWrap(
           objectToWireFormat(column, column.getDefaultValue())));
+    }
+    if(column.getTypeAttributes() != null) {
+      schemaBuilder.setTypeAttributes(
+          columnTypeAttributesToPb(Common.ColumnTypeAttributesPB.newBuilder(), column));
     }
     return schemaBuilder.build();
   }
 
+  public static Common.ColumnTypeAttributesPB columnTypeAttributesToPb(
+      Common.ColumnTypeAttributesPB.Builder builder, ColumnSchema column) {
+    ColumnTypeAttributes typeAttributes = column.getTypeAttributes();
+    if (typeAttributes.hasPrecision()) {
+      builder.setPrecision(typeAttributes.getPrecision());
+    }
+    if (typeAttributes.hasScale()) {
+      builder.setScale(typeAttributes.getScale());
+    }
+    return builder.build();
+  }
+
   public static ColumnSchema pbToColumnSchema(Common.ColumnSchemaPB pb) {
     Type type = Type.getTypeForDataType(pb.getType());
-    Object defaultValue = pb.hasReadDefaultValue() ?
-        byteStringToObject(type, pb.getReadDefaultValue()) : null;
+    ColumnTypeAttributes typeAttributes = pb.hasTypeAttributes() ?
+        pbToColumnTypeAttributes(pb.getTypeAttributes()) : null;
+    Object defaultValue = pb.hasWriteDefaultValue() ?
+        byteStringToObject(type, typeAttributes, pb.getWriteDefaultValue()) : null;
     ColumnSchema.Encoding encoding = ColumnSchema.Encoding.valueOf(pb.getEncoding().name());
     ColumnSchema.CompressionAlgorithm compressionAlgorithm =
         ColumnSchema.CompressionAlgorithm.valueOf(pb.getCompression().name());
@@ -97,7 +121,20 @@ public class ProtobufHelper {
                            .encoding(encoding)
                            .compressionAlgorithm(compressionAlgorithm)
                            .desiredBlockSize(desiredBlockSize)
+                           .typeAttributes(typeAttributes)
                            .build();
+  }
+
+  public static ColumnTypeAttributes pbToColumnTypeAttributes(Common.ColumnTypeAttributesPB pb) {
+    ColumnTypeAttributes.ColumnTypeAttributesBuilder builder =
+        new ColumnTypeAttributes.ColumnTypeAttributesBuilder();
+    if(pb.hasPrecision()) {
+      builder.precision(pb.getPrecision());
+    }
+    if(pb.hasScale()) {
+      builder.scale(pb.getScale());
+    }
+    return builder.build();
   }
 
   public static Schema pbToSchema(Common.SchemaPB schema) {
@@ -202,37 +239,85 @@ public class ProtobufHelper {
         return Bytes.fromFloat((Float) value);
       case DOUBLE:
         return Bytes.fromDouble((Double) value);
+      case DECIMAL:
+        return Bytes.fromBigDecimal((BigDecimal) value, col.getTypeAttributes().getPrecision());
       default:
         throw new IllegalArgumentException("The column " + col.getName() + " is of type " + col
             .getType() + " which is unknown");
     }
   }
 
-  private static Object byteStringToObject(Type type, ByteString value) {
-    byte[] buf = ZeroCopyLiteralByteString.zeroCopyGetBytes(value);
+  private static Object byteStringToObject(Type type, ColumnTypeAttributes typeAttributes,
+                                           ByteString value) {
+    ByteBuffer buf = value.asReadOnlyByteBuffer();
+    buf.order(ByteOrder.LITTLE_ENDIAN);
     switch (type) {
       case BOOL:
-        return Bytes.getBoolean(buf);
+        return buf.get() != 0;
       case INT8:
-        return Bytes.getByte(buf);
+        return buf.get();
       case INT16:
-        return Bytes.getShort(buf);
+        return buf.getShort();
       case INT32:
-        return Bytes.getInt(buf);
+        return buf.getInt();
       case INT64:
       case UNIXTIME_MICROS:
-        return Bytes.getLong(buf);
+        return buf.getLong();
       case FLOAT:
-        return Bytes.getFloat(buf);
+        return buf.getFloat();
       case DOUBLE:
-        return Bytes.getDouble(buf);
+        return buf.getDouble();
       case STRING:
-        return new String(buf, Charsets.UTF_8);
+        return value.toStringUtf8();
       case BINARY:
-        return buf;
+        return value.toByteArray();
+      case DECIMAL:
+        return Bytes.getDecimal(value.toByteArray(),
+            typeAttributes.getPrecision(), typeAttributes.getScale());
       default:
         throw new IllegalArgumentException("This type is unknown: " + type);
     }
+  }
+
+  /**
+   * Serializes an object based on its Java type. Used for Alter Column
+   * operations where the column's type is not available. `value` must be
+   * a Kudu-compatible type or else throws {@link IllegalArgumentException}.
+   *
+   * @param colName the name of the column (for the error message)
+   * @param value the value to serialize
+   * @return the serialized object
+   */
+  protected static ByteString objectToByteStringNoType(String colName, Object value) {
+    byte[] bytes;
+    if (value instanceof Boolean) {
+      bytes = Bytes.fromBoolean((Boolean) value);
+    } else if (value instanceof Byte) {
+      bytes = new byte[] {(Byte) value};
+    } else if (value instanceof Short) {
+      bytes = Bytes.fromShort((Short) value);
+    } else if (value instanceof Integer) {
+      bytes = Bytes.fromInt((Integer) value);
+    } else if (value instanceof Long) {
+      bytes = Bytes.fromLong((Long) value);
+    } else if (value instanceof String) {
+      bytes = ((String) value).getBytes(Charsets.UTF_8);
+    } else if (value instanceof byte[]) {
+      bytes = (byte[]) value;
+    } else if (value instanceof ByteBuffer) {
+      bytes = ((ByteBuffer) value).array();
+    } else if (value instanceof Float) {
+      bytes = Bytes.fromFloat((Float) value);
+    } else if (value instanceof Double) {
+      bytes = Bytes.fromDouble((Double) value);
+    } else if (value instanceof BigDecimal) {
+      bytes = Bytes.fromBigDecimal((BigDecimal) value, DecimalUtil.MAX_DECIMAL_PRECISION);
+    } else {
+      throw new IllegalArgumentException("The default value provided for " +
+          "column " + colName + " is of class " + value.getClass().getName() +
+          " which does not map to a supported Kudu type");
+    }
+    return UnsafeByteOperations.unsafeWrap(bytes);
   }
 
   /**
@@ -244,7 +329,7 @@ public class ProtobufHelper {
    */
   public static Common.HostPortPB hostAndPortToPB(HostAndPort hostAndPort) {
     return Common.HostPortPB.newBuilder()
-        .setHost(hostAndPort.getHostText())
+        .setHost(hostAndPort.getHost())
         .setPort(hostAndPort.getPort())
         .build();
   }
@@ -258,5 +343,16 @@ public class ProtobufHelper {
    */
   public static HostAndPort hostAndPortFromPB(Common.HostPortPB hostPortPB) {
     return HostAndPort.fromParts(hostPortPB.getHost(), hostPortPB.getPort());
+  }
+
+  /**
+   * Convert a list of HostPortPBs into a comma-separated string.
+   */
+  public static String hostPortPbListToString(List<Common.HostPortPB> pbs) {
+    List<String> strs = new ArrayList<>(pbs.size());
+    for (Common.HostPortPB pb : pbs) {
+      strs.add(pb.getHost() + ":" + pb.getPort());
+    }
+    return Joiner.on(',').join(strs);
   }
 }

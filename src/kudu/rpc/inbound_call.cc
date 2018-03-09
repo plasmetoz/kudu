@@ -17,9 +17,16 @@
 
 #include "kudu/rpc/inbound_call.h"
 
-#include <glog/stl_logging.h>
+#include <cstdint>
 #include <memory>
+#include <ostream>
 
+#include <glog/logging.h>
+#include <google/protobuf/message.h>
+#include <google/protobuf/message_lite.h>
+
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/connection.h"
 #include "kudu/rpc/rpc_introspection.pb.h"
@@ -27,13 +34,22 @@
 #include "kudu/rpc/rpcz_store.h"
 #include "kudu/rpc/serialization.h"
 #include "kudu/rpc/service_if.h"
+#include "kudu/rpc/transfer.h"
 #include "kudu/util/debug/trace_event.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/trace.h"
 
+namespace google {
+namespace protobuf {
+class FieldDescriptor;
+}
+}
+
 using google::protobuf::FieldDescriptor;
-using google::protobuf::io::CodedOutputStream;
+using google::protobuf::Message;
 using google::protobuf::MessageLite;
+using std::string;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
@@ -175,16 +191,20 @@ void InboundCall::SerializeResponseBuffer(const MessageLite& response,
                                  &response_hdr_buf_);
 }
 
-void InboundCall::SerializeResponseTo(vector<Slice>* slices) const {
+size_t InboundCall::SerializeResponseTo(TransferPayload* slices) const {
   TRACE_EVENT0("rpc", "InboundCall::SerializeResponseTo");
-  CHECK_GT(response_hdr_buf_.size(), 0);
-  CHECK_GT(response_msg_buf_.size(), 0);
-  slices->reserve(slices->size() + 2 + outbound_sidecars_.size());
-  slices->push_back(Slice(response_hdr_buf_));
-  slices->push_back(Slice(response_msg_buf_));
-  for (const unique_ptr<RpcSidecar>& car : outbound_sidecars_) {
-    slices->push_back(car->AsSlice());
+  DCHECK_GT(response_hdr_buf_.size(), 0);
+  DCHECK_GT(response_msg_buf_.size(), 0);
+  size_t n_slices = 2 + outbound_sidecars_.size();
+  DCHECK_LE(n_slices, slices->size());
+  auto slice_iter = slices->begin();
+  *slice_iter++ = Slice(response_hdr_buf_);
+  *slice_iter++ = Slice(response_msg_buf_);
+  for (auto& sidecar : outbound_sidecars_) {
+    *slice_iter++ = sidecar->AsSlice();
   }
+  DCHECK_EQ(slice_iter - slices->begin(), n_slices);
+  return n_slices;
 }
 
 Status InboundCall::AddOutboundSidecar(unique_ptr<RpcSidecar> car, int* idx) {

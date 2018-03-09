@@ -19,7 +19,6 @@ namespace kudu {
 namespace random_internal {
 
 static const uint32_t M = 2147483647L;   // 2^31-1
-const double kTwoPi = 6.283185307179586476925286;
 
 } // namespace random_internal
 
@@ -203,6 +202,11 @@ class ThreadSafeRandom {
   double Normal(double mean, double std_dev) {
     std::lock_guard<simple_spinlock> l(lock_);
     return random_.Normal(mean, std_dev);
+  }
+
+  double NextDoubleFraction() {
+    std::lock_guard<simple_spinlock> l(lock_);
+    return random_.NextDoubleFraction();
   }
 
   template<class Collection, class Set, class T>

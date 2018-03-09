@@ -27,13 +27,14 @@
 package org.apache.kudu.client;
 
 import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
 import static org.apache.kudu.client.ExternalConsistencyMode.CLIENT_PROPAGATED;
 
+import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.security.cert.CertificateException;
 import java.util.ArrayList;
 import java.util.Arrays;
-import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Random;
@@ -43,7 +44,8 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
 import java.util.concurrent.Semaphore;
-
+import javax.annotation.Nonnull;
+import javax.annotation.Nullable;
 import javax.annotation.concurrent.GuardedBy;
 import javax.security.auth.Subject;
 
@@ -57,7 +59,8 @@ import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import com.stumbleupon.async.Callback;
 import com.stumbleupon.async.Deferred;
-
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.jboss.netty.channel.socket.ClientSocketChannelFactory;
 import org.jboss.netty.channel.socket.nio.NioClientSocketChannelFactory;
 import org.jboss.netty.channel.socket.nio.NioWorkerPool;
@@ -67,11 +70,11 @@ import org.jboss.netty.util.TimerTask;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import org.apache.kudu.Common;
 import org.apache.kudu.Schema;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.master.Master;
 import org.apache.kudu.master.Master.GetTableLocationsResponsePB;
+import org.apache.kudu.master.Master.TableIdentifierPB;
 import org.apache.kudu.util.AsyncUtil;
 import org.apache.kudu.util.NetUtil;
 import org.apache.kudu.util.Pair;
@@ -128,7 +131,8 @@ public class AsyncKuduClient implements AutoCloseable {
    * a lookup of a single partition (e.g. for a write), or re-looking-up a tablet with
    * stale information.
    */
-  static int FETCH_TABLETS_PER_POINT_LOOKUP = 10;
+  private static final int FETCH_TABLETS_PER_POINT_LOOKUP = 10;
+
   /**
    * The number of tablets to fetch from the master when looking up a range of
    * tablets.
@@ -144,16 +148,18 @@ public class AsyncKuduClient implements AutoCloseable {
   private final ConcurrentHashMap<String, TableLocationsCache> tableLocations =
       new ConcurrentHashMap<>();
 
+  /** A cache to keep track of already opened connections to Kudu servers. */
   private final ConnectionCache connectionCache;
 
   @GuardedBy("sessions")
   private final Set<AsyncKuduSession> sessions = new HashSet<>();
 
-  // Since the masters also go through TabletClient, we need to treat them as if they were a normal
-  // table. We'll use the following fake table name to identify places where we need special
+  // Since RPCs to the masters also go through RpcProxy, we need to treat them as if they were a
+  // normal table. We'll use the following fake table name to identify places where we need special
   // handling.
+  // TODO(aserbin) clean this up
   static final String MASTER_TABLE_NAME_PLACEHOLDER =  "Kudu Master";
-  final KuduTable masterTable;
+  private final KuduTable masterTable;
   private final List<HostAndPort> masterAddresses;
 
   private final HashedWheelTimer timer;
@@ -164,15 +170,6 @@ public class AsyncKuduClient implements AutoCloseable {
    * @see src/kudu/common/common.proto
    */
   private long lastPropagatedTimestamp = NO_TIMESTAMP;
-
-  /**
-   * A table is considered not served when we get a TABLET_NOT_RUNNING error from the master
-   * after calling GetTableLocations (it means that some tablets aren't ready to serve yet).
-   * We cache this information so that concurrent RPCs sent just after creating a table don't
-   * all try to hit the master for no good reason.
-   */
-  private final Set<String> tablesNotServed = Collections.newSetFromMap(new
-      ConcurrentHashMap<String, Boolean>());
 
   /**
    * Semaphore used to rate-limit master lookups
@@ -198,11 +195,13 @@ public class AsyncKuduClient implements AutoCloseable {
 
   private final SecurityContext securityContext;
 
+  /** A helper to facilitate re-acquiring of authentication token if current one expires. */
+  private final AuthnTokenReacquirer tokenReacquirer;
+
   private volatile boolean closed;
 
   private AsyncKuduClient(AsyncKuduClientBuilder b) {
     this.channelFactory = b.createChannelFactory();
-    this.securityContext = new SecurityContext(b.subject);
     this.masterAddresses = b.masterAddresses;
     this.masterTable = new KuduTable(this, MASTER_TABLE_NAME_PLACEHOLDER,
         MASTER_TABLE_NAME_PLACEHOLDER, null, null);
@@ -210,11 +209,103 @@ public class AsyncKuduClient implements AutoCloseable {
     this.defaultAdminOperationTimeoutMs = b.defaultAdminOperationTimeoutMs;
     this.defaultSocketReadTimeoutMs = b.defaultSocketReadTimeoutMs;
     this.statisticsDisabled = b.statisticsDisabled;
-    statistics = statisticsDisabled ? null : new Statistics();
+    this.statistics = statisticsDisabled ? null : new Statistics();
     this.timer = b.timer;
-    String clientId = UUID.randomUUID().toString().replace("-", "");
-    this.requestTracker = new RequestTracker(clientId);
-    this.connectionCache = new ConnectionCache(this);
+    this.requestTracker = new RequestTracker(UUID.randomUUID().toString().replace("-", ""));
+
+    this.securityContext = new SecurityContext(b.subject);
+    this.connectionCache = new ConnectionCache(
+        securityContext, defaultSocketReadTimeoutMs, timer, channelFactory);
+    this.tokenReacquirer = new AuthnTokenReacquirer(this);
+  }
+
+  /**
+   * Get a proxy to send RPC calls to the specified server. The result proxy object does not
+   * restrict the type of credentials that may be used to connect to the server: it will use the
+   * secondary credentials if available, otherwise SASL credentials are used to authenticate
+   * the client when negotiating the connection to the server.
+   *
+   * @param serverInfo server's information
+   * @return the proxy object bound to the target server
+   */
+  @Nonnull
+  RpcProxy newRpcProxy(final ServerInfo serverInfo) {
+    return newRpcProxy(serverInfo, Connection.CredentialsPolicy.ANY_CREDENTIALS);
+  }
+
+  /**
+   * Get a proxy to send RPC calls to the specified server. The result proxy object should use
+   * a connection to the server negotiated with the specified credentials policy.
+   *
+   * @param serverInfo target server information
+   * @param credentialsPolicy authentication credentials policy to use for the connection
+   *                          negotiation
+   * @return the proxy object bound to the target server
+   */
+  @Nonnull
+  private RpcProxy newRpcProxy(final ServerInfo serverInfo,
+                               Connection.CredentialsPolicy credentialsPolicy) {
+    final Connection connection = connectionCache.getConnection(serverInfo, credentialsPolicy);
+    return new RpcProxy(this, connection);
+  }
+
+  /**
+   * Get a proxy to send RPC calls to Kudu master at the specified end-point.
+   *
+   * @param hostPort master end-point
+   * @param credentialsPolicy credentials policy to use for the connection negotiation to the target
+   *                          master server
+   * @return the proxy object bound to the target master
+   */
+  @Nullable
+  RpcProxy newMasterRpcProxy(HostAndPort hostPort,
+                             Connection.CredentialsPolicy credentialsPolicy) {
+    // We should have a UUID to construct ServerInfo for the master, but we have a chicken
+    // and egg problem, we first need to communicate with the masters to find out about them,
+    // and that's what we're trying to do. The UUID is just used for logging and cache key,
+    // so instead we just use concatenation of master host and port, prefixed with "master-".
+    final InetAddress inetAddress = NetUtil.getInetAddress(hostPort.getHost());
+    if (inetAddress == null) {
+      // TODO(todd): should we log the resolution failure? throw an exception?
+      return null;
+    }
+    return newRpcProxy(
+        new ServerInfo("master-" + hostPort.toString(), hostPort, inetAddress), credentialsPolicy);
+  }
+
+  void reconnectToCluster(Callback<Void, Boolean> cb,
+                          Callback<Void, Exception> eb) {
+
+    final class ReconnectToClusterCB implements Callback<Void, ConnectToClusterResponse> {
+      private final Callback<Void, Boolean> cb;
+
+      ReconnectToClusterCB(Callback<Void, Boolean> cb) {
+        this.cb = Preconditions.checkNotNull(cb);
+      }
+
+      /**
+       * Report on the token re-acqusition results. The result authn token might be null: in that
+       * case the SASL credentials will be used to negotiate future connections.
+       */
+      @Override
+      public Void call(ConnectToClusterResponse resp) throws Exception {
+        final Master.ConnectToMasterResponsePB masterResponsePB = resp.getConnectResponse();
+        if (masterResponsePB.hasAuthnToken()) {
+          LOG.info("connect to master: received a new authn token");
+          securityContext.setAuthenticationToken(masterResponsePB.getAuthnToken());
+          cb.call(true);
+        } else {
+          LOG.warn("connect to master: received no authn token");
+          securityContext.setAuthenticationToken(null);
+          cb.call(false);
+        }
+        return null;
+      }
+    }
+
+    ConnectToCluster.run(masterTable, masterAddresses, null, defaultAdminOperationTimeoutMs,
+        Connection.CredentialsPolicy.PRIMARY_CREDENTIALS).addCallbacks(
+            new ReconnectToClusterCB(cb), eb);
   }
 
   /**
@@ -230,8 +321,25 @@ public class AsyncKuduClient implements AutoCloseable {
     }
   }
 
+  /**
+   * Returns the last timestamp received from a server. Used for CLIENT_PROPAGATED
+   * external consistency. Note that the returned timestamp is encoded and cannot be
+   * interpreted as a raw timestamp.
+   *
+   * @return a long indicating the specially-encoded last timestamp received from a server
+   */
   public synchronized long getLastPropagatedTimestamp() {
     return lastPropagatedTimestamp;
+  }
+
+  /**
+   * Checks if the client received any timestamps from a server. Used for
+   * CLIENT_PROPAGATED external consistency.
+   *
+   * @return true if last propagated timestamp has been set
+   */
+  public synchronized boolean hasLastPropagatedTimestamp() {
+    return lastPropagatedTimestamp != NO_TIMESTAMP;
   }
 
   /**
@@ -268,16 +376,64 @@ public class AsyncKuduClient implements AutoCloseable {
                                          "setRangePartitionColumns or addHashPartitions");
 
     }
-    CreateTableRequest create = new CreateTableRequest(this.masterTable, name, schema, builder);
+
+    // Send the CreateTable RPC.
+    final CreateTableRequest create = new CreateTableRequest(
+        this.masterTable, name, schema, builder);
     create.setTimeoutMillis(defaultAdminOperationTimeoutMs);
-    return sendRpcToTablet(create).addCallbackDeferring(
+    Deferred<CreateTableResponse> createTableD = sendRpcToTablet(create);
+
+    // Add a callback that converts the response into a KuduTable.
+    Deferred<KuduTable> kuduTableD = createTableD.addCallbackDeferring(
         new Callback<Deferred<KuduTable>, CreateTableResponse>() {
           @Override
-          public Deferred<KuduTable> call(CreateTableResponse createTableResponse)
-              throws Exception {
-            return openTable(name);
+          public Deferred<KuduTable> call(CreateTableResponse resp) throws Exception {
+            return getTableSchema(name, resp.getTableId(), create);
           }
         });
+
+    if (!builder.shouldWait()) {
+      return kuduTableD;
+    }
+
+    // If requested, add a callback that waits until all of the table's tablets
+    // have been created.
+    return kuduTableD.addCallbackDeferring(new Callback<Deferred<KuduTable>, KuduTable>() {
+      @Override
+      public Deferred<KuduTable> call(KuduTable tableResp) throws Exception {
+        TableIdentifierPB.Builder table = TableIdentifierPB.newBuilder()
+            .setTableId(ByteString.copyFromUtf8(tableResp.getTableId()));
+        return getDelayedIsCreateTableDoneDeferred(table, create, tableResp);
+      }
+    });
+  }
+
+  /**
+   * Check whether a previously issued createTable() is done.
+   * @param name table's name
+   * @return a deferred object to track the progress of the isCreateTableDone command
+   */
+  public Deferred<IsCreateTableDoneResponse> isCreateTableDone(String name) {
+    return doIsCreateTableDone(TableIdentifierPB.newBuilder().setTableName(name), null);
+  }
+
+  /**
+   * Check whether a previously issued createTable() is done.
+   * @param table table identifier
+   * @param parent parent RPC (for tracing), if any
+   * @return a deferred object to track the progress of the isCreateTableDone command
+   */
+  private Deferred<IsCreateTableDoneResponse> doIsCreateTableDone(
+      @Nonnull TableIdentifierPB.Builder table,
+      @Nullable KuduRpc<?> parent) {
+    checkIsClosed();
+    IsCreateTableDoneRequest request = new IsCreateTableDoneRequest(
+        this.masterTable, table);
+    request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    if (parent != null) {
+      request.setParentRpc(parent);
+    }
+    return sendRpcToTablet(request);
   }
 
   /**
@@ -295,31 +451,22 @@ public class AsyncKuduClient implements AutoCloseable {
   /**
    * Alter a table on the cluster as specified by the builder.
    *
-   * When the returned deferred completes it only indicates that the master accepted the alter
-   * command, use {@link AsyncKuduClient#isAlterTableDone(String)} to know when the alter finishes.
-   * @param name the table's name, if this is a table rename then the old table name must be passed
-   * @param ato the alter table builder
+   * @param name the table's name (old name if the table is being renamed)
+   * @param ato the alter table options
    * @return a deferred object to track the progress of the alter command
    */
   public Deferred<AlterTableResponse> alterTable(String name, AlterTableOptions ato) {
     checkIsClosed();
-    AlterTableRequest alter = new AlterTableRequest(this.masterTable, name, ato);
+    final AlterTableRequest alter = new AlterTableRequest(this.masterTable, name, ato);
     alter.setTimeoutMillis(defaultAdminOperationTimeoutMs);
-    Deferred<AlterTableResponse> response = sendRpcToTablet(alter);
+    Deferred<AlterTableResponse> responseD = sendRpcToTablet(alter);
 
     if (ato.hasAddDropRangePartitions()) {
       // Clear the table locations cache so the new partition is immediately visible.
-      return response.addCallback(new Callback<AlterTableResponse, AlterTableResponse>() {
+      responseD = responseD.addCallback(new Callback<AlterTableResponse, AlterTableResponse>() {
         @Override
         public AlterTableResponse call(AlterTableResponse resp) {
-          // If the master is of a recent enough version to return the table ID,
-          // we can selectively clear the cache only for the altered table.
-          // Otherwise, we clear the caches for all tables.
-          if (resp.getTableId() != null) {
-            tableLocations.remove(resp.getTableId());
-          } else {
-            tableLocations.clear();
-          }
+          tableLocations.remove(resp.getTableId());
           return resp;
         }
 
@@ -342,19 +489,48 @@ public class AsyncKuduClient implements AutoCloseable {
         }
       });
     }
-    return response;
+    if (!ato.shouldWait()) {
+      return responseD;
+    }
+
+    // If requested, add a callback that waits until all of the table's tablets
+    // have been altered.
+    return responseD.addCallbackDeferring(
+        new Callback<Deferred<AlterTableResponse>, AlterTableResponse>() {
+      @Override
+      public Deferred<AlterTableResponse> call(AlterTableResponse resp) throws Exception {
+        TableIdentifierPB.Builder table = TableIdentifierPB.newBuilder()
+            .setTableId(ByteString.copyFromUtf8(resp.getTableId()));
+        return getDelayedIsAlterTableDoneDeferred(table, alter, resp);
+      }
+    });
   }
 
   /**
-   * Helper method that checks and waits until the completion of an alter command.
-   * It will block until the alter command is done or the deadline is reached.
-   * @param name the table's name, if the table was renamed then that name must be checked against
+   * Check whether a previously issued alterTable() is done.
+   * @param name table name
    * @return a deferred object to track the progress of the isAlterTableDone command
    */
   public Deferred<IsAlterTableDoneResponse> isAlterTableDone(String name) {
+    return doIsAlterTableDone(TableIdentifierPB.newBuilder().setTableName(name), null);
+  }
+
+  /**
+   * Check whether a previously issued alterTable() is done.
+   * @param table table identifier
+   * @param parent parent RPC (for tracing), if any
+   * @return a deferred object to track the progress of the isAlterTableDone command
+   */
+  private Deferred<IsAlterTableDoneResponse> doIsAlterTableDone(
+      @Nonnull TableIdentifierPB.Builder table,
+      @Nullable KuduRpc<?> parent) {
     checkIsClosed();
-    IsAlterTableDoneRequest request = new IsAlterTableDoneRequest(this.masterTable, name);
+    IsAlterTableDoneRequest request = new IsAlterTableDoneRequest(
+        this.masterTable, table);
     request.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    if (parent != null) {
+      request.setParentRpc(parent);
+    }
     return sendRpcToTablet(request);
   }
 
@@ -369,10 +545,47 @@ public class AsyncKuduClient implements AutoCloseable {
     return sendRpcToTablet(rpc);
   }
 
-  Deferred<GetTableSchemaResponse> getTableSchema(String name) {
-    GetTableSchemaRequest rpc = new GetTableSchemaRequest(this.masterTable, name);
+  /**
+   * Gets a table's schema either by ID or by name. Note: the name must be
+   * provided, even if the RPC should be sent by ID.
+   * @param name name of table
+   * @param id immutable ID of table
+   * @param parent parent RPC (for tracing), if any
+   * @return a deferred object that yields the schema
+   */
+  private Deferred<KuduTable> getTableSchema(
+      @Nonnull final String tableName,
+      @Nullable String tableId,
+      @Nullable KuduRpc<?> parent) {
+    Preconditions.checkNotNull(tableName);
+
+    // Prefer a lookup by table ID over name, since the former is immutable.
+    GetTableSchemaRequest rpc = new GetTableSchemaRequest(
+        this.masterTable, tableId, tableId != null ? null : tableName);
+
+    if (parent != null) {
+      rpc.setParentRpc(parent);
+    }
     rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
-    return sendRpcToTablet(rpc);
+    return sendRpcToTablet(rpc).addCallback(new Callback<KuduTable, GetTableSchemaResponse>() {
+      @Override
+      public KuduTable call(GetTableSchemaResponse resp) throws Exception {
+        // When opening a table, clear the existing cached non-covered range entries.
+        // This avoids surprises where a new table instance won't be able to see the
+        // current range partitions of a table for up to the ttl.
+        TableLocationsCache cache = tableLocations.get(resp.getTableId());
+        if (cache != null) {
+          cache.clearNonCoveredRangeEntries();
+        }
+
+        LOG.debug("Opened table {}", resp.getTableId());
+        return new KuduTable(AsyncKuduClient.this,
+            tableName,
+            resp.getTableId(),
+            resp.getSchema(),
+            resp.getPartitionSchema());
+      }
+    });
   }
 
   /**
@@ -419,97 +632,17 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Open the table with the given name. If the table was just created, the Deferred will only get
-   * called back when all the tablets have been successfully created.
+   * Open the table with the given name.
+   *
+   * New range partitions created by other clients will immediately be available
+   * after opening the table.
+   *
    * @param name table to open
    * @return a KuduTable if the table exists, else a MasterErrorException
    */
-  public Deferred<KuduTable> openTable(final String name) {
+  public Deferred<KuduTable> openTable(String name) {
     checkIsClosed();
-
-    // We create an RPC that we're never going to send, and will instead use it to keep track of
-    // timeouts and use its Deferred.
-    final KuduRpc<KuduTable> fakeRpc = new KuduRpc<KuduTable>(null) {
-      @Override
-      Message createRequestPB() {
-        return null;
-      }
-
-      @Override
-      String serviceName() {
-        return null;
-      }
-
-      @Override
-      String method() {
-        return "IsCreateTableDone";
-      }
-
-      @Override
-      Pair<KuduTable, Object> deserialize(CallResponse callResponse, String tsUUID)
-          throws KuduException {
-        return null;
-      }
-    };
-    fakeRpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
-
-    return getTableSchema(name).addCallbackDeferring(new Callback<Deferred<KuduTable>,
-        GetTableSchemaResponse>() {
-      @Override
-      public Deferred<KuduTable> call(GetTableSchemaResponse response) throws Exception {
-        KuduTable table = new KuduTable(AsyncKuduClient.this,
-            name,
-            response.getTableId(),
-            response.getSchema(),
-            response.getPartitionSchema());
-        // We grab the Deferred first because calling callback on the RPC will reset it and we'd
-        // return a different, non-triggered Deferred.
-        Deferred<KuduTable> d = fakeRpc.getDeferred();
-        if (response.isCreateTableDone()) {
-          LOG.debug("Opened table {}", name);
-          fakeRpc.callback(table);
-        } else {
-          LOG.debug("Delaying opening table {}, its tablets aren't fully created", name);
-          fakeRpc.attempt++;
-          delayedIsCreateTableDone(
-              table,
-              fakeRpc,
-              getOpenTableCB(fakeRpc, table),
-              getDelayedIsCreateTableDoneErrback(fakeRpc));
-        }
-        return d;
-      }
-    });
-  }
-
-  /**
-   * This callback will be repeatadly used when opening a table until it is done being created.
-   */
-  Callback<Deferred<KuduTable>, Master.IsCreateTableDoneResponsePB> getOpenTableCB(
-      final KuduRpc<KuduTable> rpc, final KuduTable table) {
-    return new Callback<Deferred<KuduTable>, Master.IsCreateTableDoneResponsePB>() {
-      @Override
-      public Deferred<KuduTable> call(
-          Master.IsCreateTableDoneResponsePB isCreateTableDoneResponsePB) throws Exception {
-        String tableName = table.getName();
-        Deferred<KuduTable> d = rpc.getDeferred();
-        if (isCreateTableDoneResponsePB.getDone()) {
-          LOG.debug("Table {}'s tablets are now created", tableName);
-          rpc.callback(table);
-        } else {
-          rpc.attempt++;
-          LOG.debug("Table {}'s tablets are still not created, further delaying opening it",
-              tableName);
-
-          delayedIsCreateTableDone(
-              table,
-              rpc,
-              getOpenTableCB(rpc, table),
-              getDelayedIsCreateTableDoneErrback(rpc));
-        }
-        return d;
-      }
-    };
+    return getTableSchema(name, null, null);
   }
 
   /**
@@ -612,16 +745,9 @@ public class AsyncKuduClient implements AutoCloseable {
     return requestTracker;
   }
 
-  HashedWheelTimer getTimer() {
-    return timer;
-  }
-
-  ClientSocketChannelFactory getChannelFactory() {
-    return channelFactory;
-  }
-
-  SecurityContext getSecurityContext() {
-    return securityContext;
+  @VisibleForTesting
+  KuduTable getMasterTable() {
+    return masterTable;
   }
 
   /**
@@ -657,7 +783,7 @@ public class AsyncKuduClient implements AutoCloseable {
   void removeSession(AsyncKuduSession session) {
     synchronized (sessions) {
       boolean removed = sessions.remove(session);
-      assert removed == true;
+      assert removed;
     }
   }
 
@@ -667,24 +793,21 @@ public class AsyncKuduClient implements AutoCloseable {
    * @return A deferred row.
    */
   Deferred<AsyncKuduScanner.Response> scanNextRows(final AsyncKuduScanner scanner) {
-    RemoteTablet tablet = scanner.currentTablet();
-    assert (tablet != null);
+    RemoteTablet tablet = Preconditions.checkNotNull(scanner.currentTablet());
     KuduRpc<AsyncKuduScanner.Response> nextRequest = scanner.getNextRowsRequest();
-    String uuid = tablet.getReplicaSelectedUUID(nextRequest.getReplicaSelection());
-    TabletClient client = connectionCache.getClient(uuid);
     // Important to increment the attempts before the next if statement since
     // getSleepTimeForRpc() relies on it if the client is null or dead.
     nextRequest.attempt++;
-    if (client == null || !client.isAlive()) {
-      // A null client means we either don't know about this tablet anymore (unlikely) or we
-      // couldn't find a leader (which could be triggered by a read timeout).
-      // We'll first delay the RPC in case things take some time to settle down, then retry.
-      Status statusRemoteError = Status.RemoteError("Not connected to server " + uuid +
-          " will retry after a delay");
-      return delayedSendRpcToTablet(nextRequest, new RecoverableException(statusRemoteError));
+    final ServerInfo info = tablet.getReplicaSelectedServerInfo(nextRequest.getReplicaSelection());
+    if (info == null) {
+      return delayedSendRpcToTablet(nextRequest, new RecoverableException(Status.RemoteError(
+          String.format("No information on servers hosting tablet %s, will retry later",
+              tablet.getTabletId()))));
     }
+
     Deferred<AsyncKuduScanner.Response> d = nextRequest.getDeferred();
-    client.sendRpc(nextRequest);
+    RpcProxy.sendRpc(this, connectionCache.getConnection(
+        info, Connection.CredentialsPolicy.ANY_CREDENTIALS), nextRequest);
     return d;
   }
 
@@ -700,21 +823,16 @@ public class AsyncKuduClient implements AutoCloseable {
     if (tablet == null) {
       return Deferred.fromResult(null);
     }
-
-    final KuduRpc<AsyncKuduScanner.Response>  closeRequest = scanner.getCloseRequest();
-    final TabletClient client = connectionCache.getClient(
-        tablet.getReplicaSelectedUUID(closeRequest.getReplicaSelection()));
-    if (client == null || !client.isAlive()) {
-      // Oops, we couldn't find a tablet server that hosts this tablet. Our
-      // cache was probably invalidated while the client was scanning. So
-      // we can't close this scanner properly.
-      LOG.warn("Cannot close {} properly, no connection open for {}", scanner, tablet);
+    final KuduRpc<AsyncKuduScanner.Response> closeRequest = scanner.getCloseRequest();
+    final ServerInfo info = tablet.getReplicaSelectedServerInfo(closeRequest.getReplicaSelection());
+    if (info == null) {
       return Deferred.fromResult(null);
     }
 
     final Deferred<AsyncKuduScanner.Response> d = closeRequest.getDeferred();
     closeRequest.attempt++;
-    client.sendRpc(closeRequest);
+    RpcProxy.sendRpc(this, connectionCache.getConnection(
+        info, Connection.CredentialsPolicy.ANY_CREDENTIALS), closeRequest);
     return d;
   }
 
@@ -759,15 +877,13 @@ public class AsyncKuduClient implements AutoCloseable {
     // If we found a tablet, we'll try to find the TS to talk to.
     if (entry != null) {
       RemoteTablet tablet = entry.getTablet();
-      String uuid = tablet.getReplicaSelectedUUID(request.getReplicaSelection());
-      if (uuid != null) {
+      ServerInfo info = tablet.getReplicaSelectedServerInfo(request.getReplicaSelection());
+      if (info != null) {
         Deferred<R> d = request.getDeferred();
         request.setTablet(tablet);
-        TabletClient client = connectionCache.getLiveClient(uuid);
-        if (client != null) {
-          client.sendRpc(request);
-          return d;
-        }
+        RpcProxy.sendRpc(this, connectionCache.getConnection(
+            info, Connection.CredentialsPolicy.ANY_CREDENTIALS), request);
+        return d;
       }
     }
 
@@ -786,11 +902,6 @@ public class AsyncKuduClient implements AutoCloseable {
     //
     // 2) The tablet is known, but we do not have an active client for the
     //    leader replica.
-    if (tablesNotServed.contains(tableId)) {
-      return delayedIsCreateTableDone(request.getTable(), request,
-          new RetryRpcCB<R, Master.IsCreateTableDoneResponsePB>(request),
-          getDelayedIsCreateTableDoneErrback(request));
-    }
     Callback<Deferred<R>, Master.GetTableLocationsResponsePB> cb = new RetryRpcCB<>(request);
     Callback<Deferred<R>, Exception> eb = new RetryRpcErrback<>(request);
     Deferred<Master.GetTableLocationsResponsePB> returnedD =
@@ -864,77 +975,263 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * This errback ensures that if the delayed call to IsCreateTableDone throws an Exception that
+   * Returns an errback ensuring that if the delayed call throws an Exception,
    * it will be propagated back to the user.
-   * @param request Request to errback if there's a problem with the delayed call.
-   * @param <R> Request's return type.
-   * @return An errback.
+   * <p>
+   * @param rpc RPC to errback if there's a problem with the delayed call
+   * @param <R> RPC's return type
+   * @return newly created errback
    */
-  <R> Callback<Exception, Exception> getDelayedIsCreateTableDoneErrback(final KuduRpc<R> request) {
+  private <R> Callback<Exception, Exception> getDelayedIsTableDoneEB(
+      final KuduRpc<R> rpc) {
     return new Callback<Exception, Exception>() {
       @Override
       public Exception call(Exception e) throws Exception {
         // TODO maybe we can retry it?
-        request.errback(e);
+        rpc.errback(e);
         return e;
       }
     };
   }
 
   /**
-   * This method will call IsCreateTableDone on the master after sleeping for
-   * getSleepTimeForRpc() based on the provided KuduRpc's number of attempts. Once this is done,
-   * the provided callback will be called.
-   * @param table the table to lookup
-   * @param rpc the original KuduRpc that needs to access the table
-   * @param retryCB the callback to call on completion
-   * @param errback the errback to call if something goes wrong when calling IsCreateTableDone
-   * @return Deferred used to track the provided KuduRpc
+   * Creates an RPC that will never be sent, and will instead be used
+   * exclusively for timeouts.
+   * @param method fake RPC method (shows up in RPC traces)
+   * @param parent parent RPC (for tracing), if any
+   * @param <R> the expected return type of the fake RPC
+   * @return created fake RPC
    */
-  <R> Deferred<R> delayedIsCreateTableDone(final KuduTable table, final KuduRpc<R> rpc,
-                                           final Callback<Deferred<R>,
-                                               Master.IsCreateTableDoneResponsePB> retryCB,
-                                           final Callback<Exception, Exception> errback) {
+  private <R> KuduRpc<R> buildFakeRpc(
+      @Nonnull final String method,
+      @Nullable final KuduRpc<?> parent) {
+    KuduRpc<R> rpc = new KuduRpc<R>(null) {
+      @Override
+      Message createRequestPB() {
+        return null;
+      }
 
+      @Override
+      String serviceName() {
+        return null;
+      }
+
+      @Override
+      String method() {
+        return method;
+      }
+
+      @Override
+      Pair<R, Object> deserialize(
+          CallResponse callResponse, String tsUUID) throws KuduException {
+        return null;
+      }
+    };
+    rpc.setTimeoutMillis(defaultAdminOperationTimeoutMs);
+    if (parent != null) {
+      rpc.setParentRpc(parent);
+    }
+    return rpc;
+  }
+
+  /**
+   * Schedules a IsAlterTableDone RPC. When the response comes in, if the table
+   * is done altering, the RPC's callback chain is triggered with 'resp' as its
+   * value. If not, another IsAlterTableDone RPC is scheduled and the cycle
+   * repeats, until the alter is finished or a timeout is reached.
+   * @param table table identifier
+   * @param parent parent RPC (for tracing), if any
+   * @param resp previous AlterTableResponse, if any
+   * @return Deferred that will become ready when the alter is done
+   */
+  Deferred<AlterTableResponse> getDelayedIsAlterTableDoneDeferred(
+      @Nonnull TableIdentifierPB.Builder table,
+      @Nullable KuduRpc<?> parent,
+      @Nullable AlterTableResponse resp) {
+    // TODO(adar): By scheduling even the first RPC via timer, the sequence of
+    // RPCs is delayed by at least one timer tick, which is unfortunate for the
+    // case where the table is already fully altered.
+    //
+    // Eliminating the delay by sending the first RPC immediately (and
+    // scheduling the rest via timer) would also allow us to replace this "fake"
+    // RPC with a real one.
+    KuduRpc<AlterTableResponse> fakeRpc = buildFakeRpc("IsAlterTableDone", parent);
+
+    // Store the Deferred locally; callback() or errback() on the RPC will
+    // reset it and we'd return a different, non-triggered Deferred.
+    Deferred<AlterTableResponse> fakeRpcD = fakeRpc.getDeferred();
+
+    delayedIsAlterTableDone(
+        table,
+        fakeRpc,
+        getDelayedIsAlterTableDoneCB(fakeRpc, table, resp),
+        getDelayedIsTableDoneEB(fakeRpc));
+    return fakeRpcD;
+  }
+
+  /**
+   * Schedules a IsCreateTableDone RPC. When the response comes in, if the table
+   * is done creating, the RPC's callback chain is triggered with 'resp' as its
+   * value. If not, another IsCreateTableDone RPC is scheduled and the cycle
+   * repeats, until the createis finished or a timeout is reached.
+   * @param table table identifier
+   * @param parent parent RPC (for tracing), if any
+   * @param resp previous KuduTable, if any
+   * @return Deferred that will become ready when the create is done
+   */
+  Deferred<KuduTable> getDelayedIsCreateTableDoneDeferred(
+      @Nonnull TableIdentifierPB.Builder table,
+      @Nullable KuduRpc<?> parent,
+      @Nullable KuduTable resp) {
+    // TODO(adar): By scheduling even the first RPC via timer, the sequence of
+    // RPCs is delayed by at least one timer tick, which is unfortunate for the
+    // case where the table is already fully altered.
+    //
+    // Eliminating the delay by sending the first RPC immediately (and
+    // scheduling the rest via timer) would also allow us to replace this "fake"
+    // RPC with a real one.
+    KuduRpc<KuduTable> fakeRpc = buildFakeRpc("IsCreateTableDone", parent);
+
+    // Store the Deferred locally; callback() or errback() on the RPC will
+    // reset it and we'd return a different, non-triggered Deferred.
+    Deferred<KuduTable> fakeRpcD = fakeRpc.getDeferred();
+
+    delayedIsCreateTableDone(
+        table,
+        fakeRpc,
+        getDelayedIsCreateTableDoneCB(fakeRpc, table, resp),
+        getDelayedIsTableDoneEB(fakeRpc));
+    return fakeRpcD;
+  }
+
+  /**
+   * Returns a callback to be called upon completion of an IsAlterTableDone RPC.
+   * If the table is fully altered, triggers the provided rpc's callback chain
+   * with 'alterResp' as its value. Otherwise, sends another IsAlterTableDone
+   * RPC after sleeping.
+   * <p>
+   * @param rpc RPC that initiated this sequence of operations
+   * @param table table identifier
+   * @param alterResp response from an earlier AlterTable RPC, if any
+   * @return callback that will eventually return 'alterResp'
+   */
+  private Callback<Deferred<AlterTableResponse>, IsAlterTableDoneResponse> getDelayedIsAlterTableDoneCB(
+      @Nonnull final KuduRpc<AlterTableResponse> rpc,
+      @Nonnull final TableIdentifierPB.Builder table,
+      @Nullable final AlterTableResponse alterResp) {
+    return new Callback<Deferred<AlterTableResponse>, IsAlterTableDoneResponse>() {
+      @Override
+      public Deferred<AlterTableResponse> call(IsAlterTableDoneResponse resp) throws Exception {
+        // Store the Deferred locally; callback() below will reset it and we'd
+        // return a different, non-triggered Deferred.
+        Deferred<AlterTableResponse> d = rpc.getDeferred();
+        if (resp.isDone()) {
+          rpc.callback(alterResp);
+        } else {
+          rpc.attempt++;
+          delayedIsAlterTableDone(
+              table,
+              rpc,
+              getDelayedIsAlterTableDoneCB(rpc, table, alterResp),
+              getDelayedIsTableDoneEB(rpc));
+        }
+        return d;
+      }
+    };
+  }
+
+  /**
+   * Returns a callback to be called upon completion of an IsCreateTableDone RPC.
+   * If the table is fully created, triggers the provided rpc's callback chain
+   * with 'tableResp' as its value. Otherwise, sends another IsCreateTableDone
+   * RPC after sleeping.
+   * <p>
+   * @param rpc RPC that initiated this sequence of operations
+   * @param table table identifier
+   * @param tableResp previously constructed KuduTable, if any
+   * @return callback that will eventually return 'tableResp'
+   */
+  private Callback<Deferred<KuduTable>, IsCreateTableDoneResponse> getDelayedIsCreateTableDoneCB(
+      final KuduRpc<KuduTable> rpc,
+      final TableIdentifierPB.Builder table,
+      final KuduTable tableResp) {
+    return new Callback<Deferred<KuduTable>, IsCreateTableDoneResponse>() {
+      @Override
+      public Deferred<KuduTable> call(IsCreateTableDoneResponse resp) throws Exception {
+        // Store the Deferred locally; callback() below will reset it and we'd
+        // return a different, non-triggered Deferred.
+        Deferred<KuduTable> d = rpc.getDeferred();
+        if (resp.isDone()) {
+          rpc.callback(tableResp);
+        } else {
+          rpc.attempt++;
+          delayedIsCreateTableDone(
+              table,
+              rpc,
+              getDelayedIsCreateTableDoneCB(rpc, table, tableResp),
+              getDelayedIsTableDoneEB(rpc));
+        }
+        return d;
+      }
+    };
+  }
+
+  /**
+   * Schedules a timer to send an IsCreateTableDone RPC to the master after
+   * sleeping for getSleepTimeForRpc() (based on the provided KuduRpc's number
+   * of attempts). When the master responds, the provided callback will be called.
+   * <p>
+   * @param table table identifier
+   * @param rpc original KuduRpc that needs to access the table
+   * @param callback callback to call on completion
+   * @param errback errback to call if something goes wrong
+   */
+  private void delayedIsCreateTableDone(
+      final TableIdentifierPB.Builder table,
+      final KuduRpc<KuduTable> rpc,
+      final Callback<Deferred<KuduTable>, IsCreateTableDoneResponse> callback,
+      final Callback<Exception, Exception> errback) {
     final class RetryTimer implements TimerTask {
       public void run(final Timeout timeout) {
-        String tableId = table.getTableId();
-        final boolean has_permit = acquireMasterLookupPermit();
-        if (!has_permit) {
-          // If we failed to acquire a permit, it's worth checking if someone
-          // looked up the tablet we're interested in.  Every once in a while
-          // this will save us a Master lookup.
-          if (!tablesNotServed.contains(tableId)) {
-            try {
-              retryCB.call(null);
-              return;
-            } catch (Exception e) {
-              // we're calling RetryRpcCB which doesn't throw exceptions, ignore
-            }
-          }
-        }
-        IsCreateTableDoneRequest isCreateTableDoneRequest =
-            new IsCreateTableDoneRequest(masterTable, tableId);
-        isCreateTableDoneRequest.setTimeoutMillis(defaultAdminOperationTimeoutMs);
-        isCreateTableDoneRequest.setParentRpc(rpc);
-        final Deferred<Master.IsCreateTableDoneResponsePB> d =
-            sendRpcToTablet(isCreateTableDoneRequest).addCallback(new IsCreateTableDoneCB(tableId));
-        if (has_permit) {
-          // The errback is needed here to release the lookup permit
-          d.addCallbacks(new ReleaseMasterLookupPermit<Master.IsCreateTableDoneResponsePB>(),
-              new ReleaseMasterLookupPermit<Exception>());
-        }
-        d.addCallbacks(retryCB, errback);
+        doIsCreateTableDone(table, rpc).addCallbacks(callback, errback);
       }
     }
 
-    long sleepTime = getSleepTimeForRpc(rpc);
-    if (rpc.deadlineTracker.wouldSleepingTimeout(sleepTime)) {
-      return tooManyAttemptsOrTimeout(rpc, null);
+    long sleepTimeMillis = getSleepTimeForRpcMillis(rpc);
+    if (rpc.deadlineTracker.wouldSleepingTimeoutMillis(sleepTimeMillis)) {
+      tooManyAttemptsOrTimeout(rpc, null);
+      return;
+    }
+    newTimeout(new RetryTimer(), sleepTimeMillis);
+  }
+
+  /**
+   * Schedules a timer to send an IsAlterTableDone RPC to the master after
+   * sleeping for getSleepTimeForRpc() (based on the provided KuduRpc's number
+   * of attempts). When the master responds, the provided callback will be called.
+   * <p>
+   * @param table table identifier
+   * @param rpc original KuduRpc that needs to access the table
+   * @param callback callback to call on completion
+   * @param errback errback to call if something goes wrong
+   */
+  private void delayedIsAlterTableDone(
+      final TableIdentifierPB.Builder table,
+      final KuduRpc<AlterTableResponse> rpc,
+      final Callback<Deferred<AlterTableResponse>, IsAlterTableDoneResponse> callback,
+      final Callback<Exception, Exception> errback) {
+    final class RetryTimer implements TimerTask {
+      public void run(final Timeout timeout) {
+        doIsAlterTableDone(table, rpc).addCallbacks(callback, errback);
+      }
     }
 
-    newTimeout(new RetryTimer(), sleepTime);
-    return rpc.getDeferred();
+    long sleepTimeMillis = getSleepTimeForRpcMillis(rpc);
+    if (rpc.deadlineTracker.wouldSleepingTimeoutMillis(sleepTimeMillis)) {
+      tooManyAttemptsOrTimeout(rpc, null);
+      return;
+    }
+    newTimeout(new RetryTimer(), sleepTimeMillis);
   }
 
   private final class ReleaseMasterLookupPermit<T> implements Callback<T, T> {
@@ -948,68 +1245,19 @@ public class AsyncKuduClient implements AutoCloseable {
     }
   }
 
-  /** Callback executed when IsCreateTableDone completes.  */
-  private final class IsCreateTableDoneCB implements Callback<Master.IsCreateTableDoneResponsePB,
-      Master.IsCreateTableDoneResponsePB> {
-    final String tableName;
-
-    IsCreateTableDoneCB(String tableName) {
-      this.tableName = tableName;
-
-    }
-
-    public Master.IsCreateTableDoneResponsePB
-        call(final Master.IsCreateTableDoneResponsePB response) {
-      if (response.getDone()) {
-        LOG.debug("Table {} was created", tableName);
-        tablesNotServed.remove(tableName);
-      } else {
-        LOG.debug("Table {} is still being created", tableName);
-      }
-      return response;
-    }
-
-    public String toString() {
-      return "ask the master if " + tableName + " was created";
-    }
-  }
-
-  boolean isTableNotServed(String tableId) {
-    return tablesNotServed.contains(tableId);
-  }
-
-  long getSleepTimeForRpc(KuduRpc<?> rpc) {
-    byte attemptCount = rpc.attempt;
-    assert (attemptCount > 0);
+  private long getSleepTimeForRpcMillis(KuduRpc<?> rpc) {
+    int attemptCount = rpc.attempt;
     if (attemptCount == 0) {
-      LOG.warn("Possible bug: attempting to retry an RPC with no attempts. RPC: " + rpc,
-          new Exception("Exception created to collect stack trace"));
-      attemptCount = 1;
+      // If this is the first RPC attempt, don't sleep at all.
+      return 0;
     }
     // Randomized exponential backoff, truncated at 4096ms.
     long sleepTime = (long)(Math.pow(2.0, Math.min(attemptCount, 12)) *
         sleepRandomizer.nextDouble());
     if (LOG.isTraceEnabled()) {
-      LOG.trace("Going to sleep for " + sleepTime + " at retry " + rpc.attempt);
+      LOG.trace("Going to sleep for {} at retry {}", sleepTime, rpc.attempt);
     }
     return sleepTime;
-  }
-
-  /**
-   * Modifying the list returned by this method won't change how AsyncKuduClient behaves,
-   * but calling certain methods on the returned TabletClients can. For example,
-   * it's possible to forcefully shutdown a connection to a tablet server by calling {@link
-   * TabletClient#shutdown()}.
-   * @return copy of the current TabletClients list
-   */
-  @VisibleForTesting
-  List<TabletClient> getTabletClients() {
-    return connectionCache.getImmutableTabletClientsList();
-  }
-
-  @VisibleForTesting
-  TabletClient getTabletClient(String uuid) {
-    return connectionCache.getClient(uuid);
   }
 
   /**
@@ -1031,7 +1279,7 @@ public class AsyncKuduClient implements AutoCloseable {
    * @return {@code true} if this RPC already had too many attempts,
    * {@code false} otherwise (in which case it's OK to retry once more)
    */
-  static boolean cannotRetryRequest(final KuduRpc<?> rpc) {
+  private static boolean cannotRetryRequest(final KuduRpc<?> rpc) {
     return rpc.deadlineTracker.timedOut() || rpc.attempt > MAX_RPC_ATTEMPTS;
   }
 
@@ -1042,19 +1290,18 @@ public class AsyncKuduClient implements AutoCloseable {
    * @param cause What was cause of the last failed attempt, if known.
    * You can pass {@code null} if the cause is unknown.
    */
-  static <R> Deferred<R> tooManyAttemptsOrTimeout(final KuduRpc<R> request,
-                                                  final KuduException cause) {
+  private static <R> Deferred<R> tooManyAttemptsOrTimeout(final KuduRpc<R> request,
+                                                          final KuduException cause) {
     String message;
     if (request.attempt > MAX_RPC_ATTEMPTS) {
-      message = "Too many attempts: ";
+      message = "too many attempts: ";
     } else {
-      message = "RPC can not complete before timeout: ";
+      message = "can not complete before timeout: ";
     }
     Status statusTimedOut = Status.TimedOut(message + request);
-    final Exception e = new NonRecoverableException(statusTimedOut, cause);
-    LOG.debug("Cannot continue with this RPC: {} because of: {}", request, message, e);
+    LOG.debug("Cannot continue with RPC because of: {}", statusTimedOut);
     Deferred<R> d = request.getDeferred();
-    request.errback(e);
+    request.errback(new NonRecoverableException(statusTimedOut, cause));
     return d;
   }
 
@@ -1078,7 +1325,7 @@ public class AsyncKuduClient implements AutoCloseable {
       // this will save us a Master lookup.
       TableLocationsCache.Entry entry = getTableLocationEntry(tableId, partitionKey);
       if (entry != null && !entry.isNonCoveredRange() &&
-          entry.getTablet().getLeaderUUID() != null) {
+          entry.getTablet().getLeaderServerInfo() != null) {
         return Deferred.fromResult(null);  // Looks like no lookup needed.
       }
     }
@@ -1114,16 +1361,15 @@ public class AsyncKuduClient implements AutoCloseable {
    * @return An initialized Deferred object to hold the response.
    */
   Deferred<Master.GetTableLocationsResponsePB> getMasterTableLocationsPB(KuduRpc<?> parentRpc) {
-    return ConnectToCluster.run(masterAddresses, parentRpc, connectionCache,
-        defaultAdminOperationTimeoutMs)
-        .addCallback(
+    // TODO(todd): stop using this 'masterTable' hack.
+    return ConnectToCluster.run(masterTable, masterAddresses, parentRpc,
+        defaultAdminOperationTimeoutMs, Connection.CredentialsPolicy.ANY_CREDENTIALS).addCallback(
             new Callback<Master.GetTableLocationsResponsePB, ConnectToClusterResponse>() {
               @Override
               public Master.GetTableLocationsResponsePB call(ConnectToClusterResponse resp) {
-                // If the response has security info, adopt it.
                 if (resp.getConnectResponse().hasAuthnToken()) {
-                  securityContext.setAuthenticationToken(
-                      resp.getConnectResponse().getAuthnToken());
+                  // If the response has security info, adopt it.
+                  securityContext.setAuthenticationToken(resp.getConnectResponse().getAuthnToken());
                 }
                 List<ByteString> caCerts = resp.getConnectResponse().getCaCertDerList();
                 if (!caCerts.isEmpty()) {
@@ -1256,8 +1502,8 @@ public class AsyncKuduClient implements AutoCloseable {
    * We're handling a tablet server that's telling us it doesn't have the tablet we're asking for.
    * We're in the context of decode() meaning we need to either callback or retry later.
    */
-  <R> void handleTabletNotFound(final KuduRpc<R> rpc, KuduException ex, TabletClient server) {
-    invalidateTabletCache(rpc.getTablet(), server);
+  <R> void handleTabletNotFound(final KuduRpc<R> rpc, KuduException ex, ServerInfo info) {
+    invalidateTabletCache(rpc.getTablet(), info);
     handleRetryableError(rpc, ex);
   }
 
@@ -1265,8 +1511,8 @@ public class AsyncKuduClient implements AutoCloseable {
    * A tablet server is letting us know that it isn't the specified tablet's leader in response
    * a RPC, so we need to demote it and retry.
    */
-  <R> void handleNotLeader(final KuduRpc<R> rpc, KuduException ex, TabletClient server) {
-    rpc.getTablet().demoteLeader(server.getServerInfo().getUuid());
+  <R> void handleNotLeader(final KuduRpc<R> rpc, KuduException ex, ServerInfo info) {
+    rpc.getTablet().demoteLeader(info.getUuid());
     handleRetryableError(rpc, ex);
   }
 
@@ -1278,8 +1524,34 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
+   * Same as {@link #handleRetryableError(KuduRpc, KuduException)}, but without the delay before
+   * retrying the RPC.
+   *
+   * @param rpc the RPC to retry
+   * @param ex the exception which lead to the attempt of RPC retry
+   */
+  <R> void handleRetryableErrorNoDelay(final KuduRpc<R> rpc, KuduException ex) {
+    if (cannotRetryRequest(rpc)) {
+      tooManyAttemptsOrTimeout(rpc, ex);
+      return;
+    }
+    sendRpcToTablet(rpc);
+  }
+
+  /**
+   * Handle a RPC failed due to invalid authn token error. In short, connect to the Kudu cluster
+   * to acquire a new authentication token and retry the RPC once a new authentication token
+   * is put into the {@link #securityContext}.
+   *
+   * @param rpc the RPC which failed do to invalid authn token
+   */
+  <R> void handleInvalidToken(KuduRpc<R> rpc) {
+    tokenReacquirer.handleAuthnTokenExpiration(rpc);
+  }
+
+  /**
    * This methods enable putting RPCs on hold for a period of time determined by
-   * {@link #getSleepTimeForRpc(KuduRpc)}. If the RPC is out of time/retries, its errback will
+   * {@link #getSleepTimeForRpcMillis(KuduRpc)}. If the RPC is out of time/retries, its errback will
    * be immediately called.
    * @param rpc the RPC to retry later
    * @param ex the reason why we need to retry
@@ -1307,8 +1579,8 @@ public class AsyncKuduClient implements AutoCloseable {
             .callStatus(reasonForRetry)
             .build());
 
-    long sleepTime = getSleepTimeForRpc(rpc);
-    if (cannotRetryRequest(rpc) || rpc.deadlineTracker.wouldSleepingTimeout(sleepTime)) {
+    long sleepTime = getSleepTimeForRpcMillis(rpc);
+    if (cannotRetryRequest(rpc) || rpc.deadlineTracker.wouldSleepingTimeoutMillis(sleepTime)) {
       // Don't let it retry.
       return tooManyAttemptsOrTimeout(rpc, ex);
     }
@@ -1320,10 +1592,38 @@ public class AsyncKuduClient implements AutoCloseable {
    * Remove the tablet server from the RemoteTablet's locations. Right now nothing is removing
    * the tablet itself from the caches.
    */
-  private void invalidateTabletCache(RemoteTablet tablet, TabletClient server) {
-    String uuid = server.getServerInfo().getUuid();
+  private void invalidateTabletCache(RemoteTablet tablet, ServerInfo info) {
+    final String uuid = info.getUuid();
     LOG.info("Removing server {} from this tablet's cache {}", uuid, tablet.getTabletId());
     tablet.removeTabletClient(uuid);
+  }
+
+  /**
+   * Translate master-provided information {@link Master.TSInfoPB} on a tablet server into internal
+   * {@link ServerInfo} representation.
+   *
+   * @param tsInfoPB master-provided information for the tablet server
+   * @return an object that contains all the server's information
+   * @throws UnknownHostException if we cannot resolve the tablet server's IP address
+   */
+  private ServerInfo resolveTS(Master.TSInfoPB tsInfoPB) throws UnknownHostException {
+    final List<Common.HostPortPB> addresses = tsInfoPB.getRpcAddressesList();
+    final String uuid = tsInfoPB.getPermanentUuid().toStringUtf8();
+    if (addresses.isEmpty()) {
+      LOG.warn("Received a tablet server with no addresses, UUID: {}", uuid);
+      return null;
+    }
+
+    // from meta_cache.cc
+    // TODO: if the TS advertises multiple host/ports, pick the right one
+    // based on some kind of policy. For now just use the first always.
+    final HostAndPort hostPort = ProtobufHelper.hostAndPortFromPB(addresses.get(0));
+    final InetAddress inetAddress = NetUtil.getInetAddress(hostPort.getHost());
+    if (inetAddress == null) {
+      throw new UnknownHostException(
+          "Failed to resolve the IP of `" + addresses.get(0).getHost() + "'");
+    }
+    return new ServerInfo(uuid, hostPort, inetAddress);
   }
 
   /** Callback executed when a master lookup completes.  */
@@ -1341,14 +1641,8 @@ public class AsyncKuduClient implements AutoCloseable {
 
     public Object call(final GetTableLocationsResponsePB response) {
       if (response.hasError()) {
-        if (response.getError().getCode() == Master.MasterErrorPB.Code.TABLET_NOT_RUNNING) {
-          // Keep a note that the table exists but at least one tablet is not yet running.
-          LOG.debug("Table {} has a non-running tablet", table.getName());
-          tablesNotServed.add(table.getTableId());
-        } else {
-          Status status = Status.fromMasterErrorPB(response.getError());
-          return new NonRecoverableException(status);
-        }
+        Status status = Status.fromMasterErrorPB(response.getError());
+        return new NonRecoverableException(status);
       } else {
         try {
           discoverTablets(table,
@@ -1368,7 +1662,7 @@ public class AsyncKuduClient implements AutoCloseable {
     }
   }
 
-  boolean acquireMasterLookupPermit() {
+  private boolean acquireMasterLookupPermit() {
     try {
       // With such a low timeout, the JVM may chose to spin-wait instead of
       // de-scheduling the thread (and causing context switches and whatnot).
@@ -1383,7 +1677,7 @@ public class AsyncKuduClient implements AutoCloseable {
    * Releases a master lookup permit that was acquired.
    * @see #acquireMasterLookupPermit
    */
-  void releaseMasterLookupPermit() {
+  private void releaseMasterLookupPermit() {
     masterLookups.release();
   }
 
@@ -1427,7 +1721,7 @@ public class AsyncKuduClient implements AutoCloseable {
       List<ServerInfo> servers = new ArrayList<>(tabletPb.getReplicasCount());
       for (Master.TabletLocationsPB.ReplicaPB replica : tabletPb.getReplicasList()) {
         try {
-          ServerInfo serverInfo = connectionCache.connectTS(replica.getTsInfo());
+          ServerInfo serverInfo = resolveTS(replica.getTsInfo());
           if (serverInfo != null) {
             servers.add(serverInfo);
           }
@@ -1458,7 +1752,7 @@ public class AsyncKuduClient implements AutoCloseable {
     // right away. If not, we throw an exception that RetryRpcErrback will understand as needing to
     // sleep before retrying.
     TableLocationsCache.Entry entry = locationsCache.get(requestPartitionKey);
-    if (!entry.isNonCoveredRange() && entry.getTablet().getLeaderUUID() == null) {
+    if (!entry.isNonCoveredRange() && entry.getTablet().getLeaderServerInfo() == null) {
       throw new NoLeaderFoundException(
           Status.NotFound("Tablet " + entry.toString() + " doesn't have a leader"));
     }
@@ -1512,7 +1806,7 @@ public class AsyncKuduClient implements AutoCloseable {
           public Deferred<LocatedTablet> call(List<LocatedTablet> tablets) {
             Preconditions.checkArgument(tablets.size() <= 1,
                                         "found more than one tablet for a single partition key");
-            if (tablets.size() == 0) {
+            if (tablets.isEmpty()) {
               // Most likely this indicates a non-covered range, but since this
               // could race with an alter table partitioning operation (which
               // clears the local table locations cache), we check again.
@@ -1538,8 +1832,9 @@ public class AsyncKuduClient implements AutoCloseable {
   }
 
   /**
-   * Invokes {@link #shutdown()} and waits. This method returns
-   * void, so consider invoking shutdown directly if there's a need to handle dangling RPCs.
+   * Invokes {@link #shutdown()} and waits. This method returns void, so consider invoking
+   * {@link #shutdown()} directly if there's a need to handle dangling RPCs.
+   *
    * @throws Exception if an error happens while closing the connections
    */
   @Override
@@ -1557,7 +1852,8 @@ public class AsyncKuduClient implements AutoCloseable {
    *   <li>Releases all other resources.</li>
    * </ul>
    * <strong>Not calling this method before losing the last reference to this
-   * instance may result in data loss and other unwanted side effects</strong>
+   * instance may result in data loss and other unwanted side effects.</strong>
+   *
    * @return A {@link Deferred}, whose callback chain will be invoked once all
    * of the above have been done. If this callback chain doesn't fail, then
    * the clean shutdown will be successful, and all the data will be safe on
@@ -1578,6 +1874,7 @@ public class AsyncKuduClient implements AutoCloseable {
         super("AsyncKuduClient@" + AsyncKuduClient.super.hashCode() + " shutdown");
       }
 
+      @Override
       public void run() {
         // This terminates the Executor.
         channelFactory.releaseExternalResources();
@@ -1626,7 +1923,7 @@ public class AsyncKuduClient implements AutoCloseable {
     // concurrent modification during the iteration.
     Set<AsyncKuduSession> copyOfSessions;
     synchronized (sessions) {
-      copyOfSessions = new HashSet<AsyncKuduSession>(sessions);
+      copyOfSessions = new HashSet<>(sessions);
     }
     if (sessions.isEmpty()) {
       return Deferred.fromResult(null);
@@ -1640,7 +1937,7 @@ public class AsyncKuduClient implements AutoCloseable {
     return Deferred.group(deferreds);
   }
 
-  private boolean isMasterTable(String tableId) {
+  private static boolean isMasterTable(String tableId) {
     // Checking that it's the same instance so there's absolutely no chance of confusing the master
     // 'table' for a user one.
     return MASTER_TABLE_NAME_PLACEHOLDER == tableId;
@@ -1656,6 +1953,14 @@ public class AsyncKuduClient implements AutoCloseable {
       LOG.warn("Failed to schedule timer." +
           " Ignore this if we're shutting down.", e);
     }
+  }
+
+  /**
+   * @return copy of the current TabletClients list
+   */
+  @VisibleForTesting
+  List<Connection> getConnectionListCopy() {
+    return connectionCache.getConnectionListCopy();
   }
 
   /**

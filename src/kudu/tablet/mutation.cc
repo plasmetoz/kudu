@@ -15,16 +15,21 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/strings/strcat.h"
 #include "kudu/tablet/mutation.h"
+
 #include <string>
 
+#include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/strings/strcat.h"
+
 namespace kudu {
+
+class Schema;
+
 namespace tablet {
 
-string Mutation::StringifyMutationList(const Schema &schema, const Mutation *head) {
-  string ret;
+std::string Mutation::StringifyMutationList(const Schema &schema, const Mutation *head) {
+  std::string ret;
 
   ret.append("[");
 

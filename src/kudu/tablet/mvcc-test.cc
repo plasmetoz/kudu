@@ -15,15 +15,26 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <mutex>
+#include <ostream>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <mutex>
-#include <thread>
 
-#include "kudu/server/hybrid_clock.h"
-#include "kudu/server/logical_clock.h"
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/clock/logical_clock.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/tablet/mvcc.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 using std::thread;
@@ -31,14 +42,14 @@ using std::thread;
 namespace kudu {
 namespace tablet {
 
-using server::Clock;
-using server::HybridClock;
+using clock::Clock;
+using clock::HybridClock;
 
 class MvccTest : public KuduTest {
  public:
   MvccTest()
       : clock_(
-          server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
+          clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)) {
   }
 
   void WaitForSnapshotAtTSThread(MvccManager* mgr, Timestamp ts) {
@@ -55,7 +66,7 @@ class MvccTest : public KuduTest {
   }
 
  protected:
-  scoped_refptr<server::Clock> clock_;
+  scoped_refptr<clock::Clock> clock_;
 
   mutable simple_spinlock lock_;
   gscoped_ptr<MvccSnapshot> result_snapshot_;
@@ -273,6 +284,14 @@ TEST_F(MvccTest, TestScopedTransaction) {
   mgr.TakeSnapshot(&snap);
   ASSERT_TRUE(snap.IsCommitted(Timestamp(1)));
   ASSERT_FALSE(snap.IsCommitted(Timestamp(2)));
+
+  // Test that an applying scoped transaction does not crash if it goes out of
+  // scope while the MvccManager is closed.
+  mgr.Close();
+  {
+    ScopedTransaction t(&mgr, clock_->Now());
+    NO_FATALS(t.StartApplying());
+  }
 }
 
 TEST_F(MvccTest, TestPointInTimeSnapshot) {
@@ -456,11 +475,14 @@ TEST_F(MvccTest, TestWaitForCleanSnapshot_SnapAfterSafeTimeWithInFlights) {
 
   // Wait should return immediately, since we have no transactions "applying"
   // yet.
-  mgr.WaitForApplyingTransactionsToCommit();
+  ASSERT_OK(mgr.WaitForApplyingTransactionsToCommit());
 
   mgr.StartApplyingTransaction(tx1);
 
-  thread waiting_thread = thread(&MvccManager::WaitForApplyingTransactionsToCommit, &mgr);
+  Status s;
+  thread waiting_thread = thread([&] {
+    s = mgr.WaitForApplyingTransactionsToCommit();
+  });
   while (mgr.GetNumWaitersForTests() == 0) {
     SleepFor(MonoDelta::FromMilliseconds(5));
   }
@@ -474,6 +496,7 @@ TEST_F(MvccTest, TestWaitForCleanSnapshot_SnapAfterSafeTimeWithInFlights) {
   mgr.CommitTransaction(tx1);
   ASSERT_EQ(mgr.GetNumWaitersForTests(), 0);
   waiting_thread.join();
+  ASSERT_OK(s);
 }
 
 TEST_F(MvccTest, TestWaitForCleanSnapshot_SnapAtTimestampWithInFlights) {
@@ -525,7 +548,7 @@ TEST_F(MvccTest, TestWaitForApplyingTransactionsToCommit) {
 
   // Wait should return immediately, since we have no transactions "applying"
   // yet.
-  mgr.WaitForApplyingTransactionsToCommit();
+  ASSERT_OK(mgr.WaitForApplyingTransactionsToCommit());
 
   mgr.StartApplyingTransaction(tx1);
 
@@ -543,6 +566,43 @@ TEST_F(MvccTest, TestWaitForApplyingTransactionsToCommit) {
   mgr.CommitTransaction(tx1);
   ASSERT_EQ(mgr.GetNumWaitersForTests(), 0);
   waiting_thread.join();
+}
+
+// Test to ensure that after MVCC has been closed, it will not Wait and will
+// instead return an error.
+TEST_F(MvccTest, TestDontWaitAfterClose) {
+  MvccManager mgr;
+  Timestamp tx1 = clock_->Now();
+  mgr.StartTransaction(tx1);
+  mgr.AdjustSafeTime(tx1);
+  mgr.StartApplyingTransaction(tx1);
+
+  // Spin up a thread to wait on the applying transaction.
+  // Lock the changing status. This is only necessary in this test to read the
+  // status from the main thread, showing that, regardless of where, closing
+  // MVCC will cause waiters to abort mid-wait.
+  Status s;
+  simple_spinlock status_lock;
+  thread waiting_thread = thread([&] {
+    std::lock_guard<simple_spinlock> l(status_lock);
+    s = mgr.WaitForApplyingTransactionsToCommit();
+  });
+
+  // Wait until the waiter actually gets registered.
+  while (mgr.GetNumWaitersForTests() == 0) {
+    SleepFor(MonoDelta::FromMilliseconds(5));
+  }
+
+  // Set that the mgr is closing. This should cause waiters to abort.
+  mgr.Close();
+  waiting_thread.join();
+  ASSERT_STR_CONTAINS(s.ToString(), "closed");
+  ASSERT_TRUE(s.IsAborted());
+
+  // New waiters should abort immediately.
+  s = mgr.WaitForApplyingTransactionsToCommit();
+  ASSERT_STR_CONTAINS(s.ToString(), "closed");
+  ASSERT_TRUE(s.IsAborted());
 }
 
 // Test that if we abort a transaction we don't advance the safe time and don't
@@ -678,6 +738,48 @@ TEST_F(MvccTest, TestWaitUntilCleanDeadline) {
   MvccSnapshot snap;
   Status s = mgr.WaitForSnapshotWithAllCommitted(tx1, &snap, deadline);
   ASSERT_TRUE(s.IsTimedOut()) << s.ToString();
+}
+
+// Test for a bug related to the initialization of the MvccManager without
+// any pending transactions, i.e. when there are only calls to AdvanceSafeTime().
+// Prior to the fix we would advance safe/clean time but not the
+// 'none_committed_at_or_after_' watermark, meaning the latter would become lower
+// than safe/clean time. This had the effect on compaction of culling delta files
+// even though they shouldn't be culled.
+// This test makes sure that watermarks are advanced correctly and that delta
+// files are culled correctly.
+TEST_F(MvccTest, TestCorrectInitWithNoTxns) {
+  MvccManager mgr;
+
+  MvccSnapshot snap;
+  mgr.TakeSnapshot(&snap);
+  EXPECT_EQ(snap.all_committed_before_, Timestamp::kInitialTimestamp);
+  EXPECT_EQ(snap.none_committed_at_or_after_, Timestamp::kInitialTimestamp);
+  EXPECT_EQ(snap.committed_timestamps_.size(), 0);
+
+  // Read the clock a few times to advance the timestamp
+  for (int i = 0; i < 10; i++) clock_->Now();
+
+  // Advance the safe timestamp.
+  Timestamp new_safe_time = clock_->Now();
+  mgr.AdjustSafeTime(new_safe_time);
+
+  // Test that the snapshot reports that a timestamp lower than the safe time
+  // may have be committed transaction before that timestamp.
+  // Conversely, test that the snapshot reports that a timestamp greater
+  // than the safe time (and thus greater than none_committed_at_or_after_'
+  // as there are no other transactions committed) cannot have any committed
+  // transactions after that timestamp.
+  MvccSnapshot snap2;
+  mgr.TakeSnapshot(&snap2);
+  Timestamp before_safe_time(new_safe_time.value() - 1);
+  Timestamp after_safe_time(new_safe_time.value() + 1);
+  EXPECT_TRUE(snap2.MayHaveCommittedTransactionsAtOrAfter(before_safe_time));
+  EXPECT_FALSE(snap2.MayHaveCommittedTransactionsAtOrAfter(after_safe_time));
+
+  EXPECT_EQ(snap2.all_committed_before_, new_safe_time);
+  EXPECT_EQ(snap2.none_committed_at_or_after_, new_safe_time);
+  EXPECT_EQ(snap2.committed_timestamps_.size(), 0);
 }
 
 } // namespace tablet

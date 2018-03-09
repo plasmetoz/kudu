@@ -16,29 +16,62 @@
 // under the License.
 #include "kudu/tablet/tablet-test-util.h"
 
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <memory>
 
+#include "kudu/clock/clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/schema.h"
-#include "kudu/consensus/consensus_meta.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/consensus_meta_manager.h"
 #include "kudu/consensus/log.h"
+#include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/log_util.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/block_id.h"
+#include "kudu/fs/block_manager.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/fastmem.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/messenger.h"
+#include "kudu/rpc/result_tracker.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
+#include "kudu/tablet/transactions/transaction.h"
+#include "kudu/tablet/transactions/write_transaction.h"
+#include "kudu/tserver/tablet_copy.pb.h"
 #include "kudu/tserver/tablet_copy_source_session.h"
-#include "kudu/tablet/tablet_peer.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/crc.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/test_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/threadpool.h"
 
 METRIC_DECLARE_entity(tablet);
@@ -46,13 +79,19 @@ METRIC_DECLARE_entity(tablet);
 using std::shared_ptr;
 using std::string;
 using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
+
+class BlockIdPB;
+
 namespace tserver {
 
-using consensus::ConsensusMetadata;
+using consensus::ConsensusMetadataManager;
 using consensus::RaftConfigPB;
 using consensus::RaftPeerPB;
+using consensus::kMinimumTerm;
+using fs::BlockDeletionTransaction;
 using fs::ReadableBlock;
 using log::Log;
 using log::LogOptions;
@@ -64,7 +103,7 @@ using tablet::ColumnDataPB;
 using tablet::DeltaDataPB;
 using tablet::KuduTabletTest;
 using tablet::RowSetDataPB;
-using tablet::TabletPeer;
+using tablet::TabletReplica;
 using tablet::TabletSuperBlockPB;
 using tablet::WriteTransactionState;
 
@@ -73,83 +112,85 @@ class TabletCopyTest : public KuduTabletTest {
   TabletCopyTest()
     : KuduTabletTest(Schema({ ColumnSchema("key", STRING),
                               ColumnSchema("val", INT32) }, 1)) {
-    CHECK_OK(ThreadPoolBuilder("test-exec").Build(&apply_pool_));
+    CHECK_OK(ThreadPoolBuilder("prepare").Build(&prepare_pool_));
+    CHECK_OK(ThreadPoolBuilder("apply").Build(&apply_pool_));
+    CHECK_OK(ThreadPoolBuilder("raft").Build(&raft_pool_));
   }
 
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     NO_FATALS(KuduTabletTest::SetUp());
-    NO_FATALS(SetUpTabletPeer());
+    NO_FATALS(SetUpTabletReplica());
     NO_FATALS(PopulateTablet());
     NO_FATALS(InitSession());
   }
 
-  virtual void TearDown() OVERRIDE {
+  void TearDown() override {
     session_.reset();
-    tablet_peer_->Shutdown();
+    tablet_replica_->Shutdown();
     KuduTabletTest::TearDown();
   }
 
  protected:
-  void SetUpTabletPeer() {
+  void SetUpTabletReplica() {
     scoped_refptr<Log> log;
     ASSERT_OK(Log::Open(LogOptions(), fs_manager(), tablet()->tablet_id(),
                         *tablet()->schema(),
-                        0, // schema_version
-                        NULL, &log));
+                        /*schema_version=*/ 0,
+                        /*metric_entity=*/ nullptr,
+                        &log));
 
     scoped_refptr<MetricEntity> metric_entity =
       METRIC_ENTITY_tablet.Instantiate(&metric_registry_, CURRENT_TEST_NAME());
 
-    RaftPeerPB config_peer;
-    config_peer.set_permanent_uuid(fs_manager()->uuid());
-    config_peer.mutable_last_known_addr()->set_host("0.0.0.0");
-    config_peer.mutable_last_known_addr()->set_port(0);
-    config_peer.set_member_type(RaftPeerPB::VOTER);
-
-    tablet_peer_.reset(
-        new TabletPeer(tablet()->metadata(),
-                       config_peer,
-                       apply_pool_.get(),
-                       Bind(&TabletCopyTest::TabletPeerStateChangedCallback,
-                            Unretained(this),
-                            tablet()->tablet_id())));
-
-    // TODO(dralves) similar to code in tablet_peer-test, consider refactor.
+    // TODO(mpercy): Similar to code in tablet_replica-test, consider refactor.
     RaftConfigPB config;
-    config.add_peers()->CopyFrom(config_peer);
     config.set_opid_index(consensus::kInvalidOpIdIndex);
+    RaftPeerPB* config_peer = config.add_peers();
+    config_peer->set_permanent_uuid(fs_manager()->uuid());
+    config_peer->mutable_last_known_addr()->set_host("0.0.0.0");
+    config_peer->mutable_last_known_addr()->set_port(0);
+    config_peer->set_member_type(RaftPeerPB::VOTER);
 
-    unique_ptr<ConsensusMetadata> cmeta;
-    ASSERT_OK(ConsensusMetadata::Create(tablet()->metadata()->fs_manager(),
-                                        tablet()->tablet_id(), fs_manager()->uuid(),
-                                        config, consensus::kMinimumTerm, &cmeta));
+    scoped_refptr<ConsensusMetadataManager> cmeta_manager(
+        new ConsensusMetadataManager(fs_manager()));
+    ASSERT_OK(cmeta_manager->Create(tablet()->tablet_id(), config, kMinimumTerm));
+
+    tablet_replica_.reset(
+        new TabletReplica(tablet()->metadata(),
+                          cmeta_manager,
+                          *config_peer,
+                          apply_pool_.get(),
+                          Bind(&TabletCopyTest::TabletReplicaStateChangedCallback,
+                               Unretained(this),
+                               tablet()->tablet_id())));
+    ASSERT_OK(tablet_replica_->Init(raft_pool_.get()));
 
     shared_ptr<Messenger> messenger;
     MessengerBuilder mbuilder(CURRENT_TEST_NAME());
     mbuilder.Build(&messenger);
 
     log_anchor_registry_.reset(new LogAnchorRegistry());
-    tablet_peer_->SetBootstrapping();
-    ASSERT_OK(tablet_peer_->Init(tablet(),
-                                 clock(),
-                                 messenger,
-                                 scoped_refptr<rpc::ResultTracker>(),
-                                 log,
-                                 metric_entity));
+    tablet_replica_->SetBootstrapping();
     consensus::ConsensusBootstrapInfo boot_info;
-    ASSERT_OK(tablet_peer_->Start(boot_info));
-    ASSERT_OK(tablet_peer_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
-    ASSERT_OK(tablet_peer_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
+    ASSERT_OK(tablet_replica_->Start(boot_info,
+                                     tablet(),
+                                     clock(),
+                                     messenger,
+                                     scoped_refptr<rpc::ResultTracker>(),
+                                     log,
+                                     prepare_pool_.get()));
+    ASSERT_OK(tablet_replica_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10)));
+    ASSERT_OK(tablet_replica_->consensus()->WaitUntilLeaderForTests(MonoDelta::FromSeconds(10)));
   }
 
-  void TabletPeerStateChangedCallback(const string& tablet_id, const string& reason) {
-    LOG(INFO) << "Tablet peer state changed for tablet " << tablet_id << ". Reason: " << reason;
+  void TabletReplicaStateChangedCallback(const string& tablet_id, const string& reason) {
+    LOG(INFO) << "Tablet replica state changed for tablet " << tablet_id << ". Reason: " << reason;
   }
 
   void PopulateTablet() {
     for (int32_t i = 0; i < 1000; i++) {
       WriteRequestPB req;
-      req.set_tablet_id(tablet_peer_->tablet_id());
+      req.set_tablet_id(tablet_replica_->tablet_id());
       ASSERT_OK(SchemaToPB(client_schema_, req.mutable_schema()));
       RowOperationsPB* data = req.mutable_row_operations();
       RowOperationsPBEncoder enc(data);
@@ -164,23 +205,25 @@ class TabletCopyTest : public KuduTabletTest {
       CountDownLatch latch(1);
 
       unique_ptr<tablet::WriteTransactionState> state(
-          new tablet::WriteTransactionState(tablet_peer_.get(),
+          new tablet::WriteTransactionState(tablet_replica_.get(),
                                             &req,
                                             nullptr, // No RequestIdPB
                                             &resp));
       state->set_completion_callback(gscoped_ptr<tablet::TransactionCompletionCallback>(
           new tablet::LatchTransactionCompletionCallback<WriteResponsePB>(&latch, &resp)));
-      ASSERT_OK(tablet_peer_->SubmitWrite(std::move(state)));
+      ASSERT_OK(tablet_replica_->SubmitWrite(std::move(state)));
       latch.Wait();
-      ASSERT_FALSE(resp.has_error()) << "Request failed: " << SecureShortDebugString(resp.error());
-      ASSERT_EQ(0, resp.per_row_errors_size()) << "Insert error: " << SecureShortDebugString(resp);
+      ASSERT_FALSE(resp.has_error())
+          << "Request failed: " << pb_util::SecureShortDebugString(resp.error());
+      ASSERT_EQ(0, resp.per_row_errors_size())
+          << "Insert error: " << pb_util::SecureShortDebugString(resp);
     }
     ASSERT_OK(tablet()->Flush());
   }
 
   void InitSession() {
-    session_.reset(new TabletCopySourceSession(tablet_peer_.get(), "TestSession", "FakeUUID",
-                   fs_manager()));
+    session_.reset(new TabletCopySourceSession(tablet_replica_.get(), "TestSession", "FakeUUID",
+                   fs_manager(), nullptr /* no metrics */));
     ASSERT_OK(session_->Init());
   }
 
@@ -213,8 +256,10 @@ class TabletCopyTest : public KuduTabletTest {
 
   MetricRegistry metric_registry_;
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
+  gscoped_ptr<ThreadPool> prepare_pool_;
   gscoped_ptr<ThreadPool> apply_pool_;
-  scoped_refptr<TabletPeer> tablet_peer_;
+  gscoped_ptr<ThreadPool> raft_pool_;
+  scoped_refptr<TabletReplica> tablet_replica_;
   scoped_refptr<TabletCopySourceSession> session_;
 };
 
@@ -266,18 +311,19 @@ TEST_F(TabletCopyTest, TestBlocksEqual) {
       ASSERT_OK(Env::Default()->GetFileSize(path, &session_block_size));
       faststring buf;
       buf.resize(session_block_size);
-      Slice data;
-      ASSERT_OK(file->Read(session_block_size, &data, buf.data()));
+      Slice data(buf.data(), session_block_size);
+      ASSERT_OK(file->Read(&data));
       uint32_t session_crc = crc::Crc32c(data.data(), data.size());
       LOG(INFO) << "session block file has size of " << session_block_size
                 << " and CRC32C of " << session_crc << ": " << path;
 
-      gscoped_ptr<ReadableBlock> tablet_block;
+      unique_ptr<ReadableBlock> tablet_block;
       ASSERT_OK(fs_manager()->OpenBlock(block_id, &tablet_block));
       uint64_t tablet_block_size = 0;
       ASSERT_OK(tablet_block->Size(&tablet_block_size));
       buf.resize(tablet_block_size);
-      ASSERT_OK(tablet_block->Read(0, tablet_block_size, &data, buf.data()));
+      Slice data2(buf.data(), tablet_block_size);
+      ASSERT_OK(tablet_block->Read(0, data2));
       uint32_t tablet_crc = crc::Crc32c(data.data(), data.size());
       LOG(INFO) << "tablet block file has size of " << tablet_block_size
                 << " and CRC32C of " << tablet_crc
@@ -317,9 +363,14 @@ TEST_F(TabletCopyTest, TestBlocksAreFetchableAfterBeingDeleted) {
   }
 
   // Delete them.
+  shared_ptr<BlockDeletionTransaction> deletion_transaction =
+      fs_manager()->block_manager()->NewDeletionTransaction();
   for (const BlockId& block_id : data_blocks) {
-    ASSERT_OK(fs_manager()->DeleteBlock(block_id));
+    deletion_transaction->AddDeletedBlock(block_id);
   }
+  vector<BlockId> deleted;
+  ASSERT_OK(deletion_transaction->CommitDeletedBlocks(&deleted));
+  ASSERT_EQ(data_blocks.size(), deleted.size());
 
   // Read them back.
   for (const BlockId& block_id : data_blocks) {

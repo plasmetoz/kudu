@@ -18,23 +18,19 @@
 #ifndef KUDU_CFILE_INDEX_BLOCK_H
 #define KUDU_CFILE_INDEX_BLOCK_H
 
-#include <glog/logging.h>
-#include <string>
+#include <cstddef>
+#include <cstdint>
 #include <vector>
 
-#include "kudu/common/types.h"
 #include "kudu/cfile/block_pointer.h"
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/cfile/cfile.pb.h"
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
-#include "kudu/util/coding-inl.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 namespace cfile {
-
-using std::string;
-using std::vector;
-using kudu::DataTypeTraits;
 
 // Forward decl.
 class IndexBlockIterator;
@@ -94,7 +90,7 @@ class IndexBlockBuilder {
   bool is_leaf_;
 
   faststring buffer_;
-  vector<uint32_t> entry_offsets_;
+  std::vector<uint32_t> entry_offsets_;
 };
 
 class IndexBlockReader {

@@ -17,55 +17,80 @@
 
 #include "kudu/client/client.h"
 
-#include <algorithm>
+#include <cstdlib>
 #include <memory>
+#include <ostream>
 #include <set>
 #include <string>
-#include <unordered_map>
 #include <utility>
 #include <vector>
 
 #include <boost/bind.hpp>
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 
-#include "kudu/client/batcher.h"
 #include "kudu/client/callbacks.h"
 #include "kudu/client/client-internal.h"
+#include "kudu/client/client.pb.h"
 #include "kudu/client/client_builder-internal.h"
 #include "kudu/client/error-internal.h"
 #include "kudu/client/error_collector.h"
 #include "kudu/client/meta_cache.h"
+#include "kudu/client/partitioner-internal.h"
 #include "kudu/client/replica-internal.h"
 #include "kudu/client/row_result.h"
+#include "kudu/client/scan_batch.h"
+#include "kudu/client/scan_configuration.h"
 #include "kudu/client/scan_predicate-internal.h"
 #include "kudu/client/scan_token-internal.h"
 #include "kudu/client/scanner-internal.h"
-#include "kudu/client/schema-internal.h"
 #include "kudu/client/session-internal.h"
 #include "kudu/client/table-internal.h"
 #include "kudu/client/table_alterer-internal.h"
 #include "kudu/client/table_creator-internal.h"
 #include "kudu/client/tablet-internal.h"
 #include "kudu/client/tablet_server-internal.h"
+#include "kudu/client/value.h"
 #include "kudu/client/write_op.h"
 #include "kudu/common/common.pb.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
+#include "kudu/common/partition_pruner.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
-#include "kudu/gutil/map-util.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/gutil/basictypes.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/request_tracker.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/sasl_common.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/openssl_util.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/security/token.pb.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/debug-util.h"
 #include "kudu/util/init.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/logging_callback.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/net/dns_resolver.h"
+#include "kudu/util/net/net_util.h"
 #include "kudu/util/oid_generator.h"
 #include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/version_info.h"
@@ -87,6 +112,7 @@ using kudu::master::ListTabletServersRequestPB;
 using kudu::master::ListTabletServersResponsePB;
 using kudu::master::ListTabletServersResponsePB_Entry;
 using kudu::master::MasterServiceProxy;
+using kudu::master::TableIdentifierPB;
 using kudu::master::TabletLocationsPB;
 using kudu::master::TSInfoPB;
 using kudu::rpc::Messenger;
@@ -110,21 +136,24 @@ MAKE_ENUM_LIMITS(kudu::client::KuduSession::ExternalConsistencyMode,
 
 MAKE_ENUM_LIMITS(kudu::client::KuduScanner::ReadMode,
                  kudu::client::KuduScanner::READ_LATEST,
-                 kudu::client::KuduScanner::READ_AT_SNAPSHOT);
+                 kudu::client::KuduScanner::READ_YOUR_WRITES);
 
 MAKE_ENUM_LIMITS(kudu::client::KuduScanner::OrderMode,
                  kudu::client::KuduScanner::UNORDERED,
                  kudu::client::KuduScanner::ORDERED);
 
+struct tm;
+
 namespace kudu {
 namespace client {
 
-using internal::Batcher;
-using internal::ErrorCollector;
+class ResourceMetrics;
+
 using internal::MetaCache;
 using sp::shared_ptr;
 
 static const char* kProgName = "kudu_client";
+const char* kVerboseEnvVar = "KUDU_CLIENT_VERBOSE";
 
 // We need to reroute all logging to stderr when the client library is
 // loaded. GoogleOnceInit() can do that, but there are multiple entry
@@ -137,6 +166,21 @@ static const char* kProgName = "kudu_client";
 __attribute__((constructor))
 static void InitializeBasicLogging() {
   InitGoogleLoggingSafeBasic(kProgName);
+
+  SetVerboseLevelFromEnvVar();
+}
+
+// Set Client logging verbose level from environment variable.
+void SetVerboseLevelFromEnvVar() {
+  int32_t level = 0; // this is the default logging level;
+  const char* env_verbose_level = std::getenv(kVerboseEnvVar);
+  if (env_verbose_level != nullptr) {
+     if (safe_strto32(env_verbose_level, &level) && (level >= 0)) {
+       SetVerboseLogLevel(level);
+     } else {
+       LOG(WARNING) << "Invalid verbose level from environment variable " << kVerboseEnvVar;
+     }
+  }
 }
 
 // Adapts between the internal LogSeverity and the client's KuduLogSeverity.
@@ -193,7 +237,7 @@ Status DisableOpenSSLInitialization() {
 }
 
 string GetShortVersionString() {
-  return VersionInfo::GetShortVersionString();
+  return VersionInfo::GetVersionInfo();
 }
 
 string GetAllVersionInfo() {
@@ -280,7 +324,7 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
     RETURN_NOT_OK(ImportAuthnCredsToMessenger(data_->authn_creds_, messenger.get()));
   }
 
-  shared_ptr<KuduClient> c(new KuduClient());
+  shared_ptr<KuduClient> c(new KuduClient);
   c->data_->messenger_ = std::move(messenger);
   c->data_->master_server_addrs_ = data_->master_server_addrs_;
   c->data_->default_admin_operation_timeout_ = data_->default_admin_operation_timeout_;
@@ -292,8 +336,8 @@ Status KuduClientBuilder::Build(shared_ptr<KuduClient>* client) {
   RETURN_NOT_OK_PREPEND(c->data_->ConnectToCluster(c.get(), deadline),
                         "Could not connect to the cluster");
 
-  c->data_->meta_cache_.reset(new MetaCache(c.get()));
-  c->data_->dns_resolver_.reset(new DnsResolver());
+  c->data_->meta_cache_.reset(new MetaCache(c.get(), data_->replica_visibility_));
+  c->data_->dns_resolver_.reset(new DnsResolver);
 
   // Init local host names used for locality decisions.
   RETURN_NOT_OK_PREPEND(c->data_->InitLocalHostNames(),
@@ -320,9 +364,12 @@ KuduTableCreator* KuduClient::NewTableCreator() {
 }
 
 Status KuduClient::IsCreateTableInProgress(const string& table_name,
-                                           bool *create_in_progress) {
+                                           bool* create_in_progress) {
   MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
-  return data_->IsCreateTableInProgress(this, table_name, deadline, create_in_progress);
+  TableIdentifierPB table;
+  table.set_table_name(table_name);
+  return data_->IsCreateTableInProgress(this, std::move(table), deadline,
+                                        create_in_progress);
 }
 
 Status KuduClient::DeleteTable(const string& table_name) {
@@ -335,9 +382,12 @@ KuduTableAlterer* KuduClient::NewTableAlterer(const string& name) {
 }
 
 Status KuduClient::IsAlterTableInProgress(const string& table_name,
-                                          bool *alter_in_progress) {
+                                          bool* alter_in_progress) {
   MonoTime deadline = MonoTime::Now() + default_admin_operation_timeout();
-  return data_->IsAlterTableInProgress(this, table_name, deadline, alter_in_progress);
+  TableIdentifierPB table;
+  table.set_table_name(table_name);
+  return data_->IsAlterTableInProgress(this, std::move(table), deadline,
+                                       alter_in_progress);
 }
 
 Status KuduClient::GetTableSchema(const string& table_name,
@@ -442,6 +492,12 @@ Status KuduClient::OpenTable(const string& table_name,
   table->reset(new KuduTable(shared_from_this(),
                              table_name, table_id, num_replicas,
                              schema, partition_schema));
+
+  // When opening a table, clear the existing cached non-covered range entries.
+  // This avoids surprises where a new table instance won't be able to see the
+  // current range partitions of a table for up to the ttl.
+  data_->meta_cache_->ClearNonCoveredRangeEntries(table_id);
+
   return Status::OK();
 }
 
@@ -491,9 +547,11 @@ Status KuduClient::GetTablet(const string& tablet_id, KuduTablet** tablet) {
     unique_ptr<KuduTabletServer> ts(new KuduTabletServer);
     ts->data_ = new KuduTabletServer::Data(ts_info.permanent_uuid(), hp);
 
+    // TODO(aserbin): try to use member_type instead of role for metacache.
     bool is_leader = r.role() == consensus::RaftPeerPB::LEADER;
+    bool is_voter = is_leader || r.role() == consensus::RaftPeerPB::FOLLOWER;
     unique_ptr<KuduReplica> replica(new KuduReplica);
-    replica->data_ = new KuduReplica::Data(is_leader, std::move(ts));
+    replica->data_ = new KuduReplica::Data(is_leader, is_voter, std::move(ts));
 
     replicas.push_back(replica.release());
   }
@@ -656,6 +714,7 @@ Status KuduTableCreator::Create() {
 
   // Build request.
   CreateTableRequestPB req;
+  CreateTableResponsePB resp;
   req.set_name(data_->table_name_);
   if (data_->num_replicas_ != boost::none) {
     req.set_num_replicas(data_->num_replicas_.get());
@@ -700,10 +759,9 @@ Status KuduTableCreator::Create() {
   } else {
     deadline += data_->client_->default_admin_operation_timeout();
   }
-
   RETURN_NOT_OK_PREPEND(data_->client_->data_->CreateTable(data_->client_,
                                                            req,
-                                                           *data_->schema_,
+                                                           &resp,
                                                            deadline,
                                                            !data_->range_partition_bounds_.empty()),
                         Substitute("Error creating table $0 on the master",
@@ -711,8 +769,10 @@ Status KuduTableCreator::Create() {
 
   // Spin until the table is fully created, if requested.
   if (data_->wait_) {
+    TableIdentifierPB table;
+    table.set_table_id(resp.table_id());
     RETURN_NOT_OK(data_->client_->data_->WaitForCreateTableToFinish(data_->client_,
-                                                                    data_->table_name_,
+                                                                    table,
                                                                     deadline));
   }
 
@@ -964,15 +1024,17 @@ KuduTableAlterer* KuduTableAlterer::RenameTo(const string& new_name) {
 KuduColumnSpec* KuduTableAlterer::AddColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ADD_COLUMN,
                    new KuduColumnSpec(name), nullptr, nullptr };
+  auto* spec = s.spec;
   data_->steps_.emplace_back(std::move(s));
-  return s.spec;
+  return spec;
 }
 
 KuduColumnSpec* KuduTableAlterer::AlterColumn(const string& name) {
   Data::Step s = { AlterTableRequestPB::ALTER_COLUMN,
                    new KuduColumnSpec(name), nullptr, nullptr };
+  auto* spec = s.spec;
   data_->steps_.emplace_back(std::move(s));
-  return s.spec;
+  return spec;
 }
 
 KuduTableAlterer* KuduTableAlterer::DropColumn(const string& name) {
@@ -1057,13 +1119,14 @@ KuduTableAlterer* KuduTableAlterer::wait(bool wait) {
 
 Status KuduTableAlterer::Alter() {
   AlterTableRequestPB req;
+  AlterTableResponsePB resp;
   RETURN_NOT_OK(data_->ToRequest(&req));
 
   MonoDelta timeout = data_->timeout_.Initialized() ?
     data_->timeout_ :
     data_->client_->default_admin_operation_timeout();
   MonoTime deadline = MonoTime::Now() + timeout;
-  RETURN_NOT_OK(data_->client_->data_->AlterTable(data_->client_, req, deadline,
+  RETURN_NOT_OK(data_->client_->data_->AlterTable(data_->client_, req, &resp, deadline,
                                                   data_->has_alter_partitioning_steps));
 
   if (data_->has_alter_partitioning_steps) {
@@ -1087,9 +1150,15 @@ Status KuduTableAlterer::Alter() {
   }
 
   if (data_->wait_) {
-    string alter_name = data_->rename_to_.get_value_or(data_->table_name_);
+    if (!resp.has_table_id()) {
+      return Status::NotSupported("Alter Table succeeded but the server's "
+          "response did not include a table ID. This server is too old to wait "
+          "for alter table to finish");
+    }
+    TableIdentifierPB table;
+    table.set_table_id(resp.table_id());
     RETURN_NOT_OK(data_->client_->data_->WaitForAlterTableToFinish(
-        data_->client_, alter_name, deadline));
+        data_->client_, table, deadline));
   }
 
   return Status::OK();
@@ -1235,6 +1304,21 @@ KuduSchema KuduScanner::GetProjectionSchema() const {
   return KuduSchema(*data_->configuration().projection());
 }
 
+Status KuduScanner::SetRowFormatFlags(uint64_t flags) {
+  switch (flags) {
+    case NO_FLAGS:
+    case PAD_UNIXTIME_MICROS_TO_16_BYTES:
+      break;
+    default:
+      return Status::InvalidArgument(Substitute("Invalid row format flags: $0", flags));
+  }
+  if (data_->open_) {
+    return Status::IllegalState("Row format flags must be set before Open()");
+  }
+
+  return data_->mutable_configuration()->SetRowFormatFlags(flags);
+}
+
 const ResourceMetrics& KuduScanner::GetResourceMetrics() const {
   return data_->resource_metrics_;
 }
@@ -1279,6 +1363,20 @@ Status KuduScanner::Open() {
     data_->open_ = true;
     data_->short_circuit_ = true;
     return Status::OK();
+  }
+
+  // For READ_YOUR_WRITES scan mode, get the latest observed timestamp and store it
+  // to scan config. Always use this one as propagation timestamp for the duration
+  // of the scan to avoid unnecessarily wait.
+  if (data_->configuration().read_mode() == READ_YOUR_WRITES) {
+    const uint64_t lo_ts = data_->table_->client()->data_->GetLatestObservedTimestamp();
+    data_->mutable_configuration()->SetScanLowerBoundTimestampRaw(lo_ts);
+  }
+
+  if (data_->configuration().read_mode() != READ_AT_SNAPSHOT &&
+      data_->configuration().has_snapshot_timestamp()) {
+    return Status::InvalidArgument("Snapshot timestamp should only be configured "
+                                   "for READ_AT_SNAPSHOT scan mode.");
   }
 
   VLOG(2) << "Beginning " << data_->DebugString();
@@ -1331,6 +1429,11 @@ bool KuduScanner::HasMoreRows() const {
 }
 
 Status KuduScanner::NextBatch(vector<KuduRowResult>* rows) {
+  if (PREDICT_FALSE(data_->configuration().row_format_flags() != KuduScanner::NO_FLAGS)) {
+    return Status::IllegalState(
+        Substitute("Cannot extract rows. Row format modifier flags were selected: $0",
+                   data_->configuration().row_format_flags()));
+  }
   RETURN_NOT_OK(NextBatch(&data_->batch_for_old_api_));
   data_->batch_for_old_api_.data_->ExtractRows(rows);
   return Status::OK();
@@ -1357,8 +1460,11 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
     return batch->data_->Reset(&data_->controller_,
                                data_->configuration().projection(),
                                data_->configuration().client_projection(),
-                                make_gscoped_ptr(data_->last_response_.release_data()));
-  } else if (data_->last_response_.has_more_results()) {
+                               data_->configuration().row_format_flags(),
+                               make_gscoped_ptr(data_->last_response_.release_data()));
+  }
+
+  if (data_->last_response_.has_more_results()) {
     // More data is available in this tablet.
     VLOG(2) << "Continuing " << data_->DebugString();
 
@@ -1378,6 +1484,7 @@ Status KuduScanner::NextBatch(KuduScanBatch* batch) {
         return batch->data_->Reset(&data_->controller_,
                                    data_->configuration().projection(),
                                    data_->configuration().client_projection(),
+                                   data_->configuration().row_format_flags(),
                                    make_gscoped_ptr(data_->last_response_.release_data()));
       }
 
@@ -1608,6 +1715,45 @@ const string& KuduTabletServer::hostname() const {
 
 uint16_t KuduTabletServer::port() const {
   return data_->hp_.port();
+}
+
+////////////////////////////////////////////////////////////
+// KuduPartitionerBuilder
+////////////////////////////////////////////////////////////
+KuduPartitionerBuilder::KuduPartitionerBuilder(sp::shared_ptr<KuduTable> table)
+    : data_(new Data(std::move(table))) {
+}
+
+KuduPartitionerBuilder::~KuduPartitionerBuilder() {
+  delete data_;
+}
+
+KuduPartitionerBuilder* KuduPartitionerBuilder::SetBuildTimeout(MonoDelta timeout) {
+  data_->SetBuildTimeout(timeout);
+  return this;
+}
+
+Status KuduPartitionerBuilder::Build(KuduPartitioner** partitioner) {
+  return data_->Build(partitioner);
+}
+
+////////////////////////////////////////////////////////////
+// KuduPartitioner
+////////////////////////////////////////////////////////////
+KuduPartitioner::KuduPartitioner(Data* data)
+    : data_(CHECK_NOTNULL(data)) {
+}
+
+KuduPartitioner::~KuduPartitioner() {
+  delete data_;
+}
+
+int KuduPartitioner::NumPartitions() const {
+  return data_->num_partitions_;
+}
+
+Status KuduPartitioner::PartitionRow(const KuduPartialRow& row, int* partition) {
+  return data_->PartitionRow(row, partition);
 }
 
 } // namespace client

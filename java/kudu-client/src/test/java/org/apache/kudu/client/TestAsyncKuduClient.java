@@ -31,19 +31,15 @@ import com.google.protobuf.ByteString;
 import com.stumbleupon.async.Deferred;
 import org.junit.BeforeClass;
 import org.junit.Test;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Common;
-import org.apache.kudu.consensus.Metadata;
-import org.apache.kudu.master.Master;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
+import org.apache.kudu.consensus.Metadata;
+import org.apache.kudu.master.Master;
 
 public class TestAsyncKuduClient extends BaseKuduTest {
-  private static final Logger LOG = LoggerFactory.getLogger(TestAsyncKuduClient.class);
-
   @BeforeClass
   public static void setUpBeforeClass() throws Exception {
     BaseKuduTest.setUpBeforeClass();
@@ -97,16 +93,16 @@ public class TestAsyncKuduClient extends BaseKuduTest {
   }
 
   private void disconnectAndWait() throws InterruptedException {
-    for (TabletClient tabletClient : client.getTabletClients()) {
-      tabletClient.disconnect();
+    for (Connection c : client.getConnectionListCopy()) {
+      c.disconnect();
     }
     Stopwatch sw = Stopwatch.createStarted();
-    boolean allDead = false;
+    boolean disconnected = false;
     while (sw.elapsed(TimeUnit.MILLISECONDS) < DEFAULT_SLEEP) {
       boolean sleep = false;
-      if (!client.getTabletClients().isEmpty()) {
-        for (TabletClient tserver : client.getTabletClients()) {
-          if (tserver.isAlive()) {
+      if (!client.getConnectionListCopy().isEmpty()) {
+        for (Connection c : client.getConnectionListCopy()) {
+          if (!c.isTerminated()) {
             sleep = true;
             break;
           }
@@ -116,11 +112,11 @@ public class TestAsyncKuduClient extends BaseKuduTest {
       if (sleep) {
         Thread.sleep(50);
       } else {
-        allDead = true;
+        disconnected = true;
         break;
       }
     }
-    assertTrue(allDead);
+    assertTrue(disconnected);
   }
 
   @Test
@@ -237,7 +233,7 @@ public class TestAsyncKuduClient extends BaseKuduTest {
    */
   @Test(timeout = 100000)
   public void testCreateTableOutOfOrderPrimaryKeys() throws Exception {
-    ArrayList<ColumnSchema> columns = new ArrayList<ColumnSchema>(6);
+    ArrayList<ColumnSchema> columns = new ArrayList<>(6);
     columns.add(new ColumnSchema.ColumnSchemaBuilder("key_1", Type.INT8).key(true).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("column1_i", Type.INT32).build());
     columns.add(new ColumnSchema.ColumnSchemaBuilder("key_2", Type.INT16).key(true).build());

@@ -18,31 +18,26 @@
 #define KUDU_MASTER_MASTER_H
 
 #include <atomic>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
+#include "kudu/kserver/kserver.h"
 #include "kudu/master/master_options.h"
-#include "kudu/master/master.pb.h"
-#include "kudu/server/server_base.h"
-#include "kudu/util/metrics.h"
 #include "kudu/util/promise.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
+class HostPortPB;
 class MaintenanceManager;
-class RpcServer;
-struct RpcServerOptions;
+class MonoDelta;
 class ThreadPool;
-
-namespace rpc {
-class Messenger;
-class ServicePool;
-} // namespace rpc
 
 namespace security {
 class TokenSigner;
@@ -50,13 +45,12 @@ class TokenSigner;
 
 namespace master {
 
-class AuthnTokenManager;
 class CatalogManager;
 class MasterCertAuthority;
 class MasterPathHandlers;
 class TSManager;
 
-class Master : public server::ServerBase {
+class Master : public kserver::KuduServer {
  public:
   static const uint16_t kDefaultPort = 7051;
   static const uint16_t kDefaultWebPort = 8051;
@@ -64,8 +58,9 @@ class Master : public server::ServerBase {
   explicit Master(const MasterOptions& opts);
   ~Master();
 
-  Status Init();
-  Status Start();
+  virtual Status Init() override;
+  virtual Status Start() override;
+  virtual void Shutdown() override;
 
   Status StartAsync();
   Status WaitForCatalogManagerInit() const;
@@ -75,8 +70,6 @@ class Master : public server::ServerBase {
   // If 'timeout' time is exceeded, returns Status::TimedOut.
   Status WaitUntilCatalogManagerIsLeaderAndReadyForTests(const MonoDelta& timeout)
       WARN_UNUSED_RESULT;
-
-  void Shutdown();
 
   std::string ToString() const;
 
@@ -96,11 +89,19 @@ class Master : public server::ServerBase {
   // Get node instance, Raft role, RPC and HTTP addresses for all
   // masters.
   //
-  // TODO move this to a separate class to be re-used in TS and
+  // NOTE: this performs a round-trip RPC to all of the masters so
+  // should not be used in any performance-critical paths.
+  //
+  // TODO(todd) move this to a separate class to be re-used in TS and
   // client; cache this information with a TTL (possibly in another
   // SysTable), so that we don't have to perform an RPC call on every
   // request.
   Status ListMasters(std::vector<ServerEntryPB>* masters) const;
+
+  // Gets the HostPorts for all of the masters in the cluster.
+  // This is not as complete as ListMasters() above, but operates just
+  // based on local state.
+  Status GetMasterHostPorts(std::vector<HostPortPB>* hostports) const;
 
   bool IsShutdown() const {
     return state_ == kStopped;

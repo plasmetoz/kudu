@@ -16,19 +16,75 @@
 // under the License.
 #include "kudu/tserver/tablet_copy-test-base.h"
 
+#include <cstdint>
+#include <limits>
+#include <memory>
+#include <ostream>
+#include <stdlib.h>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <glog/stl_logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/common/wire_protocol.h"
+#include "kudu/consensus/consensus_meta_manager.h"
+#include "kudu/consensus/log.h"
+#include "kudu/consensus/log_reader.h"
+#include "kudu/consensus/log_util.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/consensus/quorum_util.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/block_manager.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/fastmem.h"
-#include "kudu/tablet/tablet_bootstrap.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
+#include "kudu/tserver/tablet_copy.pb.h"
 #include "kudu/tserver/tablet_copy_client.h"
+#include "kudu/util/crc.h"
+#include "kudu/util/env.h"
 #include "kudu/util/env_util.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 
 using std::shared_ptr;
+using std::string;
+using std::thread;
+using std::vector;
+
+DECLARE_string(block_manager);
+
+METRIC_DECLARE_counter(block_manager_total_disk_sync);
 
 namespace kudu {
 namespace tserver {
 
+using consensus::ConsensusMetadataManager;
+using consensus::ConsensusStatePB;
 using consensus::GetRaftConfigLeader;
 using consensus::RaftPeerPB;
+using fs::DataDirManager;
+using std::tuple;
+using std::unique_ptr;
+using strings::Substitute;
 using tablet::TabletMetadata;
 
 class TabletCopyClientTest : public TabletCopyTest {
@@ -36,17 +92,36 @@ class TabletCopyClientTest : public TabletCopyTest {
   virtual void SetUp() OVERRIDE {
     NO_FATALS(TabletCopyTest::SetUp());
 
-    fs_manager_.reset(new FsManager(Env::Default(), GetTestPath("client_tablet")));
+    // To be a bit more flexible in testing, create a FS layout with multiple disks.
+    const string kTestWalDir = GetTestPath("client_tablet_wal");
+    const string kTestDataDirPrefix = GetTestPath("client_tablet_data");
+    FsManagerOpts opts;
+    opts.wal_root = kTestWalDir;
+    for (int dir = 0; dir < kNumDataDirs; dir++) {
+      opts.data_roots.emplace_back(Substitute("$0-$1", kTestDataDirPrefix, dir));
+    }
+
+    metric_entity_ = METRIC_ENTITY_server.Instantiate(&metric_registry_, "test");
+    opts.metric_entity = metric_entity_;
+    fs_manager_.reset(new FsManager(Env::Default(), opts));
     ASSERT_OK(fs_manager_->CreateInitialFileSystemLayout());
     ASSERT_OK(fs_manager_->Open());
 
-    tablet_peer_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10.0));
+    scoped_refptr<ConsensusMetadataManager> cmeta_manager(
+        new ConsensusMetadataManager(fs_manager_.get()));
+
+    tablet_replica_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(10.0));
     rpc::MessengerBuilder(CURRENT_TEST_NAME()).Build(&messenger_);
     client_.reset(new TabletCopyClient(GetTabletId(),
                                        fs_manager_.get(),
-                                       messenger_));
-    ASSERT_OK(GetRaftConfigLeader(tablet_peer_->consensus()
-        ->ConsensusState(consensus::CONSENSUS_CONFIG_COMMITTED), &leader_));
+                                       cmeta_manager,
+                                       messenger_,
+                                       nullptr /* no metrics */));
+    RaftPeerPB* cstate_leader;
+    ConsensusStatePB cstate;
+    ASSERT_OK(tablet_replica_->consensus()->ConsensusState(&cstate));
+    ASSERT_OK(GetRaftConfigLeader(&cstate, &cstate_leader));
+    leader_ = *cstate_leader;
 
     HostPort host_port;
     ASSERT_OK(HostPortFromPB(leader_.last_known_addr(), &host_port));
@@ -56,6 +131,8 @@ class TabletCopyClientTest : public TabletCopyTest {
  protected:
   Status CompareFileContents(const string& path1, const string& path2);
 
+  MetricRegistry metric_registry_;
+  scoped_refptr<MetricEntity> metric_entity_;
   gscoped_ptr<FsManager> fs_manager_;
   shared_ptr<rpc::Messenger> messenger_;
   gscoped_ptr<TabletCopyClient> client_;
@@ -73,20 +150,27 @@ Status TabletCopyClientTest::CompareFileContents(const string& path1, const stri
   RETURN_NOT_OK(file2->Size(&size2));
   if (size1 != size2) {
     return Status::Corruption("Sizes of files don't match",
-                              strings::Substitute("$0 vs $1 bytes", size1, size2));
+                              Substitute("$0 vs $1 bytes", size1, size2));
   }
 
-  Slice slice1, slice2;
   faststring scratch1, scratch2;
   scratch1.resize(size1);
   scratch2.resize(size2);
-  RETURN_NOT_OK(env_util::ReadFully(file1.get(), 0, size1, &slice1, scratch1.data()));
-  RETURN_NOT_OK(env_util::ReadFully(file2.get(), 0, size2, &slice2, scratch2.data()));
+  Slice slice1(scratch1.data(), size1);
+  Slice slice2(scratch2.data(), size2);
+  RETURN_NOT_OK(file1->Read(0, slice1));
+  RETURN_NOT_OK(file2->Read(0, slice2));
   int result = strings::fastmemcmp_inlined(slice1.data(), slice2.data(), size1);
   if (result != 0) {
     return Status::Corruption("Files do not match");
   }
   return Status::OK();
+}
+
+// Implementation test that no blocks exist in the new superblock before fetching.
+TEST_F(TabletCopyClientTest, TestNoBlocksAtStart) {
+  ASSERT_GT(ListBlocks(*client_->remote_superblock_).size(), 0);
+  ASSERT_EQ(0, ListBlocks(*client_->superblock_).size());
 }
 
 // Basic begin / end tablet copy session.
@@ -97,7 +181,7 @@ TEST_F(TabletCopyClientTest, TestBeginEndSession) {
 
 // Basic data block download unit test.
 TEST_F(TabletCopyClientTest, TestDownloadBlock) {
-  BlockId block_id = FirstColumnBlockId(client_->superblock_.get());
+  BlockId block_id = FirstColumnBlockId(*client_->remote_superblock_);
   Slice slice;
   faststring scratch;
 
@@ -109,16 +193,16 @@ TEST_F(TabletCopyClientTest, TestDownloadBlock) {
   // Check that the client downloaded the block and verification passed.
   BlockId new_block_id;
   ASSERT_OK(client_->DownloadBlock(block_id, &new_block_id));
+  ASSERT_OK(client_->transaction_->CommitCreatedBlocks());
 
   // Ensure it placed the block where we expected it to.
-  s = ReadLocalBlockFile(fs_manager_.get(), block_id, &scratch, &slice);
-  ASSERT_TRUE(s.IsNotFound()) << "Expected block not found: " << s.ToString();
   ASSERT_OK(ReadLocalBlockFile(fs_manager_.get(), new_block_id, &scratch, &slice));
 }
 
 // Basic WAL segment download unit test.
 TEST_F(TabletCopyClientTest, TestDownloadWalSegment) {
-  ASSERT_OK(fs_manager_->CreateDirIfMissing(fs_manager_->GetTabletWalDir(GetTabletId())));
+  ASSERT_OK(env_util::CreateDirIfMissing(
+      env_, fs_manager_->GetTabletWalDir(GetTabletId())));
 
   uint64_t seqno = client_->wal_seqnos_[0];
   string path = fs_manager_->GetWalSegmentFileName(GetTabletId(), seqno);
@@ -128,7 +212,7 @@ TEST_F(TabletCopyClientTest, TestDownloadWalSegment) {
   ASSERT_TRUE(fs_manager_->Exists(path));
 
   log::SegmentSequence local_segments;
-  ASSERT_OK(tablet_peer_->log()->reader()->GetSegmentsSnapshot(&local_segments));
+  ASSERT_OK(tablet_replica_->log()->reader()->GetSegmentsSnapshot(&local_segments));
   const scoped_refptr<log::ReadableLogSegment>& segment = local_segments[0];
   string server_path = segment->path();
 
@@ -172,92 +256,146 @@ TEST_F(TabletCopyClientTest, TestVerifyData) {
   LOG(INFO) << "Expected error returned: " << s.ToString();
 }
 
-namespace {
+TEST_F(TabletCopyClientTest, TestDownloadAllBlocks) {
+  // Download and commit all the blocks.
+  ASSERT_OK(client_->DownloadBlocks());
+  ASSERT_OK(client_->transaction_->CommitCreatedBlocks());
 
-vector<BlockId> GetAllSortedBlocks(const tablet::TabletSuperBlockPB& sb) {
-  vector<BlockId> data_blocks;
-
-  for (const tablet::RowSetDataPB& rowset : sb.rowsets()) {
-    for (const tablet::DeltaDataPB& redo : rowset.redo_deltas()) {
-      data_blocks.push_back(BlockId::FromPB(redo.block()));
-    }
-    for (const tablet::DeltaDataPB& undo : rowset.undo_deltas()) {
-      data_blocks.push_back(BlockId::FromPB(undo.block()));
-    }
-    for (const tablet::ColumnDataPB& column : rowset.columns()) {
-      data_blocks.push_back(BlockId::FromPB(column.block()));
-    }
-    if (rowset.has_bloom_block()) {
-      data_blocks.push_back(BlockId::FromPB(rowset.bloom_block()));
-    }
-    if (rowset.has_adhoc_index_block()) {
-      data_blocks.push_back(BlockId::FromPB(rowset.adhoc_index_block()));
-    }
+  // Verify the disk synchronization count.
+  // TODO(awong): These values have been determined to be safe empirically.
+  // If kNumDataDirs changes, these values may also change. The point of this
+  // test is to exemplify the difference in syncs between the log and file
+  // block managers, but it would be nice to formulate a bound here.
+  if (FLAGS_block_manager == "log") {
+    ASSERT_GE(9, down_cast<Counter*>(
+        metric_entity_->FindOrNull(METRIC_block_manager_total_disk_sync).get())->value());
+  } else {
+    ASSERT_GE(22, down_cast<Counter*>(
+        metric_entity_->FindOrNull(METRIC_block_manager_total_disk_sync).get())->value());
   }
 
-  std::sort(data_blocks.begin(), data_blocks.end(), BlockIdCompare());
-  return data_blocks;
-}
-
-} // anonymous namespace
-
-TEST_F(TabletCopyClientTest, TestDownloadAllBlocks) {
-  // Download all the blocks.
-  ASSERT_OK(client_->DownloadBlocks());
-
-  // Verify that the new superblock reflects the changes in block IDs.
-  //
-  // As long as block IDs are generated with UUIDs or something equally
-  // unique, there's no danger of a block in the new superblock somehow
-  // being assigned the same ID as a block in the existing superblock.
-  vector<BlockId> old_data_blocks = GetAllSortedBlocks(*client_->old_superblock_);
-  vector<BlockId> new_data_blocks = GetAllSortedBlocks(*client_->superblock_);
-  vector<BlockId> result;
-  std::set_intersection(old_data_blocks.begin(), old_data_blocks.end(),
-                        new_data_blocks.begin(), new_data_blocks.end(),
-                        std::back_inserter(result), BlockIdCompare());
-  ASSERT_TRUE(result.empty());
+  // After downloading blocks, verify that the old and remote and local
+  // superblock point to the same number of blocks.
+  vector<BlockId> old_data_blocks = ListBlocks(*client_->remote_superblock_);
+  vector<BlockId> new_data_blocks = ListBlocks(*client_->superblock_);
   ASSERT_EQ(old_data_blocks.size(), new_data_blocks.size());
 
-  // Verify that the old blocks aren't found. We're using a different
-  // FsManager than 'tablet_peer', so the only way an old block could end
-  // up in ours is due to a tablet copy client bug.
-  for (const BlockId& block_id : old_data_blocks) {
-    gscoped_ptr<fs::ReadableBlock> block;
-    Status s = fs_manager_->OpenBlock(block_id, &block);
-    ASSERT_TRUE(s.IsNotFound()) << "Expected block not found: " << s.ToString();
-  }
-  // And the new blocks are all present.
+  // Verify that the new blocks are all present.
   for (const BlockId& block_id : new_data_blocks) {
-    gscoped_ptr<fs::ReadableBlock> block;
+    unique_ptr<fs::ReadableBlock> block;
     ASSERT_OK(fs_manager_->OpenBlock(block_id, &block));
   }
 }
 
+// Test that failing a disk outside fo the tablet copy client will eventually
+// stop the copy client and cause it to fail.
+TEST_F(TabletCopyClientTest, TestFailedDiskStopsClient) {
+  DataDirManager* dd_manager = fs_manager_->dd_manager();
+
+  // Repeatedly fetch files for the client.
+  Status s;
+  auto copy_thread = thread([&] {
+    while (s.ok()) {
+      s = client_->FetchAll(nullptr);
+    }
+  });
+
+  // In a separate thread, mark one of the directories as failed (not the
+  // metadata directory).
+  while (true) {
+    if (rand() % 10 == 0) {
+      dd_manager->MarkDataDirFailed(1, "injected failure in non-client thread");
+      LOG(INFO) << "INJECTING FAILURE";
+      break;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(50));
+  }
+
+  // The copy thread should stop and the copy client should return an error.
+  copy_thread.join();
+  ASSERT_TRUE(s.IsIOError());
+}
+
+enum DownloadBlocks {
+  kDownloadBlocks,    // Fetch blocks from remote.
+  kNoDownloadBlocks,  // Do not fetch blocks from remote.
+};
 enum DeleteTrigger {
-  kAbortMethod, // Delete blocks via Abort().
-  kDestructor,  // Delete blocks via destructor.
-  kNoDelete     // Don't delete blocks.
+  kAbortMethod, // Delete data via Abort().
+  kDestructor,  // Delete data via destructor.
+  kNoDelete     // Don't delete data.
+};
+
+struct AbortTestParams {
+  DownloadBlocks download_blocks;
+  DeleteTrigger delete_type;
 };
 
 class TabletCopyClientAbortTest : public TabletCopyClientTest,
-                                  public ::testing::WithParamInterface<DeleteTrigger> {
+                                  public ::testing::WithParamInterface<
+                                      tuple<DownloadBlocks, DeleteTrigger>> {
+ protected:
+  // Create the specified number of blocks with junk data for testing purposes.
+  void CreateTestBlocks(int num_blocks);
 };
+
+INSTANTIATE_TEST_CASE_P(BlockDeleteTriggers,
+                        TabletCopyClientAbortTest,
+                        ::testing::Combine(
+                            ::testing::Values(kDownloadBlocks, kNoDownloadBlocks),
+                            ::testing::Values(kAbortMethod, kDestructor, kNoDelete)));
+
+void TabletCopyClientAbortTest::CreateTestBlocks(int num_blocks) {
+  for (int i = 0; i < num_blocks; i++) {
+    unique_ptr<fs::WritableBlock> block;
+    ASSERT_OK(fs_manager_->CreateNewBlock({}, &block));
+    block->Append("Test");
+    ASSERT_OK(block->Close());
+  }
+}
 
 // Test that we can clean up our downloaded blocks either explicitly using
 // Abort() or implicitly by destroying the TabletCopyClient instance before
-// calling Finish().
+// calling Finish(). Also ensure that no data loss occurs.
 TEST_P(TabletCopyClientAbortTest, TestAbort) {
-  // Download a block.
-  BlockIdPB* block_id_pb = FirstColumnBlockIdPB(client_->superblock_.get());
-  int block_id_count = 0;
-  int num_blocks = client_->CountBlocks();
-  ASSERT_OK(client_->DownloadAndRewriteBlock(block_id_pb, &block_id_count, num_blocks));
-  BlockId new_block_id = BlockId::FromPB(*block_id_pb);
-  ASSERT_TRUE(fs_manager_->BlockExists(new_block_id));
+  tuple<DownloadBlocks, DeleteTrigger> param = GetParam();
+  DownloadBlocks download_blocks = std::get<0>(param);
+  DeleteTrigger trigger = std::get<1>(param);
+
+  // Check that there are remote blocks.
+  vector<BlockId> remote_block_ids = ListBlocks(*client_->remote_superblock_);
+  ASSERT_FALSE(remote_block_ids.empty());
+  int num_remote_blocks = client_->CountRemoteBlocks();
+  ASSERT_GT(num_remote_blocks, 0);
+  ASSERT_EQ(num_remote_blocks, remote_block_ids.size());
+
+  // Create some local blocks so we can check that we didn't lose any existing
+  // data on abort. TODO(mpercy): The data loss check here will likely never
+  // trigger until we fix KUDU-1980 because there is a workaround / hack in the
+  // LBM that randomizes the starting block id for each BlockManager instance.
+  // Therefore the block ids will never overlap.
+  const int kNumBlocksToCreate = 100;
+  NO_FATALS(CreateTestBlocks(kNumBlocksToCreate));
+
+  vector<BlockId> local_block_ids;
+  ASSERT_OK(fs_manager_->block_manager()->GetAllBlockIds(&local_block_ids));
+  ASSERT_EQ(kNumBlocksToCreate, local_block_ids.size());
+  VLOG(1) << "Local blocks: " << local_block_ids;
+
+  int num_blocks_downloaded = 0;
+  if (download_blocks == kDownloadBlocks) {
+    ASSERT_OK(client_->DownloadBlocks());
+    ASSERT_OK(client_->transaction_->CommitCreatedBlocks());
+    num_blocks_downloaded = num_remote_blocks;
+  }
+
+  vector<BlockId> new_local_block_ids;
+  ASSERT_OK(fs_manager_->block_manager()->GetAllBlockIds(&new_local_block_ids));
+  ASSERT_EQ(kNumBlocksToCreate + num_blocks_downloaded, new_local_block_ids.size());
 
   // Download a WAL segment.
-  ASSERT_OK(fs_manager_->CreateDirIfMissing(fs_manager_->GetTabletWalDir(GetTabletId())));
+  ASSERT_OK(env_util::CreateDirIfMissing(
+      env_, fs_manager_->GetTabletWalDir(GetTabletId())));
   uint64_t seqno = client_->wal_seqnos_[0];
   ASSERT_OK(client_->DownloadWAL(seqno));
   string wal_path = fs_manager_->GetWalSegmentFileName(GetTabletId(), seqno);
@@ -265,7 +403,6 @@ TEST_P(TabletCopyClientAbortTest, TestAbort) {
 
   scoped_refptr<TabletMetadata> meta = client_->meta_;
 
-  DeleteTrigger trigger = GetParam();
   switch (trigger) {
     case kAbortMethod:
       ASSERT_OK(client_->Abort());
@@ -284,18 +421,20 @@ TEST_P(TabletCopyClientAbortTest, TestAbort) {
   }
 
   if (trigger == kNoDelete) {
-    ASSERT_TRUE(fs_manager_->BlockExists(new_block_id));
-    ASSERT_TRUE(fs_manager_->Exists(wal_path));
+    vector<BlockId> new_local_block_ids;
+    ASSERT_OK(fs_manager_->block_manager()->GetAllBlockIds(&new_local_block_ids));
+    ASSERT_EQ(kNumBlocksToCreate + num_blocks_downloaded, new_local_block_ids.size());
   } else {
     ASSERT_EQ(tablet::TABLET_DATA_TOMBSTONED, meta->tablet_data_state());
-    ASSERT_FALSE(fs_manager_->BlockExists(new_block_id));
     ASSERT_FALSE(fs_manager_->Exists(wal_path));
+    vector<BlockId> latest_blocks;
+    fs_manager_->block_manager()->GetAllBlockIds(&latest_blocks);
+    ASSERT_EQ(local_block_ids.size(), latest_blocks.size());
+  }
+  for (const auto& block_id : local_block_ids) {
+    ASSERT_TRUE(fs_manager_->BlockExists(block_id)) << "Missing block: " << block_id;
   }
 }
-
-INSTANTIATE_TEST_CASE_P(BlockDeleteTriggers,
-                        TabletCopyClientAbortTest,
-                        ::testing::Values(kAbortMethod, kDestructor, kNoDelete));
 
 } // namespace tserver
 } // namespace kudu

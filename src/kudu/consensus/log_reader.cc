@@ -19,16 +19,21 @@
 
 #include <algorithm>
 #include <mutex>
+#include <ostream>
 
+#include <glog/logging.h>
+
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_index.h"
-#include "kudu/consensus/opid_util.h"
-#include "kudu/gutil/map-util.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stl_util.h"
-#include "kudu/gutil/strings/util.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/coding.h"
-#include "kudu/util/env_util.h"
-#include "kudu/util/hexdump.h"
+#include "kudu/gutil/strings/util.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
@@ -46,6 +51,15 @@ METRIC_DEFINE_histogram(tablet, log_reader_read_batch_latency, "Log Read Latency
                         "Microseconds spent reading log entry batches",
                         60000000LU, 2);
 
+using kudu::consensus::OpId;
+using kudu::consensus::ReplicateMsg;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
+using std::shared_ptr;
+using std::string;
+using std::vector;
+using strings::Substitute;
+
 namespace kudu {
 namespace log {
 
@@ -58,51 +72,38 @@ struct LogSegmentSeqnoComparator {
 };
 }
 
-using consensus::OpId;
-using consensus::ReplicateMsg;
-using std::shared_ptr;
-using strings::Substitute;
-
 const int64_t LogReader::kNoSizeLimit = -1;
 
-Status LogReader::Open(FsManager* fs_manager,
+Status LogReader::Open(Env* env,
+                       const string& tablet_wal_dir,
                        const scoped_refptr<LogIndex>& index,
                        const string& tablet_id,
                        const scoped_refptr<MetricEntity>& metric_entity,
                        shared_ptr<LogReader>* reader) {
   auto log_reader = std::make_shared<LogReader>(
-      fs_manager, index, tablet_id, metric_entity);
+      env, index, tablet_id, metric_entity);
 
-  string tablet_wal_path = fs_manager->GetTabletWalDir(tablet_id);
-
-  RETURN_NOT_OK(log_reader->Init(tablet_wal_path))
+  RETURN_NOT_OK_PREPEND(log_reader->Init(tablet_wal_dir),
+                        "Unable to initialize log reader")
   *reader = log_reader;
   return Status::OK();
 }
 
-Status LogReader::OpenFromRecoveryDir(FsManager* fs_manager,
-                                      const string& tablet_id,
-                                      const scoped_refptr<MetricEntity>& metric_entity,
-                                      shared_ptr<LogReader>* reader) {
-  string recovery_path = fs_manager->GetTabletWalRecoveryDir(tablet_id);
-
-  // When recovering, we don't want to have any log index -- since it isn't fsynced()
-  // during writing, its contents are useless to us.
-  scoped_refptr<LogIndex> index(nullptr);
-  auto log_reader = std::make_shared<LogReader>(
-      fs_manager, index, tablet_id, metric_entity);
-  RETURN_NOT_OK_PREPEND(log_reader->Init(recovery_path),
-                        "Unable to initialize log reader");
-  *reader = log_reader;
-  return Status::OK();
+Status LogReader::Open(FsManager* fs_manager,
+                       const scoped_refptr<LogIndex>& index,
+                       const std::string& tablet_id,
+                       const scoped_refptr<MetricEntity>& metric_entity,
+                       std::shared_ptr<LogReader>* reader) {
+  return LogReader::Open(fs_manager->env(), fs_manager->GetTabletWalDir(tablet_id),
+                         index, tablet_id, metric_entity, reader);
 }
 
-LogReader::LogReader(FsManager* fs_manager,
-                     const scoped_refptr<LogIndex>& index,
+LogReader::LogReader(Env* env,
+                     scoped_refptr<LogIndex> index,
                      string tablet_id,
                      const scoped_refptr<MetricEntity>& metric_entity)
-    : fs_manager_(fs_manager),
-      log_index_(index),
+    : env_(env),
+      log_index_(std::move(index)),
       tablet_id_(std::move(tablet_id)),
       state_(kLogReaderInitialized) {
   if (metric_entity) {
@@ -122,9 +123,7 @@ Status LogReader::Init(const string& tablet_wal_path) {
   }
   VLOG(1) << "Reading wal from path:" << tablet_wal_path;
 
-  Env* env = fs_manager_->env();
-
-  if (!fs_manager_->Exists(tablet_wal_path)) {
+  if (!env_->FileExists(tablet_wal_path)) {
     return Status::IllegalState("Cannot find wal location at", tablet_wal_path);
   }
 
@@ -132,7 +131,7 @@ Status LogReader::Init(const string& tablet_wal_path) {
   // list existing segment files
   vector<string> log_files;
 
-  RETURN_NOT_OK_PREPEND(env->GetChildren(tablet_wal_path, &log_files),
+  RETURN_NOT_OK_PREPEND(env_->GetChildren(tablet_wal_path, &log_files),
                         "Unable to read children from path");
 
   SegmentSequence read_segments;
@@ -142,7 +141,7 @@ Status LogReader::Init(const string& tablet_wal_path) {
     if (HasPrefixString(log_file, FsManager::kWalFileNamePrefix)) {
       string fqp = JoinPathSegments(tablet_wal_path, log_file);
       scoped_refptr<ReadableLogSegment> segment;
-      Status s = ReadableLogSegment::Open(env, fqp, &segment);
+      Status s = ReadableLogSegment::Open(env_, fqp, &segment);
       if (s.IsUninitialized()) {
         // This indicates that the segment was created but the writer
         // crashed before the header was successfully written. In this
@@ -157,8 +156,8 @@ Status LogReader::Init(const string& tablet_wal_path) {
       CHECK(segment->IsInitialized()) << "Uninitialized segment at: " << segment->path();
 
       if (!segment->HasFooter()) {
-        LOG(INFO) << "Log segment " << fqp << " was likely left in-progress "
-            "after a previous crash. Will try to rebuild footer by scanning data.";
+        VLOG(1) << "Log segment " << fqp << " was likely left in-progress "
+                << "after a previous crash. Will try to rebuild footer by scanning data.";
         RETURN_NOT_OK(segment->RebuildFooterByScanning());
       }
 
@@ -251,7 +250,9 @@ Status LogReader::ReadBatchUsingIndexEntry(const LogIndexEntry& index_entry,
   CHECK_GT(index_entry.offset_in_segment, 0);
   int64_t offset = index_entry.offset_in_segment;
   ScopedLatencyMetric scoped(read_batch_latency_.get());
-  RETURN_NOT_OK_PREPEND(segment->ReadEntryHeaderAndBatch(&offset, tmp_buf, batch),
+  EntryHeaderStatus unused_status_detail;
+  RETURN_NOT_OK_PREPEND(segment->ReadEntryHeaderAndBatch(&offset, tmp_buf, batch,
+                                                         &unused_status_detail),
                         Substitute("Failed to read LogEntry for index $0 from log segment "
                                    "$1 offset $2",
                                    index,

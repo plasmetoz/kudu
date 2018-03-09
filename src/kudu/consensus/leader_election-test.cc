@@ -17,21 +17,48 @@
 
 #include "kudu/consensus/leader_election.h"
 
+#include <functional>
+#include <memory>
+#include <ostream>
 #include <string>
+#include <type_traits>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-#include "kudu/consensus/consensus_peers.h"
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/common/wire_protocol.h"
 #include "kudu/consensus/consensus-test-util.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/consensus_peers.h"
 #include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/countdown_latch.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
+#include "kudu/util/threadpool.h"
 
 namespace kudu {
+
+namespace rpc {
+class Messenger;
+} // namespace rpc
+
 namespace consensus {
 
+using std::shared_ptr;
 using std::string;
 using std::unordered_map;
 using std::vector;
@@ -73,10 +100,16 @@ class FromMapPeerProxyFactory : public PeerProxyFactory {
     return Status::OK();
   }
 
+  const shared_ptr<rpc::Messenger>& messenger() const override {
+    return null_messenger_;
+  }
+
  private:
   // FYI, the tests may add and remove nodes from this map while we hold a
   // reference to it.
   const ProxyMap* const proxy_map_;
+
+  shared_ptr<rpc::Messenger> null_messenger_;
 };
 
 class LeaderElectionTest : public KuduTest {
@@ -128,7 +161,8 @@ void LeaderElectionTest::ElectionCallback(const ElectionResult& result) {
 
 void LeaderElectionTest::InitUUIDs(int num_voters) {
   voter_uuids_ = GenVoterUUIDs(num_voters);
-  candidate_uuid_ = voter_uuids_[num_voters - 1];
+  CHECK(!voter_uuids_.empty());
+  candidate_uuid_ = voter_uuids_.back();
   voter_uuids_.pop_back();
 }
 
@@ -137,6 +171,7 @@ void LeaderElectionTest::InitNoOpPeerProxies() {
   for (const string& uuid : voter_uuids_) {
     RaftPeerPB* peer_pb = config_.add_peers();
     peer_pb->set_permanent_uuid(uuid);
+    peer_pb->set_member_type(RaftPeerPB::VOTER);
     PeerProxy* proxy = new NoOpTestPeerProxy(pool_.get(), *peer_pb);
     InsertOrDie(&proxies_, uuid, proxy);
   }
@@ -147,6 +182,7 @@ void LeaderElectionTest::InitDelayableMockedProxies(bool enable_delay) {
   for (const string& uuid : voter_uuids_) {
     RaftPeerPB* peer_pb = config_.add_peers();
     peer_pb->set_permanent_uuid(uuid);
+    peer_pb->set_member_type(RaftPeerPB::VOTER);
     auto proxy = new DelayablePeerProxy<MockedPeerProxy>(pool_.get(),
                                                          new MockedPeerProxy(pool_.get()));
     if (enable_delay) {
@@ -198,8 +234,9 @@ scoped_refptr<LeaderElection> LeaderElectionTest::SetUpElectionWithHighTermVoter
   scoped_refptr<LeaderElection> election(
       new LeaderElection(config_, proxy_factory_.get(), request, std::move(counter),
                          MonoDelta::FromSeconds(kLeaderElectionTimeoutSecs),
-                         Bind(&LeaderElectionTest::ElectionCallback,
-                              Unretained(this))));
+                         std::bind(&LeaderElectionTest::ElectionCallback,
+                                   this,
+                                   std::placeholders::_1)));
   return election;
 }
 
@@ -254,8 +291,9 @@ scoped_refptr<LeaderElection> LeaderElectionTest::SetUpElectionWithGrantDenyErro
   scoped_refptr<LeaderElection> election(
       new LeaderElection(config_, proxy_factory_.get(), request, std::move(counter),
                          MonoDelta::FromSeconds(kLeaderElectionTimeoutSecs),
-                         Bind(&LeaderElectionTest::ElectionCallback,
-                              Unretained(this))));
+                         std::bind(&LeaderElectionTest::ElectionCallback,
+                                   this,
+                                   std::placeholders::_1)));
   return election;
 }
 
@@ -280,8 +318,9 @@ TEST_F(LeaderElectionTest, TestPerfectElection) {
     scoped_refptr<LeaderElection> election(
         new LeaderElection(config_, proxy_factory_.get(), request, std::move(counter),
                            MonoDelta::FromSeconds(kLeaderElectionTimeoutSecs),
-                           Bind(&LeaderElectionTest::ElectionCallback,
-                                Unretained(this))));
+                           std::bind(&LeaderElectionTest::ElectionCallback,
+                                     this,
+                                     std::placeholders::_1)));
     election->Run();
     latch_.Wait();
 
@@ -408,8 +447,9 @@ TEST_F(LeaderElectionTest, TestFailToCreateProxy) {
   scoped_refptr<LeaderElection> election(
       new LeaderElection(config_, proxy_factory_.get(), request, std::move(counter),
                          MonoDelta::FromSeconds(kLeaderElectionTimeoutSecs),
-                         Bind(&LeaderElectionTest::ElectionCallback,
-                              Unretained(this))));
+                         std::bind(&LeaderElectionTest::ElectionCallback,
+                                   this,
+                                   std::placeholders::_1)));
   election->Run();
   latch_.Wait();
   ASSERT_EQ(kElectionTerm, result_->vote_request.candidate_term());

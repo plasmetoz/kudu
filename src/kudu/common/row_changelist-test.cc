@@ -15,22 +15,31 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <ostream>
+#include <string>
+
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/common/schema.h"
-#include "kudu/common/row_changelist.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/row.h"
+#include "kudu/common/row_changelist.h"
 #include "kudu/common/rowblock.h"
+#include "kudu/common/schema.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/faststring.h"
 #include "kudu/util/hexdump.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
-namespace kudu {
-
+using std::string;
 using strings::Substitute;
+
+namespace kudu {
 
 class TestRowChangeList : public KuduTest {
  public:
@@ -58,7 +67,7 @@ TEST_F(TestRowChangeList, TestEncodeDecodeUpdates) {
   // Construct an update with several columns changed
   Slice update1("update1");
   Slice update2("update2");
-  uint32 update3 = 12345;
+  uint32_t update3 = 12345;
 
   int c0_id = schema_.column_id(0);
   int c1_id = schema_.column_id(1);

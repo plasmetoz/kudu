@@ -17,22 +17,36 @@
 
 #include "kudu/util/flags.h"
 
+
+#include <cstdlib>
+#include <functional>
 #include <iostream>
-#include <sstream>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <sys/stat.h>
-#include <sys/types.h>
+#include <unistd.h> // IWYU pragma: keep
 
+#include <boost/algorithm/string/predicate.hpp>
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#ifdef TCMALLOC_ENABLED
 #include <gperftools/heap-profiler.h>
+#endif
 
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/flag_validators.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/os-util.h"
@@ -46,8 +60,9 @@ using google::CommandLineFlagInfo;
 using std::cout;
 using std::endl;
 using std::string;
-using std::stringstream;
+using std::ostringstream;
 using std::unordered_set;
+using std::vector;
 
 using strings::Substitute;
 
@@ -58,10 +73,10 @@ DEFINE_bool(dump_metrics_json, false,
             "by this binary.");
 TAG_FLAG(dump_metrics_json, hidden);
 
+#ifdef TCMALLOC_ENABLED
 DEFINE_bool(enable_process_lifetime_heap_profiling, false, "Enables heap "
     "profiling for the lifetime of the process. Profile output will be stored in the "
-    "directory specified by -heap_profile_path. Enabling this option will disable the "
-    "on-demand/remote server profile handlers.");
+    "directory specified by -heap_profile_path.");
 TAG_FLAG(enable_process_lifetime_heap_profiling, stable);
 TAG_FLAG(enable_process_lifetime_heap_profiling, advanced);
 
@@ -69,6 +84,16 @@ DEFINE_string(heap_profile_path, "", "Output path to store heap profiles. If not
     "profiles are stored in /tmp/<process-name>.<pid>.<n>.heap.");
 TAG_FLAG(heap_profile_path, stable);
 TAG_FLAG(heap_profile_path, advanced);
+
+DEFINE_int64(heap_sample_every_n_bytes, 0,
+             "Enable heap occupancy sampling. If this flag is set to some positive "
+             "value N, a memory allocation will be sampled approximately every N bytes. "
+             "Lower values of N incur larger overhead but give more accurate results. "
+             "A value such as 524288 (512KB) is a reasonable choice with relatively "
+             "low overhead.");
+TAG_FLAG(heap_sample_every_n_bytes, advanced);
+TAG_FLAG(heap_sample_every_n_bytes, experimental);
+#endif
 
 DEFINE_bool(disable_core_dumps, false, "Disable core dumps when this process crashes.");
 TAG_FLAG(disable_core_dumps, advanced);
@@ -114,61 +139,45 @@ TAG_FLAG(unlock_unsafe_flags, advanced);
 TAG_FLAG(unlock_unsafe_flags, stable);
 
 DEFINE_string(redact, "all",
-              "Comma-separated list of redactions. Supported redactions are 'flag', "
-              "'log' and 'all'. If 'flag' is specified, configuration flags which may "
-              "include sensitive data will be redacted whenever server configuration "
-              "is emitted. If 'log' is specified, row data will be redacted from log "
-              "and error messages. If 'all' is specified, all of above will be redacted.");
+              "Comma-separated list that controls redaction context. Supported options "
+              "are 'all','log', and 'none'. If 'all' is specified, sensitive data "
+              "(sensitive configuration flags and row data) will be redacted from "
+              "the web UI as well as glog and error messages. If 'log' is specified, "
+              "sensitive data will only be redacted from glog and error messages. "
+              "If 'none' is specified, no redaction will occur.");
 TAG_FLAG(redact, advanced);
 TAG_FLAG(redact, evolving);
 
 static bool ValidateRedact(const char* /*flagname*/, const string& value) {
-  // Empty value is valid.
-  if (value.empty()) {
-    kudu::g_should_redact_log = false;
-    kudu::g_should_redact_flag = false;
-    return true;
-  }
+  kudu::g_should_redact = kudu::RedactContext::NONE;
 
-  // Flag value is case insensitive
+  // Flag value is case insensitive.
   string redact_flags;
   kudu::ToUpperCase(value, &redact_flags);
-  // "ALL" is valid, "ALL, LOG" is not valid
-  if (redact_flags.compare("ALL") == 0) {
-    kudu::g_should_redact_log = true;
-    kudu::g_should_redact_flag = true;
+
+  // 'all', 'none', and '' must be specified without any other option.
+  if (redact_flags == "ALL") {
+    kudu::g_should_redact = kudu::RedactContext::ALL;
+    return true;
+  }
+  if (redact_flags == "NONE" || redact_flags.empty()) {
     return true;
   }
 
-  // If use specific flag value, it can only be "FLAG"
-  // or "LOG".
-  vector<string> enabled_redact_types = strings::Split(redact_flags, ",",
-                                                       strings::SkipEmpty());
-  vector<string>::const_iterator iter;
-  bool is_valid = true;
-  bool enabled_redact_log = false;
-  bool enabled_redact_flag = false;
-  for (const auto& t : enabled_redact_types) {
-    if (t.compare("LOG") == 0) {
-      enabled_redact_log = true;
+  for (const auto& t : strings::Split(redact_flags, ",", strings::SkipEmpty())) {
+    if (t == "LOG") {
+      kudu::g_should_redact = kudu::RedactContext::LOG;
+    } else if (t == "ALL" || t == "NONE") {
+      LOG(ERROR) << "Invalid redaction options: "
+                 << value << ", '" << t << "' must be specified by itself.";
+      return false;
     } else {
-      if (t.compare("FLAG") == 0) {
-        enabled_redact_flag = true;
-      } else {
-        is_valid = false;
-      }
+      LOG(ERROR) << "Invalid redaction context: " << t <<
+                    ". Available types are 'all', 'log', and 'none'.";
+      return false;
     }
   }
-  if (!is_valid) {
-    LOG(ERROR) << Substitute("Invalid redaction type: $0. Available types are 'flag', "
-                             "'log', 'all'.", value);
-  } else {
-    // If the value of --redact flag is valid, set
-    // g_should_redact_log and g_should_redact_flag accordingly.
-    kudu::g_should_redact_log = enabled_redact_log;
-    kudu::g_should_redact_flag = enabled_redact_flag;
-  }
-  return is_valid;
+  return true;
 }
 
 DEFINE_validator(redact, &ValidateRedact);
@@ -320,6 +329,16 @@ TAG_FLAG(helpxml, advanced);
 DECLARE_bool(version);
 TAG_FLAG(version, stable);
 
+//------------------------------------------------------------
+// TCMalloc flags.
+// These are tricky because tcmalloc doesn't use gflags. So we have to
+// reach into its internal namespace.
+//------------------------------------------------------------
+#define TCM_NAMESPACE FLAG__namespace_do_not_use_directly_use_DECLARE_int64_instead
+namespace TCM_NAMESPACE {
+extern int64_t FLAGS_tcmalloc_sample_parameter;
+} // namespace TCM_NAMESPACE
+
 namespace kudu {
 
 // After flags have been parsed, the umask value is filled in here.
@@ -361,7 +380,7 @@ void DumpFlagsXML() {
       EscapeForHtmlToString(google::ProgramUsage())) << endl;
 
   for (const CommandLineFlagInfo& flag : flags) {
-    cout << DescribeOneFlagInXML(flag) << std::endl;
+    cout << DescribeOneFlagInXML(flag) << endl;
   }
 
   cout << "</AllFlags>" << endl;
@@ -417,15 +436,29 @@ void CheckFlagsAllowed() {
   }
 }
 
-// Redact the flag tagged as 'sensitive', if --redact is set
-// with 'flag'. Otherwise, return its value as-is. If EscapeMode
-// is set to HTML, return HTML escaped string.
+// Run 'late phase' custom validators: these can be run only when all flags are
+// already parsed and individually validated.
+void RunCustomValidators() {
+  const auto& validators(GetFlagValidators());
+  bool found_inconsistency = false;
+  for (const auto& e : validators) {
+    found_inconsistency |= !e.second();
+  }
+  if (found_inconsistency) {
+    LOG(ERROR) << "Detected inconsistency in command-line flags; exiting";
+    exit(1);
+  }
+}
+
+// If --redact indicates, redact the flag tagged as 'sensitive'.
+// Otherwise, return its value as-is. If EscapeMode is set to HTML,
+// return HTML escaped string.
 string CheckFlagAndRedact(const CommandLineFlagInfo& flag, EscapeMode mode) {
   string ret_value;
   unordered_set<string> tags;
   GetFlagTags(flag.name, &tags);
 
-  if (ContainsKey(tags, "sensitive") && g_should_redact_flag) {
+  if (ContainsKey(tags, "sensitive") && KUDU_SHOULD_REDACT()) {
     ret_value = kRedactionMessage;
   } else {
     ret_value = flag.current_value;
@@ -450,6 +483,10 @@ void SetUmask() {
 } // anonymous namespace
 
 int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags) {
+  // The logbufsecs default is 30 seconds which is a bit too long.
+  google::SetCommandLineOptionWithMode("logbufsecs", "5",
+                                       google::FlagSettingMode::SET_FLAGS_DEFAULT);
+
   int ret = google::ParseCommandLineNonHelpFlags(argc, argv, remove_flags);
   HandleCommonFlags();
   return ret;
@@ -457,6 +494,7 @@ int ParseCommandLineFlags(int* argc, char*** argv, bool remove_flags) {
 
 void HandleCommonFlags() {
   CheckFlagsAllowed();
+  RunCustomValidators();
 
   if (FLAGS_helpxml) {
     DumpFlagsXML();
@@ -468,11 +506,6 @@ void HandleCommonFlags() {
     google::HandleCommandLineHelpFlags();
   }
 
-  if (FLAGS_heap_profile_path.empty()) {
-    FLAGS_heap_profile_path = strings::Substitute(
-        "/tmp/$0.$1", google::ProgramInvocationShortName(), getpid());
-  }
-
   if (FLAGS_disable_core_dumps) {
     DisableCoreDumps();
   }
@@ -480,8 +513,22 @@ void HandleCommonFlags() {
   SetUmask();
 
 #ifdef TCMALLOC_ENABLED
+  if (FLAGS_heap_profile_path.empty()) {
+    FLAGS_heap_profile_path = strings::Substitute(
+        "/tmp/$0.$1", google::ProgramInvocationShortName(), getpid());
+  }
+
   if (FLAGS_enable_process_lifetime_heap_profiling) {
     HeapProfilerStart(FLAGS_heap_profile_path.c_str());
+  }
+  // Set the internal tcmalloc flag unless it was already set using the built-in
+  // environment-variable-based method. It doesn't appear that this is settable
+  // in any less hacky fashion.
+  if (!getenv("TCMALLOC_SAMPLE_PARAMETER")) {
+    TCM_NAMESPACE::FLAGS_tcmalloc_sample_parameter = FLAGS_heap_sample_every_n_bytes;
+  } else if (!google::GetCommandLineFlagInfoOrDie("heap_sample_every_n_bytes").is_default) {
+    LOG(ERROR) << "Heap sampling configured using both --heap-sample-every-n-bytes and "
+               << "TCMALLOC_SAMPLE_PARAMETER. Ignoring command line flag.";
   }
 #endif
 }
@@ -506,7 +553,7 @@ string CommandlineFlagsIntoString(EscapeMode mode) {
 }
 
 string GetNonDefaultFlags(const GFlagsMap& default_flags) {
-  stringstream args;
+  ostringstream args;
   vector<CommandLineFlagInfo> flags;
   GetAllFlags(&flags);
   for (const auto& flag : flags) {
@@ -523,8 +570,7 @@ string GetNonDefaultFlags(const GFlagsMap& default_flags) {
           args << '\n';
         }
 
-        // Redact the flags tagged as sensitive, if --redact is set
-        // with 'flag'.
+        // Redact the flags tagged as sensitive, if redaction is enabled.
         string flag_value = CheckFlagAndRedact(flag, EscapeMode::NONE);
         args << "--" << flag.name << '=' << flag_value;
       }
@@ -541,6 +587,22 @@ GFlagsMap GetFlagsMap() {
     flags_by_name.emplace(flag.name, std::move(flag));
   }
   return flags_by_name;
+}
+
+Status ParseTriState(const char* flag_name, const std::string& flag_value,
+    TriStateFlag* tri_state) {
+  if (boost::iequals(flag_value, "required")) {
+    *tri_state = TriStateFlag::REQUIRED;
+  } else if (boost::iequals(flag_value, "optional")) {
+    *tri_state = TriStateFlag::OPTIONAL;
+  } else if (boost::iequals(flag_value, "disabled")) {
+    *tri_state = TriStateFlag::DISABLED;
+  } else {
+    return Status::InvalidArgument(strings::Substitute(
+          "$0 flag must be one of 'required', 'optional', or 'disabled'",
+          flag_name));
+  }
+  return Status::OK();
 }
 
 } // namespace kudu

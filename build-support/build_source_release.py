@@ -17,6 +17,8 @@
 # specific language governing permissions and limitations
 # under the License.
 
+from __future__ import print_function
+
 import hashlib
 import logging
 import os
@@ -38,9 +40,8 @@ def check_repo_not_dirty():
                                shell=True) != 0
   if not dirty_repo:
     return
-  print "The repository does not appear to be clean."
-  print Colors.RED + "The source release will not include your local changes." + \
-      Colors.RESET
+  print("The repository does not appear to be clean.")
+  print(Colors.RED + "The source release will not include your local changes." + Colors.RESET)
   if not confirm_prompt("Continue?"):
     sys.exit(1)
 
@@ -50,23 +51,22 @@ def check_no_local_commits():
   Check that there are no local commits which haven't been pushed to the upstream
   repo via Jenkins.
   """
-  upstream_commit = check_output(GET_UPSTREAM_COMMIT_SCRIPT).strip()
-  cur_commit = check_output(["git", "rev-parse", "HEAD"]).strip()
+  upstream_commit = check_output(GET_UPSTREAM_COMMIT_SCRIPT).strip().decode('utf-8')
+  cur_commit = check_output(["git", "rev-parse", "HEAD"]).strip().decode('utf-8')
 
   if upstream_commit == cur_commit:
     return
-  print "The repository appears to have local commits:"
+  print("The repository appears to have local commits:")
   subprocess.check_call(["git", "log", "--oneline", "%s..HEAD" % upstream_commit])
 
-  print Colors.RED + "This should not be an official release!" + \
-      Colors.RESET
+  print(Colors.RED + "This should not be an official release!" + Colors.RESET)
   if not confirm_prompt("Continue?"):
     sys.exit(1)
 
 
 def get_version_number():
   """ Return the current version number of Kudu. """
-  return file(os.path.join(ROOT, "version.txt")).read().strip()
+  return open(os.path.join(ROOT, "version.txt")).read().strip()
 
 
 def create_tarball():
@@ -75,12 +75,12 @@ def create_tarball():
   if not os.path.exists(build_dir):
     os.path.makedirs(build_dir)
   tarball_path = os.path.join(build_dir, artifact_name + ".tar.gz")
-  print "Exporting source tarball..."
+  print("Exporting source tarball...")
   subprocess.check_output(["git", "archive",
                            "--prefix=%s/" % artifact_name,
                            "--output=%s" % tarball_path,
                            "HEAD"])
-  print Colors.GREEN + "Generated tarball:\t" + Colors.RESET, tarball_path
+  print(Colors.GREEN + "Generated tarball:\t" + Colors.RESET + tarball_path)
   return tarball_path
 
 
@@ -91,18 +91,18 @@ def sign_tarball(tarball_path):
 
   email = get_my_email()
   if not email.endswith("@apache.org"):
-    print Colors.YELLOW, "Your email address for the repository is not an @apache.org address."
-    print "Release signatures should typically be signed by committers with @apache.org GPG keys."
-    print Colors.RESET,
+    print(Colors.YELLOW, "Your email address for the repository is not an @apache.org address.")
+    print("Release signatures should typically be signed by committers with @apache.org GPG keys.")
+    print(end=Colors.RESET)
     if not confirm_prompt("Continue?"):
       return
 
   try:
     subprocess.check_call(["gpg", "--detach-sign", "--armor", "-u", email, tarball_path])
   except subprocess.CalledProcessError:
-    print Colors.RED + "GPG signing failed. Artifact will not be signed." + Colors.RESET
+    print(Colors.RED + "GPG signing failed. Artifact will not be signed." + Colors.RESET)
     return
-  print Colors.GREEN + "Generated signature:\t" + Colors.RESET, tarball_path + ".asc"
+  print(Colors.GREEN + "Generated signature:\t" + Colors.RESET, tarball_path + ".asc")
 
 
 def checksum_file(summer, path):
@@ -110,28 +110,28 @@ def checksum_file(summer, path):
   Calculates the checksum of the file 'path' using the provided hashlib
   digest implementation. Returns the hex form of the digest.
   """
-  with file(path, "rb") as f:
+  with open(path, "rb") as f:
     # Read the file in 4KB chunks until EOF.
-    for chunk in iter(lambda: f.read(4096), ""):
+    while True:
+      chunk = f.read(4096)
+      if not chunk:
+        break
       summer.update(chunk)
   return summer.hexdigest()
 
 
-def gen_checksum_files(tarball_path):
+def gen_sha_file(tarball_path):
   """
-  Create md5 and sha files of the tarball.
+  Create a sha checksum file of the tarball.
 
-  The output format is compatible with command line tools like 'sha1sum'
-  and 'md5sum' so they may be used to verify the checksums.
+  The output format is compatible with command line tools like 'sha1sum' so it
+  can be used to verify the checksum.
   """
-  hashes = [(hashlib.sha1, "sha"),
-            (hashlib.md5, "md5")]
-  for hash_func, extension in hashes:
-    digest = checksum_file(hash_func(), tarball_path)
-    path = tarball_path + "." + extension
-    with file(path, "w") as f:
-      print >>f, "%s\t%s" % (digest, os.path.basename(tarball_path))
-    print Colors.GREEN + ("Generated %s:\t" % extension) + Colors.RESET, path
+  digest = checksum_file(hashlib.sha1(), tarball_path)
+  path = tarball_path + ".sha"
+  with open(path, "w") as f:
+    f.write("%s\t%s\n" % (digest, os.path.basename(tarball_path)))
+  print(Colors.GREEN + "Generated sha:\t\t" + Colors.RESET + path)
 
 
 def run_rat(tarball_path):
@@ -151,25 +151,25 @@ def run_rat(tarball_path):
   try:
     rat_jar_dest = "%s/%s" % (tmpdir_path, os.path.basename(rat_url))
 
-    print "> Downloading RAT jar from " + rat_url
+    print("> Downloading RAT jar from " + rat_url)
     urllib.urlretrieve(rat_url, rat_jar_dest)
 
-    print "> Running RAT..."
+    print("> Running RAT...")
     xml = subprocess.check_output(["java", "-jar", rat_jar_dest, "-x", tarball_path])
     rat_report_dest = "%s/%s" % (tmpdir_path, "rat_report.xml")
     with open(rat_report_dest, "w") as f:
         f.write(xml)
 
-    print "> Parsing RAT report..."
+    print("> Parsing RAT report...")
     rat_report_result = subprocess.check_output(
         ["./build-support/release/check-rat-report.py",
          "./build-support/release/rat_exclude_files.txt",
          rat_report_dest],
         stderr=subprocess.STDOUT)
-    print Colors.GREEN + "RAT: LICENSES APPROVED" + Colors.RESET
+    print(Colors.GREEN + "RAT: LICENSES APPROVED" + Colors.RESET)
   except subprocess.CalledProcessError as e:
-    print Colors.RED + "RAT: LICENSES NOT APPROVED" + Colors.RESET
-    print e.output
+    print(Colors.RED + "RAT: LICENSES NOT APPROVED" + Colors.RESET)
+    print(e.output)
     raise e
   finally:
     shutil.rmtree(tmpdir_path)
@@ -181,11 +181,11 @@ def main():
   check_repo_not_dirty()
   check_no_local_commits()
   tarball_path = create_tarball()
-  gen_checksum_files(tarball_path)
+  gen_sha_file(tarball_path)
   sign_tarball(tarball_path)
   run_rat(tarball_path)
 
-  print Colors.GREEN + "Release successfully generated!" + Colors.RESET
+  print(Colors.GREEN + "Release successfully generated!" + Colors.RESET)
   print
 
 

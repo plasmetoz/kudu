@@ -16,25 +16,64 @@
 // under the License.
 
 #include <algorithm>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <memory>
+#include <numeric>
+#include <ostream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/clock/logical_clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/partial_row.h"
+#include "kudu/common/row.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/rowid.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
 #include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/block_manager.h"
 #include "kudu/fs/fs_manager.h"
 #include "kudu/fs/log_block_manager.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/gutil/strings/util.h"
-#include "kudu/server/logical_clock.h"
 #include "kudu/tablet/compaction.h"
+#include "kudu/tablet/diskrowset.h"
 #include "kudu/tablet/local_tablet_writer.h"
+#include "kudu/tablet/memrowset.h"
+#include "kudu/tablet/mutation.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset.h"
+#include "kudu/tablet/rowset_metadata.h"
+#include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/tablet/tablet_mem_trackers.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 #include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
 DEFINE_string(merge_benchmark_input_dir, "",
@@ -51,6 +90,10 @@ DEFINE_int32(merge_benchmark_num_rows_per_rowset, 500000,
 DECLARE_string(block_manager);
 
 using std::shared_ptr;
+using std::string;
+using std::thread;
+using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -69,8 +112,8 @@ class TestCompaction : public KuduRowSetTest {
     : KuduRowSetTest(CreateSchema()),
       op_id_(consensus::MaximumOpId()),
       row_builder_(schema_),
-      arena_(32*1024, 128*1024),
-      clock_(server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
+      arena_(32*1024),
+      clock_(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
       log_anchor_registry_(new log::LogAnchorRegistry()) {
   }
 
@@ -237,7 +280,7 @@ class TestCompaction : public KuduRowSetTest {
     // Flush with a large roll threshold so we only write a single file.
     // This simplifies the test so we always need to reopen only a single rowset.
     RollingDiskRowSetWriter rsw(tablet()->metadata(), projection,
-                                BloomFilterSizing::BySizeAndFPRate(32*1024, 0.01f),
+                                Tablet::DefaultBloomSizing(),
                                 roll_threshold);
     ASSERT_OK(rsw.Open());
     ASSERT_OK(FlushCompactionInput(input, snap, HistoryGcOpts::Disabled(), &rsw));
@@ -413,7 +456,7 @@ class TestCompaction : public KuduRowSetTest {
       ASSERT_OK(BuildCompactionInput(merge_snap, rowsets, schema_, &compact_input));
       // Use a low target row size to increase the number of resulting rowsets.
       RollingDiskRowSetWriter rdrsw(tablet()->metadata(), schema_,
-                                    BloomFilterSizing::BySizeAndFPRate(32 * 1024, 0.01f),
+                                    Tablet::DefaultBloomSizing(),
                                     1024 * 1024); // 1 MB
       ASSERT_OK(rdrsw.Open());
       ASSERT_OK(FlushCompactionInput(compact_input.get(), merge_snap, HistoryGcOpts::Disabled(),
@@ -434,7 +477,7 @@ class TestCompaction : public KuduRowSetTest {
   RowBuilder row_builder_;
   char key_buf_[256];
   Arena arena_;
-  scoped_refptr<server::LogicalClock> clock_;
+  scoped_refptr<clock::LogicalClock> clock_;
   MvccManager mvcc_;
 
   scoped_refptr<LogAnchorRegistry> log_anchor_registry_;
@@ -489,11 +532,11 @@ TEST_F(TestCompaction, TestFlushMRSWithRolling) {
 
   rows.clear();
   rowsets[1]->DebugDump(&rows);
-  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00154700", int32 val=15470, )"
-                "int32 nullable_val=15470); Undo Mutations: [@15471(DELETE)]; Redo Mutations: [];",
+  EXPECT_EQ(R"(RowIdxInBlock: 0; Base: (string key="hello 00017150", int32 val=1715, )"
+            "int32 nullable_val=NULL); Undo Mutations: [@1716(DELETE)]; Redo Mutations: [];",
             rows[0]);
-  EXPECT_EQ(R"(RowIdxInBlock: 1; Base: (string key="hello 00154710", int32 val=15471, )"
-                "int32 nullable_val=NULL); Undo Mutations: [@15472(DELETE)]; Redo Mutations: [];",
+  EXPECT_EQ(R"(RowIdxInBlock: 1; Base: (string key="hello 00017160", int32 val=1716, )"
+            "int32 nullable_val=1716); Undo Mutations: [@1717(DELETE)]; Redo Mutations: [];",
             rows[1]);
 }
 
@@ -1019,6 +1062,50 @@ TEST_F(TestCompaction, BenchmarkMergeWithOverlap) {
   ASSERT_NO_FATAL_FAILURE(DoBenchmark<true>());
 }
 #endif
+
+// Test for KUDU-2115 to ensure that compaction selection will correctly pick
+// rowsets that exist in the rowset tree (i.e. rowsets that are removed by
+// concurrent compactions are not considered).
+//
+// Failure of this test may not necessarily mean that a compaction of the
+// single rowset will occur, but rather that a potentially sub-optimal
+// compaction may be scheduled.
+TEST_F(TestCompaction, TestConcurrentCompactionRowSetPicking) {
+  LocalTabletWriter writer(tablet().get(), &client_schema());
+  KuduPartialRow row(&client_schema());
+  const int kNumRowSets = 3;
+  const int kNumRowsPerRowSet = 2;
+  const int kExpectedRows = kNumRowSets * kNumRowsPerRowSet;
+
+  // Flush a few overlapping rowsets.
+  for (int i = 0; i < kNumRowSets; i++) {
+    for (int j = 0; j < kNumRowsPerRowSet; j++) {
+      const int val = i + j * 10;
+      ASSERT_OK(row.SetStringCopy("key", Substitute("hello $0", val)));
+      ASSERT_OK(row.SetInt32("val", val));
+      ASSERT_OK(writer.Insert(row));
+    }
+    ASSERT_OK(tablet()->Flush());
+  }
+  uint64_t num_rows;
+  ASSERT_OK(tablet()->CountRows(&num_rows));
+  ASSERT_EQ(kExpectedRows, num_rows);
+
+  // Schedule multiple compactions on the tablet at once. Concurrent
+  // compactions should not schedule the same rowsets for compaction, and we
+  // should end up with the same number of rows.
+  vector<unique_ptr<thread>> threads;
+  for (int i = 0; i < 10; i++) {
+    threads.emplace_back(new thread([&] {
+      ASSERT_OK(tablet()->Compact(Tablet::COMPACT_NO_FLAGS));
+    }));
+  }
+  for (int i = 0; i < 10; i++) {
+    threads[i]->join();
+  }
+  ASSERT_OK(tablet()->CountRows(&num_rows));
+  ASSERT_EQ(kExpectedRows, num_rows);
+}
 
 TEST_F(TestCompaction, TestCompactionFreesDiskSpace) {
   {

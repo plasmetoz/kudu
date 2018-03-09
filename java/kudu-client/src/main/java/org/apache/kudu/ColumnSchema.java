@@ -17,10 +17,13 @@
 
 package org.apache.kudu;
 
+import java.util.Objects;
+
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
+
 import org.apache.kudu.Common.EncodingType;
 import org.apache.kudu.Compression.CompressionType;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 
 /**
  * Represents a Kudu Table column. Use {@link ColumnSchema.ColumnSchemaBuilder} in order to
@@ -38,6 +41,8 @@ public class ColumnSchema {
   private final int desiredBlockSize;
   private final Encoding encoding;
   private final CompressionAlgorithm compressionAlgorithm;
+  private final ColumnTypeAttributes typeAttributes;
+  private final int typeSize;
 
   /**
    * Specifies the encoding of data for a column on disk.
@@ -91,7 +96,7 @@ public class ColumnSchema {
 
   private ColumnSchema(String name, Type type, boolean key, boolean nullable,
                        Object defaultValue, int desiredBlockSize, Encoding encoding,
-                       CompressionAlgorithm compressionAlgorithm) {
+                       CompressionAlgorithm compressionAlgorithm, ColumnTypeAttributes typeAttributes) {
     this.name = name;
     this.type = type;
     this.key = key;
@@ -100,6 +105,8 @@ public class ColumnSchema {
     this.desiredBlockSize = desiredBlockSize;
     this.encoding = encoding;
     this.compressionAlgorithm = compressionAlgorithm;
+    this.typeAttributes = typeAttributes;
+    this.typeSize = type.getSize(typeAttributes);
   }
 
   /**
@@ -167,6 +174,21 @@ public class ColumnSchema {
     return compressionAlgorithm;
   }
 
+  /**
+   * Return the column type attributes for the column, or null if it is not known.
+   */
+  public ColumnTypeAttributes getTypeAttributes() {
+    return typeAttributes;
+  }
+
+  /**
+   * The size of this type in bytes on the wire.
+   * @return A size
+   */
+  public int getTypeSize() {
+    return typeSize;
+  }
+
   @Override
   public boolean equals(Object o) {
     if (this == o) {
@@ -187,26 +209,28 @@ public class ColumnSchema {
     if (!type.equals(that.type)) {
       return false;
     }
+    if (!typeAttributes.equals(that.typeAttributes)) {
+      return false;
+    }
 
     return true;
   }
 
   @Override
   public int hashCode() {
-    int result = name.hashCode();
-    result = 31 * result + type.hashCode();
-    result = 31 * result + (key ? 1 : 0);
-    return result;
+    return Objects.hash(name, type, key, typeAttributes);
   }
 
   @Override
   public String toString() {
-    return "Column name: " + name + ", type: " + type.getName();
+    return "Column name: " + name + ", type: " + type.getName() + typeAttributes.toStringForType(type);
   }
 
   /**
    * Builder for ColumnSchema.
    */
+  @InterfaceAudience.Public
+  @InterfaceStability.Evolving
   public static class ColumnSchemaBuilder {
     private final String name;
     private final Type type;
@@ -216,6 +240,7 @@ public class ColumnSchema {
     private int blockSize = 0;
     private Encoding encoding = null;
     private CompressionAlgorithm compressionAlgorithm = null;
+    private ColumnTypeAttributes typeAttributes = null;
 
     /**
      * Constructor for the required parameters.
@@ -307,13 +332,25 @@ public class ColumnSchema {
     }
 
     /**
+     * Set the column type attributes for this column.
+     */
+    public ColumnSchemaBuilder typeAttributes(ColumnTypeAttributes typeAttributes) {
+      if (type != Type.DECIMAL && typeAttributes != null) {
+        throw new IllegalArgumentException(
+            "ColumnTypeAttributes are not used on " + type + " columns");
+      }
+      this.typeAttributes = typeAttributes;
+      return this;
+    }
+
+    /**
      * Builds a {@link ColumnSchema} using the passed parameters.
      * @return a new {@link ColumnSchema}
      */
     public ColumnSchema build() {
       return new ColumnSchema(name, type,
                               key, nullable, defaultValue,
-                              blockSize, encoding, compressionAlgorithm);
+                              blockSize, encoding, compressionAlgorithm, typeAttributes);
     }
   }
 }

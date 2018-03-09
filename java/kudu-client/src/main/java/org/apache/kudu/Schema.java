@@ -23,9 +23,9 @@ import java.util.List;
 import java.util.Map;
 
 import com.google.common.collect.ImmutableList;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.Bytes;
 import org.apache.kudu.client.PartialRow;
 
@@ -111,7 +111,7 @@ public class Schema {
 
       hasNulls |= column.isNullable();
       columnOffsets[index] = offset;
-      offset += column.getType().getSize();
+      offset += column.getTypeSize();
       if (this.columnsByName.put(column.getName(), index) != null) {
         throw new IllegalArgumentException(
             String.format("Column names must be unique: %s", columns));
@@ -167,7 +167,7 @@ public class Schema {
     int totalSize = 0;
     boolean hasNullables = false;
     for (ColumnSchema column : columns) {
-      totalSize += column.getType().getSize();
+      totalSize += column.getTypeSize();
       hasNullables |= column.isNullable();
     }
     if (hasNullables) {

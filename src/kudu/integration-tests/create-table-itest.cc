@@ -15,22 +15,47 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cmath>
+#include <cstdint>
+#include <cstdlib>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <set>
 #include <string>
+#include <type_traits>
+#include <utility>
+#include <vector>
 
-#include <gflags/gflags.h>
+#include <glog/logging.h>
 #include <glog/stl_logging.h>
 #include <gtest/gtest.h>
 
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/mathlimits.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/mini-cluster/mini_cluster.h"
 #include "kudu/rpc/rpc_controller.h"
+#include "kudu/util/atomic.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
 using std::multimap;
 using std::set;
@@ -41,6 +66,8 @@ METRIC_DECLARE_entity(server);
 METRIC_DECLARE_histogram(handler_latency_kudu_tserver_TabletServerAdminService_CreateTablet);
 
 namespace kudu {
+
+using cluster::ClusterNodes;
 
 const char* const kTableName = "test-table";
 
@@ -55,7 +82,7 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   const int kNumReplicas = 3;
   vector<string> ts_flags;
   vector<string> master_flags;
-  master_flags.push_back("--tablet_creation_timeout_ms=1000");
+  master_flags.emplace_back("--tablet_creation_timeout_ms=1000");
   NO_FATALS(StartCluster(ts_flags, master_flags, kNumReplicas));
 
   // Shut down 2/3 of the tablet servers.
@@ -78,7 +105,8 @@ TEST_F(CreateTableITest, TestCreateWhenMajorityOfReplicasFailCreation) {
   int64_t num_create_attempts = 0;
   while (num_create_attempts < 3) {
     SleepFor(MonoDelta::FromMilliseconds(100));
-    ASSERT_OK(cluster_->tablet_server(0)->GetInt64Metric(
+    ASSERT_OK(itest::GetInt64Metric(
+        cluster_->tablet_server(0)->bound_http_hostport(),
         &METRIC_ENTITY_server,
         "kudu.tabletserver",
         &METRIC_handler_latency_kudu_tserver_TabletServerAdminService_CreateTablet,

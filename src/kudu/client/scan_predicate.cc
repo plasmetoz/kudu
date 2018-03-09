@@ -17,24 +17,31 @@
 
 #include "kudu/client/scan_predicate.h"
 
-#include <boost/optional.hpp>
 #include <utility>
 #include <vector>
+
+#include <boost/optional/optional.hpp>
 
 #include "kudu/client/scan_predicate-internal.h"
 #include "kudu/client/value-internal.h"
 #include "kudu/client/value.h"
+#include "kudu/common/column_predicate.h"
 #include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/status.h"
 
+using boost::optional;
 using std::move;
 using std::vector;
-using boost::optional;
+using strings::Substitute;
 
 namespace kudu {
 
-using strings::Substitute;
+class Arena;
 
 namespace client {
 
@@ -70,7 +77,8 @@ ComparisonPredicateData::~ComparisonPredicateData() {
 Status ComparisonPredicateData::AddToScanSpec(ScanSpec* spec, Arena* arena) {
   void* val_void;
   RETURN_NOT_OK(val_->data_->CheckTypeAndGetPointer(col_.name(),
-                                                    col_.type_info()->physical_type(),
+                                                    col_.type_info()->type(),
+                                                    col_.type_attributes(),
                                                     &val_void));
   switch (op_) {
     case KuduPredicate::LESS_EQUAL: {
@@ -129,7 +137,8 @@ Status InListPredicateData::AddToScanSpec(ScanSpec* spec, Arena* /*arena*/) {
     // passed to the ColumnPredicate::InList constructor. The constructor for
     // ColumnPredicate::InList will assume ownership of the pointers via a swap.
     RETURN_NOT_OK(value->data_->CheckTypeAndGetPointer(col_.name(),
-                                                       col_.type_info()->physical_type(),
+                                                       col_.type_info()->type(),
+                                                       col_.type_attributes(),
                                                        &val_void));
     vals_list.push_back(val_void);
   }

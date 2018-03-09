@@ -17,29 +17,39 @@
 
 #include "kudu/rpc/negotiation.h"
 
-#include <sys/time.h>
 #include <poll.h>
+#include <sys/socket.h>
 
+#include <cerrno>
+#include <ctime>
+#include <memory>
 #include <ostream>
 #include <string>
+#include <utility>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 
-#include "kudu/gutil/stringprintf.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/rpc/blocking_ops.h"
 #include "kudu/rpc/client_negotiation.h"
 #include "kudu/rpc/connection.h"
+#include "kudu/rpc/connection_id.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/reactor.h"
+#include "kudu/rpc/rpc_controller.h"
 #include "kudu/rpc/rpc_header.pb.h"
-#include "kudu/rpc/sasl_common.h"
 #include "kudu/rpc/server_negotiation.h"
+#include "kudu/rpc/user_credentials.h"
 #include "kudu/security/tls_context.h"
+#include "kudu/security/token.pb.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/socket.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
 #include "kudu/util/trace.h"
 
@@ -54,9 +64,6 @@ DEFINE_int32(rpc_negotiation_inject_delay_ms, 0,
              "the RPC negotiation process on the server side.");
 TAG_FLAG(rpc_negotiation_inject_delay_ms, unsafe);
 
-DECLARE_string(keytab_file);
-DECLARE_string(rpc_certificate_file);
-
 DEFINE_bool(rpc_encrypt_loopback_connections, false,
             "Whether to encrypt data transfer on RPC connections that stay within "
             "a single host. Encryption here is likely to offer no additional "
@@ -65,6 +72,8 @@ DEFINE_bool(rpc_encrypt_loopback_connections, false,
             "an attacker.");
 TAG_FLAG(rpc_encrypt_loopback_connections, advanced);
 
+using std::string;
+using std::unique_ptr;
 using strings::Substitute;
 
 namespace kudu {
@@ -156,18 +165,19 @@ static Status DisableSocketTimeouts(Socket* socket) {
 static Status DoClientNegotiation(Connection* conn,
                                   RpcAuthentication authentication,
                                   RpcEncryption encryption,
-                                  MonoTime deadline) {
+                                  MonoTime deadline,
+                                  unique_ptr<ErrorStatusPB>* rpc_error) {
   const auto* messenger = conn->reactor_thread()->reactor()->messenger();
+  // Prefer secondary credentials (such as authn token) if permitted by policy.
+  const auto authn_token = (conn->credentials_policy() == CredentialsPolicy::PRIMARY_CREDENTIALS)
+      ? boost::none : messenger->authn_token();
   ClientNegotiation client_negotiation(conn->release_socket(),
                                        &messenger->tls_context(),
-                                       messenger->authn_token(),
-                                       encryption);
+                                       authn_token,
+                                       encryption,
+                                       messenger->sasl_proto_name());
 
-  // Note that the fqdn is an IP address here: we've already lost whatever DNS
-  // name the client was attempting to use. Unless krb5 is configured with 'rdns
-  // = false', it will automatically take care of reversing this address to its
-  // canonical hostname to determine the expected server principal.
-  client_negotiation.set_server_fqdn(conn->remote().host());
+  client_negotiation.set_server_fqdn(conn->outbound_connection_id().hostname());
 
   if (authentication != RpcAuthentication::DISABLED) {
     Status s = client_negotiation.EnableGSSAPI();
@@ -186,7 +196,7 @@ static Status DoClientNegotiation(Connection* conn,
       }
 
       if (authentication == RpcAuthentication::REQUIRED &&
-          !messenger->authn_token() &&
+          !authn_token &&
           !messenger->tls_context().has_signed_cert()) {
         return Status::InvalidArgument(
             "Kerberos, token, or PKI certificate credentials must be provided in order to "
@@ -196,19 +206,27 @@ static Status DoClientNegotiation(Connection* conn,
   }
 
   if (authentication != RpcAuthentication::REQUIRED) {
-    RETURN_NOT_OK(client_negotiation.EnablePlain(conn->local_user_credentials().real_user(), ""));
+    const auto& creds = conn->outbound_connection_id().user_credentials();
+    RETURN_NOT_OK(client_negotiation.EnablePlain(creds.real_user(), ""));
   }
 
   client_negotiation.set_deadline(deadline);
 
   RETURN_NOT_OK(WaitForClientConnect(client_negotiation.socket(), deadline));
   RETURN_NOT_OK(client_negotiation.socket()->SetNonBlocking(false));
-  RETURN_NOT_OK(client_negotiation.Negotiate());
+  RETURN_NOT_OK(client_negotiation.Negotiate(rpc_error));
   RETURN_NOT_OK(DisableSocketTimeouts(client_negotiation.socket()));
 
   // Transfer the negotiated socket and state back to the connection.
   conn->adopt_socket(client_negotiation.release_socket());
   conn->set_remote_features(client_negotiation.take_server_features());
+  conn->set_confidential(client_negotiation.tls_negotiated() ||
+      (conn->socket()->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections));
+
+  // Sanity check: if no authn token was supplied as user credentials,
+  // the negotiated authentication type cannot be AuthenticationType::TOKEN.
+  DCHECK(!(authn_token == boost::none &&
+           client_negotiation.negotiated_authn() == AuthenticationType::TOKEN));
 
   return Status::OK();
 }
@@ -218,9 +236,10 @@ static Status DoServerNegotiation(Connection* conn,
                                   RpcAuthentication authentication,
                                   RpcEncryption encryption,
                                   const MonoTime& deadline) {
+  const auto* messenger = conn->reactor_thread()->reactor()->messenger();
   if (authentication == RpcAuthentication::REQUIRED &&
-      FLAGS_keytab_file.empty() &&
-      FLAGS_rpc_certificate_file.empty()) {
+      messenger->keytab_file().empty() &&
+      !messenger->tls_context().is_external_cert()) {
     return Status::InvalidArgument("RPC authentication (--rpc_authentication) may not be "
                                    "required unless Kerberos (--keytab_file) or external PKI "
                                    "(--rpc_certificate_file et al) are configured");
@@ -233,13 +252,13 @@ static Status DoServerNegotiation(Connection* conn,
   }
 
   // Create a new ServerNegotiation to handle the synchronous negotiation.
-  const auto* messenger = conn->reactor_thread()->reactor()->messenger();
   ServerNegotiation server_negotiation(conn->release_socket(),
                                        &messenger->tls_context(),
                                        &messenger->token_verifier(),
-                                       encryption);
+                                       encryption,
+                                       messenger->sasl_proto_name());
 
-  if (authentication != RpcAuthentication::DISABLED && !FLAGS_keytab_file.empty()) {
+  if (authentication != RpcAuthentication::DISABLED && !messenger->keytab_file().empty()) {
     RETURN_NOT_OK(server_negotiation.EnableGSSAPI());
   }
   if (authentication != RpcAuthentication::REQUIRED) {
@@ -257,6 +276,8 @@ static Status DoServerNegotiation(Connection* conn,
   conn->adopt_socket(server_negotiation.release_socket());
   conn->set_remote_features(server_negotiation.take_client_features());
   conn->set_remote_user(server_negotiation.take_authenticated_user());
+  conn->set_confidential(server_negotiation.tls_negotiated() ||
+      (conn->socket()->IsLoopbackConnection() && !FLAGS_rpc_encrypt_loopback_connections));
 
   return Status::OK();
 }
@@ -266,10 +287,12 @@ void Negotiation::RunNegotiation(const scoped_refptr<Connection>& conn,
                                  RpcEncryption encryption,
                                  MonoTime deadline) {
   Status s;
+  unique_ptr<ErrorStatusPB> rpc_error;
   if (conn->direction() == Connection::SERVER) {
     s = DoServerNegotiation(conn.get(), authentication, encryption, deadline);
   } else {
-    s = DoClientNegotiation(conn.get(), authentication, encryption, deadline);
+    s = DoClientNegotiation(conn.get(), authentication, encryption, deadline,
+                            &rpc_error);
   }
 
   if (PREDICT_FALSE(!s.ok())) {
@@ -296,7 +319,7 @@ void Negotiation::RunNegotiation(const scoped_refptr<Connection>& conn,
   if (conn->direction() == Connection::SERVER && s.IsNotAuthorized()) {
     LOG(WARNING) << "Unauthorized connection attempt: " << s.message().ToString();
   }
-  conn->CompleteNegotiation(s);
+  conn->CompleteNegotiation(std::move(s), std::move(rpc_error));
 }
 
 

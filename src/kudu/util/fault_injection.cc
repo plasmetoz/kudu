@@ -17,13 +17,16 @@
 
 #include "kudu/util/fault_injection.h"
 
-#include <stdlib.h>
-#include <sys/time.h>
+#include <unistd.h>
 
+#include <ostream>
+
+#include <glog/logging.h>
+
+#include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/once.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/os-util.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
 
@@ -53,7 +56,7 @@ void DoMaybeFault(const char* fault_str, double fraction) {
   }
   LOG(ERROR) << "Injecting fault: " << fault_str << " (process will exit)";
   // _exit will exit the program without running atexit handlers. This more
-  // accurately simiulates a crash.
+  // accurately simulates a crash.
   _exit(kExitStatus);
 }
 
@@ -62,13 +65,13 @@ void DoInjectRandomLatency(double max_latency_ms) {
   SleepFor(MonoDelta::FromMilliseconds(g_random->NextDoubleFraction() * max_latency_ms));
 }
 
-Status DoMaybeReturnFailure(double fraction,
-                            const Status& bad_status_to_return) {
+void DoInjectFixedLatency(int32_t latency_ms) {
+  SleepFor(MonoDelta::FromMilliseconds(latency_ms));
+}
+
+bool DoMaybeTrue(double fraction) {
   GoogleOnceInit(&g_random_once, InitRandom);
-  if (PREDICT_TRUE(g_random->NextDoubleFraction() >= fraction)) {
-    return Status::OK();
-  }
-  return bad_status_to_return;
+  return PREDICT_FALSE(g_random->NextDoubleFraction() <= fraction);
 }
 
 } // namespace fault_injection

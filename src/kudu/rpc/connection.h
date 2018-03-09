@@ -18,22 +18,26 @@
 #ifndef KUDU_RPC_CONNECTION_H
 #define KUDU_RPC_CONNECTION_H
 
-#include <stdint.h>
-
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <memory>
 #include <set>
 #include <string>
 #include <unordered_map>
-#include <vector>
+#include <utility>
 
 #include <boost/intrusive/list.hpp>
+#include <boost/optional/optional.hpp>
 #include <ev++.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/rpc/inbound_call.h"
-#include "kudu/rpc/outbound_call.h"
+#include "kudu/rpc/connection_id.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
 #include "kudu/rpc/remote_user.h"
 #include "kudu/rpc/transfer.h"
 #include "kudu/util/monotime.h"
@@ -43,12 +47,16 @@
 #include "kudu/util/status.h"
 
 namespace kudu {
+
 namespace rpc {
 
 class DumpRunningRpcsRequestPB;
+class InboundCall;
+class OutboundCall;
 class RpcConnectionPB;
 class ReactorThread;
 class RpczStore;
+enum class CredentialsPolicy;
 
 //
 // A connection between an endpoint and us.
@@ -84,7 +92,8 @@ class Connection : public RefCountedThreadSafe<Connection> {
   Connection(ReactorThread *reactor_thread,
              Sockaddr remote,
              std::unique_ptr<Socket> socket,
-             Direction direction);
+             Direction direction,
+             CredentialsPolicy policy = CredentialsPolicy::ANY_CREDENTIALS);
 
   // Set underlying socket to non-blocking (or blocking) mode.
   Status SetNonBlocking(bool enabled);
@@ -106,33 +115,61 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // Fail any calls which are currently queued or awaiting response.
   // Prohibits any future calls (they will be failed immediately with this
   // same Status).
-  void Shutdown(const Status &status);
+  void Shutdown(const Status& status,
+                std::unique_ptr<ErrorStatusPB> rpc_error = {});
 
   // Queue a new call to be made. If the queueing fails, the call will be
-  // marked failed.
+  // marked failed. The caller is expected to check if 'call' has been cancelled
+  // before making the call.
   // Takes ownership of the 'call' object regardless of whether it succeeds or fails.
-  // This may be called from a non-reactor thread.
-  void QueueOutboundCall(const std::shared_ptr<OutboundCall> &call);
+  void QueueOutboundCall(std::shared_ptr<OutboundCall> call);
 
   // Queue a call response back to the client on the server side.
   //
   // This may be called from a non-reactor thread.
   void QueueResponseForCall(gscoped_ptr<InboundCall> call);
 
+  // Cancel an outbound call by removing any reference to it by CallAwaitingResponse
+  // in 'awaiting_responses_'.
+  void CancelOutboundCall(const std::shared_ptr<OutboundCall> &call);
+
   // The address of the remote end of the connection.
   const Sockaddr &remote() const { return remote_; }
 
   // Set the user credentials for an outbound connection.
-  void set_local_user_credentials(UserCredentials creds) {
+  void set_outbound_connection_id(ConnectionId conn_id) {
     DCHECK_EQ(direction_, CLIENT);
-    local_user_credentials_ = std::move(creds);
+    DCHECK(!outbound_connection_id_);
+    outbound_connection_id_ = std::move(conn_id);
   }
 
   // Get the user credentials which will be used to log in.
-  const UserCredentials& local_user_credentials() const {
+  const ConnectionId& outbound_connection_id() const {
     DCHECK_EQ(direction_, CLIENT);
-    return local_user_credentials_;
+    DCHECK(outbound_connection_id_);
+    return *outbound_connection_id_;
   }
+
+  bool is_confidential() const {
+    return is_confidential_;
+  }
+
+  // Set/unset the 'confidentiality' property for this connection.
+  void set_confidential(bool is_confidential);
+
+  // Credentials policy to start connection negotiation.
+  CredentialsPolicy credentials_policy() const { return credentials_policy_; }
+
+  // Whether the connection satisfies the specified credentials policy.
+  //
+  // NOTE: The policy is set prior to connection negotiation, and the actual
+  //       authentication credentials used for connection negotiation might
+  //       effectively make the connection to satisfy a stronger policy.
+  //       An example: the credentials policy for the connection was set to
+  //       ANY_CREDENTIALS, but since the authn token was not available
+  //       at the time of negotiation, the primary credentials were used, making
+  //       the connection de facto satisfying the PRIMARY_CREDENTIALS policy.
+  bool SatisfiesCredentialsPolicy(CredentialsPolicy policy) const;
 
   RpczStore* rpcz_store();
 
@@ -150,7 +187,8 @@ class Connection : public RefCountedThreadSafe<Connection> {
   Socket* socket() { return socket_.get(); }
 
   // Go through the process of transferring control of the underlying socket back to the Reactor.
-  void CompleteNegotiation(const Status& negotiation_status);
+  void CompleteNegotiation(Status negotiation_status,
+                           std::unique_ptr<ErrorStatusPB> rpc_error);
 
   // Indicate that negotiation is complete and that the Reactor is now in control of the socket.
   void MarkNegotiationComplete();
@@ -182,9 +220,27 @@ class Connection : public RefCountedThreadSafe<Connection> {
     return remote_user_;
   }
 
+  // Whether the connection is scheduled for shutdown.
+  bool scheduled_for_shutdown() const {
+    DCHECK_EQ(direction_, CLIENT);
+    return scheduled_for_shutdown_;
+  }
+
+  // Mark the connection as scheduled to be shut down. Reactor does not dispatch
+  // new calls on such a connection.
+  void set_scheduled_for_shutdown() {
+    DCHECK_EQ(direction_, CLIENT);
+    scheduled_for_shutdown_ = true;
+  }
+
+  size_t num_queued_outbound_transfers() const {
+    return outbound_transfers_.size();
+  }
+
  private:
   friend struct CallAwaitingResponse;
   friend class QueueTransferTask;
+  friend struct CallTransferCallbacks;
   friend struct ResponseTransferCallbacks;
 
   // A call which has been fully sent to the server, which we're waiting for
@@ -238,6 +294,10 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // This must be called from the reactor thread.
   void QueueOutbound(gscoped_ptr<OutboundTransfer> transfer);
 
+  // Internal test function for injecting cancellation request when 'call'
+  // reaches state specified in 'FLAGS_rpc_inject_cancellation_state'.
+  void MaybeInjectCancellation(const std::shared_ptr<OutboundCall> &call);
+
   // The reactor thread that created this connection.
   ReactorThread* const reactor_thread_;
 
@@ -247,8 +307,9 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // The socket we're communicating on.
   std::unique_ptr<Socket> socket_;
 
-  // The credentials of the user operating on this connection (if a client user).
-  UserCredentials local_user_credentials_;
+  // The ConnectionId that serves as a key into the client connection map
+  // within this reactor. Only set in the case of outbound connections.
+  boost::optional<ConnectionId> outbound_connection_id_;
 
   // The authenticated remote user (if this is an inbound connection on the server).
   RemoteUser remote_user_;
@@ -289,10 +350,6 @@ class Connection : public RefCountedThreadSafe<Connection> {
   // Starts as Status::OK, gets set to a shutdown status upon Shutdown().
   Status shutdown_status_;
 
-  // Temporary vector used when serializing - avoids an allocation
-  // when serializing calls.
-  std::vector<Slice> slices_tmp_;
-
   // RPC features supported by the remote end of the connection.
   std::set<RpcFeatureFlag> remote_features_;
 
@@ -301,8 +358,31 @@ class Connection : public RefCountedThreadSafe<Connection> {
   ObjectPool<CallAwaitingResponse> car_pool_;
   typedef ObjectPool<CallAwaitingResponse>::scoped_ptr scoped_car;
 
+  // The credentials policy to use for connection negotiation. It defines which
+  // type of user credentials used to negotiate a connection. The actual type of
+  // credentials used for authentication during the negotiation process depends
+  // on the credentials availability, but the result credentials guaranteed to
+  // always satisfy the specified credentials policy. In other words, the actual
+  // type of credentials used for connection negotiation might effectively make
+  // the connection to satisfy a stronger/narrower policy.
+  //
+  // An example:
+  //   The credentials policy for the connection was set to ANY_CREDENTIALS,
+  //   but since no secondary credentials (such authn token) were available
+  //   at the time of negotiation, the primary credentials were used,making the
+  //   connection satisfying the PRIMARY_CREDENTIALS policy de facto.
+  const CredentialsPolicy credentials_policy_;
+
   // Whether we completed connection negotiation.
   bool negotiation_complete_;
+
+  // Whether it's OK to pass confidential information over the connection.
+  // For example, an encrypted (but not necessarily authenticated) connection
+  // is considered confidential.
+  bool is_confidential_;
+
+  // Whether the connection is scheduled for shutdown.
+  bool scheduled_for_shutdown_;
 };
 
 } // namespace rpc

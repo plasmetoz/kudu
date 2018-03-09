@@ -17,28 +17,33 @@
 #ifndef KUDU_TABLET_DELTA_STORE_H
 #define KUDU_TABLET_DELTA_STORE_H
 
+#include <cstddef>
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <vector>
 
-#include "kudu/common/columnblock.h"
-#include "kudu/common/schema.h"
-#include "kudu/util/status.h"
-#include "kudu/tablet/mutation.h"
-#include "kudu/tablet/mvcc.h"
+#include "kudu/common/rowid.h"
 #include "kudu/tablet/delta_key.h"
-#include "kudu/tablet/delta_stats.h"
-#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
+class Arena;
+class ColumnBlock;
 class ScanSpec;
+class Schema;
 class SelectionVector;
+struct ColumnId;
 
 namespace tablet {
 
-class DeltaIterator;
 class DeltaFileWriter;
+class DeltaIterator;
+class DeltaStats;
+class Mutation;
+class MvccSnapshot;
 
 // Interface for the pieces of the system that track deltas/updates.
 // This is implemented by DeltaMemStore and by DeltaFileReader.
@@ -163,7 +168,7 @@ class DeltaIterator {
   //
   // The Mutation objects will be allocated out of the provided Arena, which must be non-NULL.
   // Must have called PrepareBatch() with flag = PREPARE_FOR_COLLECT.
-  virtual Status CollectMutations(vector<Mutation *> *dst, Arena *arena) = 0;
+  virtual Status CollectMutations(std::vector<Mutation *> *dst, Arena *arena) = 0;
 
   // Iterate through all deltas, adding deltas for columns not
   // specified in 'col_ids' to 'out'.
@@ -172,7 +177,7 @@ class DeltaIterator {
   // must be non-NULL.
   // Must have called PrepareBatch() with flag = PREPARE_FOR_COLLECT.
   virtual Status FilterColumnIdsAndCollectDeltas(const std::vector<ColumnId>& col_ids,
-                                                 vector<DeltaKeyAndUpdate>* out,
+                                                 std::vector<DeltaKeyAndUpdate>* out,
                                                  Arena* arena) = 0;
 
   // Returns true if there are any more rows left in this iterator.
@@ -202,7 +207,7 @@ Status DebugDumpDeltaIterator(DeltaType type,
                               DeltaIterator* iter,
                               const Schema& schema,
                               size_t nrows,
-                              vector<std::string>* out);
+                              std::vector<std::string>* out);
 
 // Writes the contents of 'iter' to 'out', block by block.  Used by
 // minor delta compaction.

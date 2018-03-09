@@ -16,20 +16,34 @@
 // under the License.
 
 #include <algorithm>
+#include <cstdint>
 #include <iterator>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
 #include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/schema.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/security/test/mini_kdc.h"
 #include "kudu/tablet/key_value_test_schema.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 
+DECLARE_bool(rpc_reopen_outbound_connections);
 DECLARE_bool(rpc_trace_negotiation);
 
 using kudu::client::KuduClient;
@@ -38,6 +52,8 @@ using kudu::client::KuduSchema;
 using kudu::client::KuduSession;
 using kudu::client::KuduTable;
 using kudu::client::KuduTableCreator;
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -52,13 +68,13 @@ namespace kudu {
 class SecurityComponentsFaultsITest : public KuduTest {
  public:
   SecurityComponentsFaultsITest()
-#if defined(ADDRESS_SANITIZER) || defined(THREAD_SANITIZER)
-      : krb_lifetime_seconds_(64),
-#else
-      : krb_lifetime_seconds_(16),
-#endif
+      : krb_lifetime_seconds_(120),
         num_masters_(3),
         num_tservers_(3) {
+
+    // Reopen client-->server connections on every RPC. This is to make sure the
+    // servers authenticate the client on every RPC call.
+    FLAGS_rpc_reopen_outbound_connections = true;
 
     // Want to run with Kerberos enabled.
     cluster_opts_.enable_kerberos = true;
@@ -77,10 +93,21 @@ class SecurityComponentsFaultsITest : public KuduTest {
     const vector<string> common_flags = {
       // Enable tracing of successful KRPC negotiations as well.
       "--rpc_trace_negotiation",
+
+      // Speed up Raft elections.
+      "--raft_heartbeat_interval_ms=25",
+      "--leader_failure_exp_backoff_max_delta_ms=1000",
     };
     std::copy(common_flags.begin(), common_flags.end(),
         std::back_inserter(cluster_opts_.extra_master_flags));
     std::copy(common_flags.begin(), common_flags.end(),
+        std::back_inserter(cluster_opts_.extra_tserver_flags));
+
+    const vector<string> tserver_flags = {
+      // Decreasing TS->master heartbeat interval speeds up the test.
+      "--heartbeat_interval_ms=25",
+    };
+    std::copy(tserver_flags.begin(), tserver_flags.end(),
         std::back_inserter(cluster_opts_.extra_tserver_flags));
   }
 
@@ -202,27 +229,16 @@ TEST_F(SecurityComponentsFaultsITest, KdcRestartsInTheMiddle) {
   // Wait for Kerberos tickets to expire.
   SleepFor(MonoDelta::FromSeconds(krb_lifetime_seconds_));
 
-#ifndef __APPLE__
-  // For some reason (may be caching negative responses?), calling this on OS X
-  // causes the next call to SmokeTestCluster() fail. Not sure that's expected
-  // or correct, so disabling this for OS X until it's clarified.
-
-  // It seems different version of krb5 library handles the error differently:
-  // in some cases, the error is about ticket expiration, in other -- failure
-  // to contact KDC.
   const Status s = SmokeTestCluster();
   ASSERT_TRUE(s.IsNotAuthorized()) << s.ToString();
   ASSERT_STR_MATCHES(s.ToString(),
       "Not authorized: Could not connect to the cluster: "
-      "Client connection negotiation failed: client connection to .* ("
-      "Cannot contact any KDC for realm .*|"
-      "Ticket expired.*|"
-      "GSSAPI Error:  The context has expire.*)");
-#endif
+      "Client connection negotiation failed: client connection to .*: "
+      "server requires authentication, but client does not have Kerberos credentials available");
 
   ASSERT_OK(cluster_->kdc()->Start());
 
-  // No renewal/re-acquire thread is run on the test client, so need to
+  // No re-acquire thread is run on the test client, so need to
   // re-acquire tickets explicitly.
   // TODO(aserbin): use constant instead of 'test-admin' string literal here
   ASSERT_OK(cluster_->kdc()->Kinit("test-admin"));

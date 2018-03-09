@@ -17,13 +17,17 @@
 #ifndef KUDU_UTIL_SUBPROCESS_H
 #define KUDU_UTIL_SUBPROCESS_H
 
+#include <signal.h>
+#include <unistd.h>
+
 #include <map>
 #include <string>
 #include <vector>
 
-#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
 
 #include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
@@ -47,15 +51,23 @@ namespace kudu {
 // will be forcibly SIGKILLed to avoid orphaning processes.
 class Subprocess {
  public:
-  Subprocess(std::string program, std::vector<std::string> argv);
+  // Constructs a new Subprocess that will execute 'argv' on Start().
+  //
+  // If the process isn't explicitly killed, 'sig_on_destroy' will be delivered
+  // to it when the Subprocess goes out of scope.
+  explicit Subprocess(std::vector<std::string> argv, int sig_on_destruct = SIGKILL);
   ~Subprocess();
 
-  // Disable subprocess stream output.  Must be called before subprocess starts.
+  // Disables subprocess stream output. Is mutually exclusive with stream sharing.
+  //
+  // Must be called before subprocess starts.
   void DisableStderr();
   void DisableStdout();
 
-  // Share a stream with parent. Must be called before subprocess starts.
-  // Cannot set sharing at all if stream is disabled
+  // Configures the subprocess to share the parent's stream. Is mutually
+  // exclusive with stream disabling.
+  //
+  // Must be called before subprocess starts.
   void ShareParentStdin(bool  share = true) { SetFdShared(STDIN_FILENO,  share); }
   void ShareParentStdout(bool share = true) { SetFdShared(STDOUT_FILENO, share); }
   void ShareParentStderr(bool share = true) { SetFdShared(STDERR_FILENO, share); }
@@ -69,6 +81,11 @@ class Subprocess {
   //
   // Repeated calls to this function replace earlier calls.
   void SetEnvVars(std::map<std::string, std::string> env);
+
+  // Set the initial current working directory of the subprocess.
+  //
+  // Must be set before starting the subprocess.
+  void SetCurrentDir(std::string cwd);
 
   // Start the subprocess. Can only be called once.
   //
@@ -99,6 +116,12 @@ class Subprocess {
   // Note that this does not reap the process -- you must still Wait()
   // in order to reap it. Only call after starting.
   Status Kill(int signal) WARN_UNUSED_RESULT;
+
+  // Sends a signal to the subprocess and waits for it to exit.
+  //
+  // If the signal is not SIGKILL and the process doesn't appear to be exiting,
+  // retries with SIGKILL.
+  Status KillAndWait(int signal);
 
   // Retrieve exit status of the process awaited by Wait() and/or WaitNoBlock()
   // methods. Must be called only after calling Wait()/WaitNoBlock().
@@ -140,8 +163,11 @@ class Subprocess {
   int ReleaseChildStderrFd() { return ReleaseChildFd(STDERR_FILENO); }
 
   pid_t pid() const;
+  const std::string& argv0() const { return argv_[0]; }
 
  private:
+  FRIEND_TEST(SubprocessTest, TestGetProcfsState);
+
   enum State {
     kNotStarted,
     kRunning,
@@ -149,6 +175,20 @@ class Subprocess {
   };
   enum StreamMode {SHARED, DISABLED, PIPED};
   enum WaitMode {BLOCKING, NON_BLOCKING};
+
+  // Process state according to /proc/<pid>/stat.
+  enum class ProcfsState {
+    // "T  Stopped (on a signal) or (before Linux 2.6.33) trace stopped"
+    PAUSED,
+
+    // Every other process state.
+    RUNNING,
+  };
+
+  // Extracts the process state for /proc/<pid>/stat.
+  //
+  // Returns an error if /proc/</pid>/stat doesn't exist or if parsing failed.
+  static Status GetProcfsState(int pid, ProcfsState* state);
 
   Status DoWait(int* wait_status, WaitMode mode) WARN_UNUSED_RESULT;
   void SetFdShared(int stdfd, bool share);
@@ -162,10 +202,15 @@ class Subprocess {
   int child_pid_;
   enum StreamMode fd_state_[3];
   int child_fds_[3];
+  std::string cwd_;
 
   // The cached wait status if Wait()/WaitNoBlock() has been called.
   // Only valid if state_ == kExited.
   int wait_status_;
+
+  // Custom signal to deliver when the subprocess goes out of scope, provided
+  // the process hasn't already been killed.
+  int sig_on_destruct_;
 
   DISALLOW_COPY_AND_ASSIGN(Subprocess);
 };

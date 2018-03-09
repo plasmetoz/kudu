@@ -20,35 +20,44 @@
 #include <dirent.h>
 #include <fcntl.h>
 #include <signal.h>
-#include <stdio.h>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif
-#include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <cerrno>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <memory>
-#include <sstream>
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include <ev++.h>
 #include <glog/logging.h>
 #include <glog/stl_logging.h>
 
-#include "kudu/gutil/once.h"
+#include "kudu/gutil/basictypes.h"
 #include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/split.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/debug-util.h"
+#include "kudu/util/env.h"
 #include "kudu/util/errno.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/os-util.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/signal.h"
 #include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
 
+using std::map;
 using std::string;
 using std::unique_ptr;
 using std::vector;
@@ -62,6 +71,8 @@ namespace kudu {
 using ::operator<<;
 
 namespace {
+
+static double kProcessWaitTimeoutSeconds = 5.0;
 
 static const char* kProcSelfFd =
 #if defined(__APPLE__)
@@ -141,10 +152,17 @@ void CloseNonStandardFDs(DIR* fd_dir) {
 }
 
 void RedirectToDevNull(int fd) {
-  // We must not close stderr or stdout, because then when a new file descriptor
-  // gets opened, it might get that fd number.  (We always allocate the lowest
-  // available file descriptor number.)  Instead, we reopen that fd as
-  // /dev/null.
+  // We must not close stderr or stdout, because then when a new file
+  // descriptor is opened, it might reuse the closed file descriptor's number
+  // (we always allocate the lowest available file descriptor number).
+  //
+  // Instead, we open /dev/null as a new file descriptor, then use dup2() to
+  // atomically close 'fd' and reuse its file descriptor number as an open file
+  // handle to /dev/null.
+  //
+  // It is expected that the file descriptor allocated when opening /dev/null
+  // will be closed when the child process closes all of its "non-standard"
+  // file descriptors later on.
   int dev_null = open("/dev/null", O_WRONLY);
   if (dev_null < 0) {
     PLOG(WARNING) << "failed to open /dev/null";
@@ -156,8 +174,8 @@ void RedirectToDevNull(int fd) {
 // Stateful libev watcher to help ReadFdsFully().
 class ReadFdsFullyHelper {
  public:
-  ReadFdsFullyHelper(const string& progname, ev::dynamic_loop* loop, int fd)
-      : progname_(progname) {
+  ReadFdsFullyHelper(string progname, ev::dynamic_loop* loop, int fd)
+      : progname_(std::move(progname)) {
     // Bind the watcher to the provided loop, to this functor, and to the
     // readable fd.
     watcher_.set(*loop);
@@ -234,13 +252,17 @@ Status ReadFdsFully(const string& progname,
 
 } // anonymous namespace
 
-Subprocess::Subprocess(string program, vector<string> argv)
-    : program_(std::move(program)),
+Subprocess::Subprocess(vector<string> argv, int sig_on_destruct)
+    : program_(argv[0]),
       argv_(std::move(argv)),
       state_(kNotStarted),
       child_pid_(-1),
       fd_state_(),
-      child_fds_() {
+      child_fds_(),
+      sig_on_destruct_(sig_on_destruct) {
+  // By convention, the first argument in argv is the base name of the program.
+  argv_[0] = BaseName(argv_[0]);
+
   fd_state_[STDIN_FILENO]   = PIPED;
   fd_state_[STDOUT_FILENO]  = SHARED;
   fd_state_[STDERR_FILENO]  = SHARED;
@@ -251,11 +273,12 @@ Subprocess::Subprocess(string program, vector<string> argv)
 
 Subprocess::~Subprocess() {
   if (state_ == kRunning) {
-    LOG(WARNING) << "Child process " << child_pid_
-                 << "(" << JoinStrings(argv_, " ") << ") "
-                 << " was orphaned. Sending SIGKILL...";
-    WARN_NOT_OK(Kill(SIGKILL), "Failed to send SIGKILL");
-    WARN_NOT_OK(Wait(), "Failed to Wait()");
+    LOG(WARNING) << Substitute(
+        "Child process $0 ($1) was orphaned. Sending signal $2...",
+        child_pid_, JoinStrings(argv_, " "), sig_on_destruct_);
+    WARN_NOT_OK(KillAndWait(sig_on_destruct_),
+                Substitute("Failed to KillAndWait() with signal $0",
+                           sig_on_destruct_));
   }
 
   for (int i = 0; i < 3; ++i) {
@@ -263,16 +286,6 @@ Subprocess::~Subprocess() {
       close(child_fds_[i]);
     }
   }
-}
-
-void Subprocess::DisableStderr() {
-  CHECK_EQ(state_, kNotStarted);
-  fd_state_[STDERR_FILENO] = DISABLED;
-}
-
-void Subprocess::DisableStdout() {
-  CHECK_EQ(state_, kNotStarted);
-  fd_state_[STDOUT_FILENO] = DISABLED;
 }
 
 #if defined(__APPLE__)
@@ -346,7 +359,8 @@ Status Subprocess::Start() {
   RETURN_NOT_OK_PREPEND(OpenProcFdDir(&fd_dir), "Unable to open fd dir");
   unique_ptr<DIR, std::function<void(DIR*)>> fd_dir_closer(fd_dir,
                                                            CloseProcFdDir);
-  int ret = fork();
+  int ret;
+  RETRY_ON_EINTR(ret, fork());
   if (ret == -1) {
     return Status::RuntimeError("Unable to fork", ErrnoToString(errno), errno);
   }
@@ -363,6 +377,8 @@ Status Subprocess::Start() {
     // stdin
     if (fd_state_[STDIN_FILENO] == PIPED) {
       PCHECK(dup2(child_stdin[0], STDIN_FILENO) == STDIN_FILENO);
+    } else {
+      DCHECK_EQ(SHARED, fd_state_[STDIN_FILENO]);
     }
 
     // stdout
@@ -376,6 +392,7 @@ Status Subprocess::Start() {
         break;
       }
       default:
+        DCHECK_EQ(SHARED, fd_state_[STDOUT_FILENO]);
         break;
     }
 
@@ -390,6 +407,7 @@ Status Subprocess::Start() {
         break;
       }
       default:
+        DCHECK_EQ(SHARED, fd_state_[STDERR_FILENO]);
         break;
     }
 
@@ -406,6 +424,11 @@ Status Subprocess::Start() {
     // disposition to SIG_IGN via IgnoreSigPipe(). At the time of writing, we
     // don't explicitly ignore any other signals in Kudu.
     ResetSigPipeHandlerToDefault();
+
+    // Set the current working directory of the subprocess.
+    if (!cwd_.empty()) {
+      PCHECK(chdir(cwd_.c_str()) == 0);
+    }
 
     // Set the environment for the subprocess. This is more portable than
     // using execvpe(), which doesn't exist on OS X. We rely on the 'p'
@@ -480,6 +503,39 @@ Status Subprocess::WaitNoBlock(int* wait_status) {
   return DoWait(wait_status, NON_BLOCKING);
 }
 
+Status Subprocess::GetProcfsState(int pid, ProcfsState* state) {
+  faststring data;
+  string filename = Substitute("/proc/$0/stat", pid);
+  RETURN_NOT_OK(ReadFileToString(Env::Default(), filename, &data));
+
+  // The part of /proc/<pid>/stat that's relevant for us looks like this:
+  //
+  //   "16009 (subprocess-test) R ..."
+  //
+  // The first number is the PID, the string in the parens in the command, and
+  // the single letter afterwards is the process' state.
+  //
+  // To extract the state, we scan backwards looking for the last ')', then
+  // increment past it and the separating space. This is safer than scanning
+  // forward as it properly handles commands containing parens.
+  string data_str = data.ToString();
+  const char* end_parens = strrchr(data_str.c_str(), ')');
+  if (end_parens == nullptr) {
+    return Status::RuntimeError(Substitute("unexpected layout in $0", filename));
+  }
+  char proc_state = end_parens[2];
+
+  switch (proc_state) {
+    case 'T':
+      *state = ProcfsState::PAUSED;
+      break;
+    default:
+      *state = ProcfsState::RUNNING;
+      break;
+  }
+  return Status::OK();
+}
+
 Status Subprocess::Kill(int signal) {
   if (state_ != kRunning) {
     const string err_str = "Sub-process is not running";
@@ -490,6 +546,69 @@ Status Subprocess::Kill(int signal) {
     return Status::RuntimeError("Unable to kill",
                                 ErrnoToString(errno),
                                 errno);
+  }
+
+  // Signal delivery is often asynchronous. For some signals, we try to wait
+  // for the process to actually change state, using /proc/<pid>/stat as a
+  // guide. This is best-effort.
+  ProcfsState desired_state;
+  switch (signal) {
+    case SIGSTOP:
+      desired_state = ProcfsState::PAUSED;
+      break;
+    case SIGCONT:
+      desired_state = ProcfsState::RUNNING;
+      break;
+    default:
+      return Status::OK();
+  }
+  Stopwatch sw;
+  sw.start();
+  do {
+    ProcfsState current_state;
+    if (!GetProcfsState(child_pid_, &current_state).ok()) {
+      // There was some error parsing /proc/<pid>/stat (or perhaps it doesn't
+      // exist on this platform).
+      return Status::OK();
+    }
+    if (current_state == desired_state) {
+      return Status::OK();
+    }
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  } while (sw.elapsed().wall_seconds() < kProcessWaitTimeoutSeconds);
+  return Status::OK();
+}
+
+Status Subprocess::KillAndWait(int signal) {
+  string procname = Substitute("$0 (pid $1)", argv0(), pid());
+
+  // This is a fatal error because all errors in Kill() are signal-independent,
+  // so Kill(SIGKILL) is just as likely to fail if this did.
+  RETURN_NOT_OK_PREPEND(
+      Kill(signal), Substitute("Failed to send signal $0 to $1",
+                               signal, procname));
+  if (signal == SIGKILL) {
+    RETURN_NOT_OK_PREPEND(
+        Wait(), Substitute("Failed to wait on $0", procname));
+  } else {
+    Status s;
+    Stopwatch sw;
+    sw.start();
+    do {
+      s = WaitNoBlock();
+      if (s.ok()) {
+        break;
+      } else if (!s.IsTimedOut()) {
+        // An unexpected error in WaitNoBlock() is likely to manifest repeatedly,
+        // so there's no point in retrying this.
+        RETURN_NOT_OK_PREPEND(
+            s, Substitute("Unexpected failure while waiting on $0", procname));
+      }
+      SleepFor(MonoDelta::FromMilliseconds(10));
+    } while (sw.elapsed().wall_seconds() < kProcessWaitTimeoutSeconds);
+    if (s.IsTimedOut()) {
+      return KillAndWait(SIGKILL);
+    }
   }
   return Status::OK();
 }
@@ -543,7 +662,7 @@ Status Subprocess::Call(const vector<string>& argv,
                         const string& stdin_in,
                         string* stdout_out,
                         string* stderr_out) {
-  Subprocess p(argv[0], argv);
+  Subprocess p(argv);
 
   if (stdout_out) {
     p.ShareParentStdout(false);
@@ -615,7 +734,8 @@ Status Subprocess::DoWait(int* wait_status, WaitMode mode) {
 
   const int options = (mode == NON_BLOCKING) ? WNOHANG : 0;
   int status;
-  const int rc = waitpid(child_pid_, &status, options);
+  int rc;
+  RETRY_ON_EINTR(rc, waitpid(child_pid_, &status, options));
   if (rc == -1) {
     return Status::RuntimeError("Unable to wait on child",
                                 ErrnoToString(errno), errno);
@@ -635,14 +755,29 @@ Status Subprocess::DoWait(int* wait_status, WaitMode mode) {
   return Status::OK();
 }
 
-void Subprocess::SetEnvVars(std::map<std::string, std::string> env) {
+void Subprocess::SetEnvVars(map<string, string> env) {
+  CHECK_EQ(state_, kNotStarted);
   env_ = std::move(env);
+}
+
+void Subprocess::SetCurrentDir(string cwd) {
+  CHECK_EQ(state_, kNotStarted);
+  cwd_ = std::move(cwd);
 }
 
 void Subprocess::SetFdShared(int stdfd, bool share) {
   CHECK_EQ(state_, kNotStarted);
-  CHECK_NE(fd_state_[stdfd], DISABLED);
-  fd_state_[stdfd] = share? SHARED : PIPED;
+  fd_state_[stdfd] = share ? SHARED : PIPED;
+}
+
+void Subprocess::DisableStderr() {
+  CHECK_EQ(state_, kNotStarted);
+  fd_state_[STDERR_FILENO] = DISABLED;
+}
+
+void Subprocess::DisableStdout() {
+  CHECK_EQ(state_, kNotStarted);
+  fd_state_[STDOUT_FILENO] = DISABLED;
 }
 
 int Subprocess::CheckAndOffer(int stdfd) const {

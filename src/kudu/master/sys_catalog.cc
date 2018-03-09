@@ -18,68 +18,108 @@
 #include "kudu/master/sys_catalog.h"
 
 #include <algorithm>
+#include <cstddef>
 #include <functional>
-#include <iomanip>
 #include <iterator>
 #include <memory>
+#include <ostream>
 #include <set>
+#include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
 #include <gflags/gflags.h>
 #include <glog/logging.h>
+#include <google/protobuf/util/message_differencer.h>
 
+#include "kudu/clock/clock.h"
+#include "kudu/common/column_predicate.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/iterator.h"
 #include "kudu/common/key_encoder.h"
 #include "kudu/common/partial_row.h"
 #include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/rowblock.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus_meta.h"
+#include "kudu/consensus/consensus_meta_manager.h"
 #include "kudu/consensus/consensus_peers.h"
+#include "kudu/consensus/log.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
 #include "kudu/consensus/quorum_util.h"
+#include "kudu/consensus/raft_consensus.h"
 #include "kudu/fs/fs_manager.h"
-#include "kudu/gutil/casts.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
 #include "kudu/master/master.pb.h"
-#include "kudu/rpc/rpc_context.h"
-#include "kudu/tablet/mvcc.h"
+#include "kudu/master/master_options.h"
+#include "kudu/rpc/result_tracker.h"
+#include "kudu/security/token.pb.h"
+#include "kudu/tablet/metadata.pb.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/tablet/tablet_bootstrap.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/transactions/transaction.h"
 #include "kudu/tablet/transactions/write_transaction.h"
 #include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/countdown_latch.h"
+#include "kudu/util/cow_object.h"
 #include "kudu/util/debug/trace_event.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/memory/arena.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/threadpool.h"
+#include "kudu/util/slice.h"
 
 DEFINE_double(sys_catalog_fail_during_write, 0.0,
               "Fraction of the time when system table writes will fail");
 TAG_FLAG(sys_catalog_fail_during_write, hidden);
 
-using kudu::consensus::CONSENSUS_CONFIG_COMMITTED;
 using kudu::consensus::ConsensusMetadata;
+using kudu::consensus::ConsensusMetadataManager;
 using kudu::consensus::ConsensusStatePB;
 using kudu::consensus::RaftConfigPB;
 using kudu::consensus::RaftPeerPB;
 using kudu::log::Log;
+using kudu::pb_util::SecureShortDebugString;
 using kudu::tablet::LatchTransactionCompletionCallback;
 using kudu::tablet::Tablet;
-using kudu::tablet::TabletPeer;
-using kudu::tablet::TabletStatusListener;
+using kudu::tablet::TabletReplica;
 using kudu::tserver::WriteRequestPB;
 using kudu::tserver::WriteResponsePB;
 using std::function;
+using std::set;
 using std::shared_ptr;
+using std::string;
 using std::unique_ptr;
 using std::vector;
 using strings::Substitute;
+
+
+namespace google {
+namespace protobuf {
+class Message;
+}
+}
 
 namespace kudu {
 namespace master {
@@ -95,22 +135,40 @@ const char* const SysCatalogTable::kSysCertAuthorityEntryId =
 const char* const SysCatalogTable::kInjectedFailureStatusMsg =
     "INJECTED FAILURE";
 
-SysCatalogTable::SysCatalogTable(Master* master, MetricRegistry* metrics,
+namespace {
+
+// Return true if the two PBs are equal.
+//
+// If 'diff_str' is not null, stores a textual description of the
+// difference.
+bool ArePBsEqual(const google::protobuf::Message& prev_pb,
+                 const google::protobuf::Message& new_pb,
+                 string* diff_str) {
+  google::protobuf::util::MessageDifferencer md;
+  if (diff_str) {
+    md.ReportDifferencesToString(diff_str);
+  }
+  return md.Compare(prev_pb, new_pb);
+}
+
+} // anonymous namespace
+
+
+SysCatalogTable::SysCatalogTable(Master* master,
                                  ElectedLeaderCallback leader_cb)
-    : metric_registry_(metrics),
+    : metric_registry_(master->metric_registry()),
       master_(master),
+      cmeta_manager_(new ConsensusMetadataManager(master_->fs_manager())),
       leader_cb_(std::move(leader_cb)) {
-  CHECK_OK(ThreadPoolBuilder("apply").Build(&apply_pool_));
 }
 
 SysCatalogTable::~SysCatalogTable() {
 }
 
 void SysCatalogTable::Shutdown() {
-  if (tablet_peer_) {
-    tablet_peer_->Shutdown();
+  if (tablet_replica_) {
+    tablet_replica_->Shutdown();
   }
-  apply_pool_->Shutdown();
 }
 
 Status SysCatalogTable::Load(FsManager *fs_manager) {
@@ -127,13 +185,12 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
   if (master_->opts().IsDistributed()) {
     LOG(INFO) << "Verifying existing consensus state";
     string tablet_id = metadata->tablet_id();
-    unique_ptr<ConsensusMetadata> cmeta;
-    RETURN_NOT_OK_PREPEND(ConsensusMetadata::Load(fs_manager, tablet_id,
-                                                  fs_manager->uuid(), &cmeta),
+    scoped_refptr<ConsensusMetadata> cmeta;
+    RETURN_NOT_OK_PREPEND(cmeta_manager_->Load(tablet_id, &cmeta),
                           "Unable to load consensus metadata for tablet " + tablet_id);
-    ConsensusStatePB cstate = cmeta->ToConsensusStatePB(CONSENSUS_CONFIG_COMMITTED);
-    RETURN_NOT_OK(consensus::VerifyConsensusState(
-        cstate, consensus::COMMITTED_QUORUM));
+    ConsensusStatePB cstate = cmeta->ToConsensusStatePB();
+    RETURN_NOT_OK(consensus::VerifyRaftConfig(cstate.committed_config()));
+    CHECK(!cstate.has_pending_config());
 
     // Make sure the set of masters passed in at start time matches the set in
     // the on-disk cmeta.
@@ -141,8 +198,13 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
     for (const auto& hp : master_->opts().master_addresses) {
       peer_addrs_from_opts.insert(hp.ToString());
     }
+    if (peer_addrs_from_opts.size() < master_->opts().master_addresses.size()) {
+      LOG(WARNING) << Substitute("Found duplicates in --master_addresses: "
+                                 "the unique set of addresses is $0",
+                                 JoinStrings(peer_addrs_from_opts, ", "));
+    }
     set<string> peer_addrs_from_disk;
-    for (const auto& p : cstate.config().peers()) {
+    for (const auto& p : cstate.committed_config().peers()) {
       HostPort hp;
       RETURN_NOT_OK(HostPortFromPB(p.last_known_addr(), &hp));
       peer_addrs_from_disk.insert(hp.ToString());
@@ -155,8 +217,11 @@ Status SysCatalogTable::Load(FsManager *fs_manager) {
                                   std::back_inserter(symm_diff));
     if (!symm_diff.empty()) {
       string msg = Substitute(
-          "on-disk and provided master lists are different: $0",
-          JoinStrings(symm_diff, " "));
+          "on-disk master list ($0) and provided master list ($1) differ. "
+          "Their symmetric difference is: $2",
+          JoinStrings(peer_addrs_from_opts, ", "),
+          JoinStrings(peer_addrs_from_disk, ", "),
+          JoinStrings(symm_diff, ", "));
       return Status::InvalidArgument(msg);
     }
   }
@@ -184,6 +249,7 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
                                                   schema, partition_schema,
                                                   partitions[0],
                                                   tablet::TABLET_DATA_READY,
+                                                  /*tombstone_last_logged_opid=*/ boost::none,
                                                   &metadata));
 
   RaftConfigPB config;
@@ -199,9 +265,7 @@ Status SysCatalogTable::CreateNew(FsManager *fs_manager) {
   }
 
   string tablet_id = metadata->tablet_id();
-  unique_ptr<ConsensusMetadata> cmeta;
-  RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(fs_manager, tablet_id, fs_manager->uuid(),
-                                                  config, consensus::kMinimumTerm, &cmeta),
+  RETURN_NOT_OK_PREPEND(cmeta_manager_->Create(tablet_id, config, consensus::kMinimumTerm),
                         "Unable to persist consensus metadata for tablet " + tablet_id);
 
   return SetupTablet(metadata);
@@ -246,7 +310,7 @@ Status SysCatalogTable::CreateDistributedConfig(const MasterOptions& options,
     }
   }
 
-  RETURN_NOT_OK(consensus::VerifyRaftConfig(resolved_config, consensus::COMMITTED_QUORUM));
+  RETURN_NOT_OK(consensus::VerifyRaftConfig(resolved_config));
   VLOG(1) << "Distributed Raft configuration: " << SecureShortDebugString(resolved_config);
 
   *committed_config = resolved_config;
@@ -254,18 +318,23 @@ Status SysCatalogTable::CreateDistributedConfig(const MasterOptions& options,
 }
 
 void SysCatalogTable::SysCatalogStateChanged(const string& tablet_id, const string& reason) {
-  CHECK_EQ(tablet_id, tablet_peer_->tablet_id());
-  scoped_refptr<consensus::Consensus> consensus  = tablet_peer_->shared_consensus();
+  CHECK_EQ(tablet_id, tablet_replica_->tablet_id());
+  shared_ptr<consensus::RaftConsensus> consensus = tablet_replica_->shared_consensus();
   if (!consensus) {
     LOG_WITH_PREFIX(WARNING) << "Received notification of tablet state change "
                              << "but tablet no longer running. Tablet ID: "
                              << tablet_id << ". Reason: " << reason;
     return;
   }
-  consensus::ConsensusStatePB cstate = consensus->ConsensusState(CONSENSUS_CONFIG_COMMITTED);
+  consensus::ConsensusStatePB cstate;
+  Status s = consensus->ConsensusState(&cstate);
+  if (PREDICT_FALSE(!s.ok())) {
+    LOG_WITH_PREFIX(WARNING) << s.ToString();
+    return;
+  }
   LOG_WITH_PREFIX(INFO) << "SysCatalogTable state changed. Reason: " << reason << ". "
                         << "Latest consensus state: " << SecureShortDebugString(cstate);
-  RaftPeerPB::Role new_role = GetConsensusRole(tablet_peer_->permanent_uuid(), cstate);
+  RaftPeerPB::Role new_role = GetConsensusRole(tablet_replica_->permanent_uuid(), cstate);
   LOG_WITH_PREFIX(INFO) << "This master's current role is: "
                         << RaftPeerPB::Role_Name(new_role);
   if (new_role == RaftPeerPB::LEADER) {
@@ -284,42 +353,51 @@ Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>&
 
   InitLocalRaftPeerPB();
 
-  // TODO: handle crash mid-creation of tablet? do we ever end up with a
-  // partially created tablet here?
-  tablet_peer_.reset(new TabletPeer(
+  // TODO(matteo): handle crash mid-creation of tablet? do we ever end up with
+  // a partially created tablet here?
+  tablet_replica_.reset(new TabletReplica(
       metadata,
+      cmeta_manager_,
       local_peer_pb_,
-      apply_pool_.get(),
+      master_->tablet_apply_pool(),
       Bind(&SysCatalogTable::SysCatalogStateChanged, Unretained(this), metadata->tablet_id())));
+  Status s = tablet_replica_->Init(master_->raft_pool());
+  if (!s.ok()) {
+    tablet_replica_->SetError(s);
+    tablet_replica_->Shutdown();
+    return s;
+  }
+
+  scoped_refptr<ConsensusMetadata> cmeta;
+  RETURN_NOT_OK(cmeta_manager_->Load(metadata->tablet_id(), &cmeta));
 
   consensus::ConsensusBootstrapInfo consensus_info;
-  tablet_peer_->SetBootstrapping();
+  tablet_replica_->SetBootstrapping();
   RETURN_NOT_OK(BootstrapTablet(metadata,
-                                scoped_refptr<server::Clock>(master_->clock()),
+                                cmeta->CommittedConfig(),
+                                scoped_refptr<clock::Clock>(master_->clock()),
                                 master_->mem_tracker(),
                                 scoped_refptr<rpc::ResultTracker>(),
                                 metric_registry_,
-                                implicit_cast<TabletStatusListener*>(tablet_peer_.get()),
+                                tablet_replica_,
                                 &tablet,
                                 &log,
-                                tablet_peer_->log_anchor_registry(),
+                                tablet_replica_->log_anchor_registry(),
                                 &consensus_info));
 
-  // TODO: Do we have a setSplittable(false) or something from the outside is
-  // handling split in the TS?
+  // TODO(matteo): Do we have a setSplittable(false) or something from the
+  // outside is handling split in the TS?
 
-  RETURN_NOT_OK_PREPEND(tablet_peer_->Init(tablet,
-                                           scoped_refptr<server::Clock>(master_->clock()),
-                                           master_->messenger(),
-                                           scoped_refptr<rpc::ResultTracker>(),
-                                           log,
-                                           tablet->GetMetricEntity()),
-                        "Failed to Init() TabletPeer");
+  RETURN_NOT_OK_PREPEND(tablet_replica_->Start(consensus_info,
+                                               tablet,
+                                               scoped_refptr<clock::Clock>(master_->clock()),
+                                               master_->messenger(),
+                                               scoped_refptr<rpc::ResultTracker>(),
+                                               log,
+                                               master_->tablet_prepare_pool()),
+                        "Failed to Start() TabletReplica");
 
-  RETURN_NOT_OK_PREPEND(tablet_peer_->Start(consensus_info),
-                        "Failed to Start() TabletPeer");
-
-  tablet_peer_->RegisterMaintenanceOps(master_->maintenance_manager());
+  tablet_replica_->RegisterMaintenanceOps(master_->maintenance_manager());
 
   const Schema* schema = tablet->schema();
   schema_ = SchemaBuilder(*schema).BuildWithoutIds();
@@ -329,8 +407,8 @@ Status SysCatalogTable::SetupTablet(const scoped_refptr<tablet::TabletMetadata>&
 
 std::string SysCatalogTable::LogPrefix() const {
   return Substitute("T $0 P $1 [$2]: ",
-                    tablet_peer_->tablet_id(),
-                    tablet_peer_->permanent_uuid(),
+                    tablet_replica_->tablet_id(),
+                    tablet_replica_->permanent_uuid(),
                     table_name());
 }
 
@@ -338,7 +416,7 @@ Status SysCatalogTable::WaitUntilRunning() {
   TRACE_EVENT0("master", "SysCatalogTable::WaitUntilRunning");
   int seconds_waited = 0;
   while (true) {
-    Status status = tablet_peer_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(1));
+    Status status = tablet_replica_->WaitUntilConsensusRunning(MonoDelta::FromSeconds(1));
     seconds_waited++;
     if (status.ok()) {
       LOG_WITH_PREFIX(INFO) << "configured and running, proceeding with master startup.";
@@ -363,13 +441,13 @@ Status SysCatalogTable::SyncWrite(const WriteRequestPB *req, WriteResponsePB *re
   gscoped_ptr<tablet::TransactionCompletionCallback> txn_callback(
       new LatchTransactionCompletionCallback<WriteResponsePB>(&latch, resp));
   unique_ptr<tablet::WriteTransactionState> tx_state(
-      new tablet::WriteTransactionState(tablet_peer_.get(),
+      new tablet::WriteTransactionState(tablet_replica_.get(),
                                         req,
                                         nullptr, // No RequestIdPB
                                         resp));
   tx_state->set_completion_callback(std::move(txn_callback));
 
-  RETURN_NOT_OK(tablet_peer_->SubmitWrite(std::move(tx_state)));
+  RETURN_NOT_OK(tablet_replica_->SubmitWrite(std::move(tx_state)));
   latch.Wait();
 
   if (resp->has_error()) {
@@ -406,12 +484,6 @@ Schema SysCatalogTable::BuildTableSchema() {
   return builder.Build();
 }
 
-SysCatalogTable::Actions::Actions()
-    : table_to_add(nullptr),
-      table_to_update(nullptr),
-      table_to_delete(nullptr) {
-}
-
 Status SysCatalogTable::Write(const Actions& actions) {
   TRACE_EVENT0("master", "SysCatalogTable::Write");
 
@@ -434,6 +506,11 @@ Status SysCatalogTable::Write(const Actions& actions) {
   ReqUpdateTablets(&req, actions.tablets_to_update);
   ReqDeleteTablets(&req, actions.tablets_to_delete);
 
+  if (req.row_operations().rows().empty()) {
+    // No actual changes were written (i.e the data to be updated matched the
+    // previous version of the data).
+    return Status::OK();
+  }
   RETURN_NOT_OK(SyncWrite(&req, &resp));
   return Status::OK();
 }
@@ -442,7 +519,11 @@ Status SysCatalogTable::Write(const Actions& actions) {
 // Table related methods
 // ==================================================================
 
-void SysCatalogTable::ReqAddTable(WriteRequestPB* req, const TableInfo* table) {
+void SysCatalogTable::ReqAddTable(WriteRequestPB* req,
+                                  const scoped_refptr<TableInfo>& table) {
+  VLOG(2) << "Adding table " << table->id() << " in catalog: " <<
+      SecureShortDebugString(table->metadata().dirty().pb);
+
   faststring metadata_buf;
   pb_util::SerializeToString(table->metadata().dirty().pb, &metadata_buf);
 
@@ -454,7 +535,17 @@ void SysCatalogTable::ReqAddTable(WriteRequestPB* req, const TableInfo* table) {
   enc.Add(RowOperationsPB::INSERT, row);
 }
 
-void SysCatalogTable::ReqUpdateTable(WriteRequestPB* req, const TableInfo* table) {
+void SysCatalogTable::ReqUpdateTable(WriteRequestPB* req,
+                                     const scoped_refptr<TableInfo>& table) {
+  string diff;
+  if (ArePBsEqual(table->metadata().state().pb,
+                  table->metadata().dirty().pb,
+                  VLOG_IS_ON(2) ? &diff : nullptr)) {
+    // Short-circuit empty updates.
+    return;
+  }
+  VLOG(2) << "Updating table " << table->id() << " in catalog: " << diff;
+
   faststring metadata_buf;
   pb_util::SerializeToString(table->metadata().dirty().pb, &metadata_buf);
 
@@ -466,7 +557,8 @@ void SysCatalogTable::ReqUpdateTable(WriteRequestPB* req, const TableInfo* table
   enc.Add(RowOperationsPB::UPDATE, row);
 }
 
-void SysCatalogTable::ReqDeleteTable(WriteRequestPB* req, const TableInfo* table) {
+void SysCatalogTable::ReqDeleteTable(WriteRequestPB* req,
+                                     const scoped_refptr<TableInfo>& table) {
   KuduPartialRow row(&schema_);
   CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLES_ENTRY));
   CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, table->id()));
@@ -525,10 +617,10 @@ Status SysCatalogTable::ProcessRows(
   spec.AddPredicate(pred);
 
   gscoped_ptr<RowwiseIterator> iter;
-  RETURN_NOT_OK(tablet_peer_->tablet()->NewRowIterator(schema_, &iter));
+  RETURN_NOT_OK(tablet_replica_->tablet()->NewRowIterator(schema_, &iter));
   RETURN_NOT_OK(iter->Init(&spec));
 
-  Arena arena(32 * 1024, 256 * 1024);
+  Arena arena(32 * 1024);
   RowBlock block(iter->schema(), 512, &arena);
   while (iter->HasNext()) {
     RETURN_NOT_OK(iter->NextBlock(&block));
@@ -648,40 +740,51 @@ Status SysCatalogTable::RemoveTskEntries(const set<string>& entry_ids) {
 // ==================================================================
 
 void SysCatalogTable::ReqAddTablets(WriteRequestPB* req,
-                                    const vector<TabletInfo*>& tablets) {
+                                    const vector<scoped_refptr<TabletInfo>>& tablets) {
   faststring metadata_buf;
   KuduPartialRow row(&schema_);
   RowOperationsPBEncoder enc(req->mutable_row_operations());
-  for (auto tablet : tablets) {
+  for (const auto& tablet : tablets) {
+    VLOG(2) << "Adding tablet " << tablet->id() << " in catalog: "
+            << SecureShortDebugString(tablet->metadata().dirty().pb);
     pb_util::SerializeToString(tablet->metadata().dirty().pb, &metadata_buf);
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
-    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->tablet_id()));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->id()));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
     enc.Add(RowOperationsPB::INSERT, row);
   }
 }
 
 void SysCatalogTable::ReqUpdateTablets(WriteRequestPB* req,
-                                       const vector<TabletInfo*>& tablets) {
+                                       const vector<scoped_refptr<TabletInfo>>& tablets) {
   faststring metadata_buf;
   KuduPartialRow row(&schema_);
   RowOperationsPBEncoder enc(req->mutable_row_operations());
-  for (auto tablet : tablets) {
+  for (const auto& tablet : tablets) {
+    string diff;
+    if (ArePBsEqual(tablet->metadata().state().pb,
+                    tablet->metadata().dirty().pb,
+                    VLOG_IS_ON(2) ? &diff : nullptr)) {
+      // Short-circuit empty updates.
+      continue;
+    }
+    VLOG(2) << "Updating tablet " << tablet->id() << " in catalog: "
+            << diff;
     pb_util::SerializeToString(tablet->metadata().dirty().pb, &metadata_buf);
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
-    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->tablet_id()));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->id()));
     CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColMetadata, metadata_buf));
     enc.Add(RowOperationsPB::UPDATE, row);
   }
 }
 
 void SysCatalogTable::ReqDeleteTablets(WriteRequestPB* req,
-                                       const vector<TabletInfo*>& tablets) {
+                                       const vector<scoped_refptr<TabletInfo>>& tablets) {
   KuduPartialRow row(&schema_);
   RowOperationsPBEncoder enc(req->mutable_row_operations());
-  for (auto tablet : tablets) {
+  for (const auto& tablet : tablets) {
     CHECK_OK(row.SetInt8(kSysCatalogTableColType, TABLETS_ENTRY));
-    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->tablet_id()));
+    CHECK_OK(row.SetStringNoCopy(kSysCatalogTableColId, tablet->id()));
     enc.Add(RowOperationsPB::DELETE, row);
   }
 }

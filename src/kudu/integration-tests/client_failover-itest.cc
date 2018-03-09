@@ -15,17 +15,37 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <boost/optional.hpp>
 #include <memory>
+#include <ostream>
 #include <set>
+#include <string>
 #include <unordered_map>
+#include <vector>
+
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/client/client-test-util.h"
+#include "kudu/client/client.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/map-util.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 
 using kudu::client::CountTableRows;
 using kudu::client::KuduInsert;
@@ -33,12 +53,15 @@ using kudu::client::KuduSession;
 using kudu::client::KuduTable;
 using kudu::client::KuduUpdate;
 using kudu::client::sp::shared_ptr;
+using kudu::cluster::ExternalTabletServer;
+using kudu::cluster::ScopedResumeExternalDaemon;
 using kudu::itest::TServerDetails;
+using kudu::itest::DeleteTablet;
 using kudu::tablet::TABLET_DATA_TOMBSTONED;
 using std::set;
 using std::string;
-using std::vector;
 using std::unordered_map;
+using std::vector;
 
 namespace kudu {
 
@@ -143,8 +166,7 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
 
   // Delete the leader replica. This will cause the next scan to the same
   // leader to get a TABLET_NOT_FOUND error.
-  ASSERT_OK(itest::DeleteTablet(leader, tablet_id, TABLET_DATA_TOMBSTONED,
-                                boost::none, kTimeout));
+  ASSERT_OK(DeleteTablet(leader, tablet_id, TABLET_DATA_TOMBSTONED, kTimeout));
 
   int old_leader_index = leader_index;
   TServerDetails* old_leader = leader;
@@ -161,14 +183,13 @@ TEST_P(ClientFailoverParamITest, TestDeleteLeaderWhileScanning) {
 
   // Do a config change to remove the old replica and add a new one.
   // Cause the new replica to become leader, then do the scan again.
-  ASSERT_OK(RemoveServer(leader, tablet_id, old_leader, boost::none, kTimeout));
+  ASSERT_OK(RemoveServer(leader, tablet_id, old_leader, kTimeout));
   // Wait until the config is committed, otherwise AddServer() will fail.
   ASSERT_OK(WaitUntilCommittedConfigOpIdIndexIs(workload.batches_completed() + 4, leader, tablet_id,
                                                 kTimeout));
 
   TServerDetails* to_add = ts_map_[cluster_->tablet_server(missing_replica_index)->uuid()];
-  ASSERT_OK(AddServer(leader, tablet_id, to_add, consensus::RaftPeerPB::VOTER,
-                      boost::none, kTimeout));
+  ASSERT_OK(AddServer(leader, tablet_id, to_add, consensus::RaftPeerPB::VOTER, kTimeout));
   HostPort hp;
   ASSERT_OK(HostPortFromPB(leader->registration.rpc_addresses(0), &hp));
   ASSERT_OK(StartTabletCopy(to_add, tablet_id, leader->uuid(), hp, 1, kTimeout));
@@ -243,6 +264,97 @@ TEST_F(ClientFailoverITest, TestClusterCrashDuringWorkload) {
   cluster_->master()->Shutdown();
   cluster_->tablet_server(0)->Shutdown();
   workload.StopAndJoin();
+}
+
+class ClientFailoverTServerTimeoutITest : public ExternalMiniClusterITestBase {
+ public:
+  void SetUp() override {
+    ExternalMiniClusterITestBase::SetUp();
+
+    // Extra flags to speed up the test.
+    const vector<string> extra_flags_tserver = {
+      "--consensus_rpc_timeout_ms=250",
+      "--heartbeat_interval_ms=10",
+      "--raft_heartbeat_interval_ms=25",
+      "--leader_failure_exp_backoff_max_delta_ms=1000",
+    };
+    const vector<string> extra_flags_master = {
+      "--raft_heartbeat_interval_ms=25",
+      "--leader_failure_exp_backoff_max_delta_ms=1000",
+    };
+    NO_FATALS(StartCluster(extra_flags_tserver, extra_flags_master, kTSNum));
+  }
+
+ protected:
+  static const int kTSNum = 3;
+
+  Status GetLeaderReplica(TServerDetails** leader) {
+    string tablet_id;
+    RETURN_NOT_OK(GetTabletId(&tablet_id));
+    Status s;
+    for (int i = 0; i < 128; ++i) {
+      // FindTabletLeader tries to connect the the reported leader to verify
+      // that it thinks it's the leader.
+      s = itest::FindTabletLeader(
+          ts_map_, tablet_id, MonoDelta::FromMilliseconds(100), leader);
+      if (s.ok()) {
+        break;
+      }
+      SleepFor(MonoDelta::FromMilliseconds(10L * (i + 1)));
+    }
+    return s;
+  }
+
+ private:
+  // Get identifier of any tablet running on the tablet server with index 0.
+  Status GetTabletId(string* tablet_id) {
+    TServerDetails* ts = ts_map_[cluster_->tablet_server(0)->uuid()];
+    vector<tserver::ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+    RETURN_NOT_OK(itest::WaitForNumTabletsOnTS(
+        ts, 1, MonoDelta::FromSeconds(32), &tablets));
+    *tablet_id = tablets[0].tablet_status().tablet_id();
+
+    return Status::OK();
+  }
+};
+
+// Test that a client fails over to other available tablet replicas when a RPC
+// with the former leader times out. This is a regression test for KUDU-1034.
+TEST_F(ClientFailoverTServerTimeoutITest, FailoverOnLeaderTimeout) {
+  TestWorkload workload(cluster_.get());
+  workload.set_num_replicas(kTSNum);
+  workload.Setup();
+  workload.Start();
+  while (workload.rows_inserted() < 100) {
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  }
+  workload.StopAndJoin();
+
+  TServerDetails* leader;
+  ASSERT_OK(GetLeaderReplica(&leader));
+  ASSERT_NE(nullptr, leader);
+
+  // Pause the leader: this will cause the client to get timeout errors
+  // if trying to send RPCs to the corresponding tablet server.
+  ExternalTabletServer* ts(cluster_->tablet_server_by_uuid(leader->uuid()));
+  ASSERT_NE(nullptr, ts);
+  ScopedResumeExternalDaemon leader_resumer(ts);
+  ASSERT_OK(ts->Pause());
+
+  // Write 100 more rows.
+  int rows_target = workload.rows_inserted() + 100;
+  workload.set_timeout_allowed(true);
+  workload.set_write_timeout_millis(500);
+  workload.Start();
+  for (int i = 0; i < 1000; ++i) {
+    if (workload.rows_inserted() >= rows_target) {
+      break;
+    }
+    SleepFor(MonoDelta::FromMilliseconds(10));
+  }
+
+  // Verify all rows have reached the destiation.
+  EXPECT_GE(workload.rows_inserted(), rows_target);
 }
 
 } // namespace kudu

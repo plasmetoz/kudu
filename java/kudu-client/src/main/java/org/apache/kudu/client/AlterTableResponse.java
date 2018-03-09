@@ -17,8 +17,8 @@
 
 package org.apache.kudu.client;
 
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 
 @InterfaceAudience.Public
 @InterfaceStability.Evolving
@@ -35,7 +35,7 @@ public class AlterTableResponse extends KuduRpcResponse {
   }
 
   /**
-   * @return the ID of the altered table, or null if the master version is too old
+   * @return the ID of the altered table
    */
   public String getTableId() {
     return tableId;

@@ -15,12 +15,16 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <cstring>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+
 #include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <memory>
-#include <thread>
-#include <vector>
 
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/util/memory/arena.h"
@@ -34,6 +38,7 @@ DEFINE_int32(alloc_size, 4, "number of bytes in each allocation");
 namespace kudu {
 
 using std::shared_ptr;
+using std::string;
 using std::thread;
 using std::vector;
 
@@ -66,8 +71,7 @@ static void AllocateThreadTSArena(ThreadSafeArena *arena, uint8_t thread_index) 
 
 
 TEST(TestArena, TestSingleThreaded) {
-  Arena arena(128, 128);
-
+  Arena arena(128);
   AllocateThread(&arena, 0);
 }
 
@@ -76,7 +80,7 @@ TEST(TestArena, TestSingleThreaded) {
 TEST(TestArena, TestMultiThreaded) {
   CHECK(FLAGS_num_threads < 256);
 
-  ThreadSafeArena arena(1024, 1024);
+  ThreadSafeArena arena(1024);
 
   vector<thread> threads;
   for (uint8_t i = 0; i < FLAGS_num_threads; i++) {
@@ -89,8 +93,7 @@ TEST(TestArena, TestMultiThreaded) {
 }
 
 TEST(TestArena, TestAlignment) {
-
-  ThreadSafeArena arena(1024, 1024);
+  ThreadSafeArena arena(1024);
   for (int i = 0; i < 1000; i++) {
     int alignment = 1 << (1 % 5);
 
@@ -100,6 +103,18 @@ TEST(TestArena, TestAlignment) {
       ret;
   }
 }
+
+TEST(TestArena, TestObjectAlignment) {
+  struct MyStruct {
+    int64_t v;
+  };
+  Arena a(256);
+  // Allocate a junk byte to ensure that the next allocation isn't "accidentally" aligned.
+  a.AllocateBytes(1);
+  void* v = a.NewObject<MyStruct>();
+  ASSERT_EQ(reinterpret_cast<uintptr_t>(v) % alignof(MyStruct), 0);
+}
+
 
 // MemTrackers update their ancestors when consuming and releasing memory to compute
 // usage totals. However, the lifetimes of parent and child trackers can be different.
@@ -117,7 +132,7 @@ TEST(TestArena, TestMemoryTrackerParentReferences) {
   }
   shared_ptr<MemoryTrackingBufferAllocator> allocator(
       new MemoryTrackingBufferAllocator(HeapBufferAllocator::Get(), child_tracker));
-  MemoryTrackingArena arena(256, 1024, allocator);
+  MemoryTrackingArena arena(256, allocator);
 
   // Try some child operations.
   ASSERT_EQ(256, child_tracker->consumption());
@@ -133,7 +148,7 @@ TEST(TestArena, TestMemoryTrackingDontEnforce) {
   shared_ptr<MemTracker> mem_tracker = MemTracker::CreateTracker(1024, "arena-test-tracker");
   shared_ptr<MemoryTrackingBufferAllocator> allocator(
       new MemoryTrackingBufferAllocator(HeapBufferAllocator::Get(), mem_tracker));
-  MemoryTrackingArena arena(256, 1024, allocator);
+  MemoryTrackingArena arena(256, allocator);
   ASSERT_EQ(256, mem_tracker->consumption());
   void *allocated = arena.AllocateBytes(256);
   ASSERT_TRUE(allocated);
@@ -164,7 +179,7 @@ TEST(TestArena, TestMemoryTrackingEnforced) {
       new MemoryTrackingBufferAllocator(HeapBufferAllocator::Get(), mem_tracker,
                                         // enforce limit
                                         true));
-  MemoryTrackingArena arena(256, 1024, allocator);
+  MemoryTrackingArena arena(256, allocator);
   ASSERT_EQ(256, mem_tracker->consumption());
   void *allocated = arena.AllocateBytes(256);
   ASSERT_TRUE(allocated);
@@ -175,7 +190,7 @@ TEST(TestArena, TestMemoryTrackingEnforced) {
 }
 
 TEST(TestArena, TestSTLAllocator) {
-  Arena a(256, 256 * 1024);
+  Arena a(256);
   typedef vector<int, ArenaAllocator<int, false> > ArenaVector;
   ArenaAllocator<int, false> alloc(&a);
   ArenaVector v(alloc);

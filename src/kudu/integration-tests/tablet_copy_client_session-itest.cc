@@ -15,23 +15,54 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include <stdlib.h>
+#include <cstdint>
+#include <cstdlib>
+#include <limits>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <thread>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 
-#include <boost/optional.hpp>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
 
 #include "kudu/common/wire_protocol.h"
-#include "kudu/gutil/macros.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
 #include "kudu/integration-tests/test_workload.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/net_util.h"
+#include "kudu/util/path_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 
+METRIC_DECLARE_gauge_uint64(tablets_num_failed);
+
+using kudu::cluster::ExternalMiniClusterOptions;
+using kudu::cluster::ExternalTabletServer;
 using kudu::itest::StartTabletCopy;
 using kudu::itest::TServerDetails;
 using kudu::itest::WaitUntilTabletRunning;
 using kudu::tablet::TabletDataState;
 using kudu::tserver::ListTabletsResponsePB;
 using std::string;
+using std::thread;
 using std::vector;
+using strings::Substitute;
 
 namespace kudu {
 
@@ -40,8 +71,7 @@ class TabletCopyClientSessionITest : public ExternalMiniClusterITestBase {
  protected:
   // Bring up two tablet servers. Load tablet(s) onto TS 0, while TS 1 is left
   // blank. Prevent the master from tombstoning evicted replicas.
-  void PrepareClusterForTabletCopy(const vector<string>& extra_tserver_flags = {},
-                                   vector<string> extra_master_flags = {},
+  void PrepareClusterForTabletCopy(ExternalMiniClusterOptions opts = ExternalMiniClusterOptions(),
                                    int num_tablets = kDefaultNumTablets);
 
   static const int kDefaultNumTablets;
@@ -51,14 +81,14 @@ class TabletCopyClientSessionITest : public ExternalMiniClusterITestBase {
 const int TabletCopyClientSessionITest::kDefaultNumTablets = 1;
 
 void TabletCopyClientSessionITest::PrepareClusterForTabletCopy(
-    const vector<string>& extra_tserver_flags,
-    vector<string> extra_master_flags,
+    ExternalMiniClusterOptions opts,
     int num_tablets) {
   const int kNumTabletServers = 2;
   // We don't want the master to interfere when we manually make copies of
   // tablets onto servers it doesn't know about.
-  extra_master_flags.push_back("--master_tombstone_evicted_tablet_replicas=false");
-  NO_FATALS(StartCluster(extra_tserver_flags, extra_master_flags, kNumTabletServers));
+  opts.extra_master_flags.emplace_back("--master_tombstone_evicted_tablet_replicas=false");
+  opts.num_tablet_servers = kNumTabletServers;
+  NO_FATALS(StartClusterWithOpts(std::move(opts)));
   // Shut down the 2nd tablet server; we'll create tablets on the first one.
   cluster_->tablet_server(1)->Shutdown();
 
@@ -163,9 +193,9 @@ TEST_F(TabletCopyClientSessionITest, TestStartTabletCopyWhileSourceBootstrapping
     // tablet copy operation completing, so we retry tablet deletion attempts.
     // We want a clean deletion so only one thread wins, then we have to
     // restart TS 1 to clear knowledge of the replica from memory.
-    NO_FATALS(DeleteTabletWithRetries(ts1, tablet_id,
+    ASSERT_OK(DeleteTabletWithRetries(ts1, tablet_id,
                                       TabletDataState::TABLET_DATA_DELETED,
-                                      boost::none, kTimeout));
+                                      kTimeout));
     cluster_->tablet_server(1)->Shutdown();
     ASSERT_OK(cluster_->tablet_server(1)->Restart());
   }
@@ -190,9 +220,9 @@ TEST_F(TabletCopyClientSessionITest, TestStartTabletCopy) {
   };
   for (int scenario = 0; scenario < kLast; scenario++) {
     if (scenario == kTombstoned) {
-      NO_FATALS(DeleteTabletWithRetries(ts1, tablet_id,
+      ASSERT_OK(DeleteTabletWithRetries(ts1, tablet_id,
                                         TabletDataState::TABLET_DATA_TOMBSTONED,
-                                        boost::none, kDefaultTimeout));
+                                        kDefaultTimeout));
     }
 
     // Run tablet copy.
@@ -242,6 +272,145 @@ TEST_F(TabletCopyClientSessionITest, TestCopyFromCrashedSource) {
   ASSERT_OK(StartTabletCopy(ts1, tablet_id, ts0->uuid(), src_addr,
                             std::numeric_limits<int64_t>::max(), kDefaultTimeout));
   ASSERT_OK(WaitUntilTabletRunning(ts1, tablet_id, kDefaultTimeout));
+}
+
+// Regression for KUDU-2125: ensure that a heavily loaded source cluster can
+// satisfy many concurrent tablet copies.
+TEST_F(TabletCopyClientSessionITest, TestTabletCopyWithBusySource) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+  const int kNumTablets = 20;
+
+  ExternalMiniClusterOptions opts;
+  opts.extra_tserver_flags.emplace_back(Substitute("--num_tablets_to_copy_simultaneously=$0",
+                                                      kNumTablets));
+  NO_FATALS(PrepareClusterForTabletCopy(opts, kNumTablets));
+
+  // Tune down the RPC capacity on the source server to ensure
+  // ERROR_SERVER_TOO_BUSY errors occur.
+  cluster_->tablet_server(0)->mutable_flags()->emplace_back("--rpc_service_queue_length=1");
+  cluster_->tablet_server(0)->mutable_flags()->emplace_back("--rpc_num_service_threads=1");
+
+  // Restart the TS for the new flags to take effect.
+  cluster_->tablet_server(0)->Shutdown();
+  ASSERT_OK(cluster_->tablet_server(0)->Restart());
+
+  TServerDetails* ts0 = ts_map_[cluster_->tablet_server(0)->uuid()];
+  TServerDetails* ts1 = ts_map_[cluster_->tablet_server(1)->uuid()];
+  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  ASSERT_OK(WaitForNumTabletsOnTS(ts0, kNumTablets, kDefaultTimeout,
+                                  &tablets, tablet::TabletStatePB::RUNNING));
+  ASSERT_EQ(kNumTablets, tablets.size());
+
+  HostPort src_addr;
+  ASSERT_OK(HostPortFromPB(ts0->registration.rpc_addresses(0), &src_addr));
+
+  vector<thread> threads;
+  for (const auto& tablet : tablets) {
+    threads.emplace_back(thread([&] {
+      const string& tablet_id = tablet.tablet_status().tablet_id();
+      // Run tablet copy.
+      CHECK_OK(StartTabletCopy(ts1, tablet_id, ts0->uuid(), src_addr,
+                               std::numeric_limits<int64_t>::max(), kDefaultTimeout));
+      CHECK_OK(WaitUntilTabletRunning(ts1, tablet_id, kDefaultTimeout));
+    }));
+  }
+
+  for (auto& thread : threads) {
+    thread.join();
+  }
+}
+
+// Test that fails a disk during copies/bootstraps and ensures the tablets are
+// appropriately failed.
+TEST_F(TabletCopyClientSessionITest, TestStopCopyOnClientDiskFailure) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+  const int kNumTablets = 10;
+  const MonoDelta kTimeout = MonoDelta::FromSeconds(90);
+  ExternalMiniClusterOptions opts;
+  opts.extra_tserver_flags = {
+    Substitute("--num_tablets_to_copy_simultaneously=$0", kNumTablets),
+
+    // Ensure we get some blocks to copy. This also serves to stress more
+    // complex, concurrent codepaths.
+    "--flush_threshold_mb=1",
+    "--flush_threshold_secs=1",
+
+    // Ensure we don't crash when we start injecting errors.
+    "--crash_on_eio=false"
+  };
+
+  // Create a cluster with multiple directories per server so we can fail a
+  // directory without crashing.
+  opts.num_data_dirs = 2;
+  NO_FATALS(PrepareClusterForTabletCopy(opts, kNumTablets));
+
+  ExternalTabletServer* ext_ts0 = cluster_->tablet_server(0);
+  ExternalTabletServer* ext_ts1 = cluster_->tablet_server(1);
+  TServerDetails* ts0 = ts_map_[ext_ts0->uuid()];
+  TServerDetails* ts1 = ts_map_[ext_ts1->uuid()];
+  vector<ListTabletsResponsePB::StatusAndSchemaPB> tablets;
+  ASSERT_OK(WaitForNumTabletsOnTS(ts0, kNumTablets, kTimeout, &tablets));
+  ASSERT_EQ(kNumTablets, tablets.size());
+
+  // Wait a bit for some flushes to occur and blocks to appear.
+  ASSERT_EVENTUALLY([&] {
+    // Each data dir has '.', '..', and 'block_manager_instance'.
+    const string& dir_with_data = JoinPathSegments(ext_ts0->data_dirs()[0], "data");
+    ASSERT_GT(inspect_->CountFilesInDir(dir_with_data), 3);
+  });
+
+  // Now kick off the tablet copies.
+  HostPort src_addr;
+  ASSERT_OK(HostPortFromPB(ts0->registration.rpc_addresses(0), &src_addr));
+  vector<thread> threads;
+  auto CopyTabletWithNum = [&] (int i) {
+    LOG(INFO) << Substitute("Copying over tablet $0 / $1", i + 1, kNumTablets);
+    const string& tablet_id = tablets[i].tablet_status().tablet_id();
+    // The copy can fail if the tablet in the middle of some maintenance
+    // operations, complaining about missing blocks. Just try again.
+    while (!StartTabletCopy(ts1, tablet_id, ts0->uuid(), src_addr,
+           std::numeric_limits<int64_t>::max(), kDefaultTimeout).ok()) {
+      SleepFor(MonoDelta::FromMilliseconds(50));
+    }
+  };
+  for (int i = 0; i < tablets.size() - 1; i++) {
+    threads.emplace_back([=] {
+      CopyTabletWithNum(i);
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  // Inject failures into a directory on the receiving server.
+  const string& dir_to_fail = ext_ts1->data_dirs()[1];
+  LOG(INFO) << "Injecting failures to " << dir_to_fail;
+  ASSERT_OK(cluster_->SetFlag(ext_ts1, "env_inject_eio_globs",
+      JoinPathSegments(dir_to_fail, "**")));
+
+  // Copy over the last tablet and immediately try failing it.
+  CopyTabletWithNum(kNumTablets - 1);
+  ASSERT_OK(cluster_->SetFlag(ext_ts1, "env_inject_eio", "1"));
+
+  // The injection will attempt to fail all of the tablets on the affected
+  // disk. The last copy may have started after the disk failure and, thus, may
+  // have avoided the failed directory. As such, we can only enforce that most,
+  // not necessarily all, tablets have failed.
+  ASSERT_EVENTUALLY([&] {
+    int64_t failed_on_ts = 0;
+    ASSERT_OK(itest::GetInt64Metric(ext_ts1->bound_http_hostport(),
+        &METRIC_ENTITY_server, nullptr, &METRIC_tablets_num_failed, "value", &failed_on_ts));
+    LOG(INFO) << Substitute("Waiting for tablets to fail: $0 / $1", failed_on_ts, kNumTablets);
+    ASSERT_GE(failed_on_ts, kNumTablets - 1);
+    LOG(INFO) << "Asserted success!";
+  });
+  LOG(INFO) << "Done!";
 }
 
 } // namespace kudu

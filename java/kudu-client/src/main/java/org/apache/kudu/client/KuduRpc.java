@@ -41,12 +41,12 @@ import com.google.protobuf.InvalidProtocolBufferException;
 import com.google.protobuf.Message;
 import com.google.protobuf.Message.Builder;
 import com.stumbleupon.async.Deferred;
+import org.apache.yetus.audience.InterfaceAudience;
 import org.jboss.netty.buffer.ChannelBuffer;
 import org.jboss.netty.buffer.ChannelBuffers;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import org.apache.kudu.annotations.InterfaceAudience;
 import org.apache.kudu.util.Pair;
 import org.apache.kudu.util.Slice;
 
@@ -131,13 +131,13 @@ public abstract class KuduRpc<R> {
    * that access this attribute will have a happens-before relationship with
    * the rest of the code, due to other existing synchronization.
    */
-  byte attempt;  // package-private for TabletClient and AsyncKuduClient only.
+  int attempt;  // package-private for RpcProxy and AsyncKuduClient only.
 
   /**
-   * Set by TabletClient when isRequestTracked returns true to identify this RPC in the sequence of
+   * Set by RpcProxy when isRequestTracked returns true to identify this RPC in the sequence of
    * RPCs sent by this client. Once it is set it should never change unless the RPC is reused.
    */
-  long sequenceId = RequestTracker.NO_SEQ_NO;
+  private long sequenceId = RequestTracker.NO_SEQ_NO;
 
   KuduRpc(KuduTable table) {
     this.table = table;
@@ -398,10 +398,10 @@ public abstract class KuduRpc<R> {
     chanBuf.writeInt(totalSize);
     final CodedOutputStream out = CodedOutputStream.newInstance(buf, 4, totalSize);
     try {
-      out.writeRawVarint32(header.getSerializedSize());
+      out.writeUInt32NoTag(header.getSerializedSize());
       header.writeTo(out);
 
-      out.writeRawVarint32(pb.getSerializedSize());
+      out.writeUInt32NoTag(pb.getSerializedSize());
       pb.writeTo(out);
       out.checkNoSpaceLeft();
     } catch (IOException e) {

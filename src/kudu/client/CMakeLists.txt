@@ -37,12 +37,14 @@ set(CLIENT_SRCS
   error-internal.cc
   master_rpc.cc
   meta_cache.cc
+  partitioner-internal.cc
   scan_batch.cc
   scan_configuration.cc
   scan_predicate.cc
   scan_token-internal.cc
   scanner-internal.cc
   replica-internal.cc
+  replica_controller-internal.cc
   resource_metrics.cc
   schema.cc
   session-internal.cc
@@ -118,7 +120,7 @@ ADD_EXPORTABLE_LIBRARY(kudu_client
 # For a detailed explanation of the kinds of C++ changes that would break ABI
 # compatibility, see:
 #
-#   https://techbase.kde.org/Policies/Binary_Compatibility_Issues_With_C++
+#   https://community.kde.org/Policies/Binary_Compatibility_Issues_With_C++
 #
 # For more background on library versions, see:
 #
@@ -191,6 +193,7 @@ install(FILES
 # Headers: util
 install(FILES
   ${CMAKE_CURRENT_BINARY_DIR}/../util/kudu_export.h
+  ../util/int128.h
   ../util/monotime.h
   ../util/slice.h
   ../util/status.h
@@ -253,8 +256,12 @@ endif()
 if(NOT "${KUDU_USE_ASAN}" AND NOT "${KUDU_USE_TSAN}")
   ADD_KUDU_TEST(client_samples-test.sh RUN_SERIAL true LABELS no_dist_test)
 endif()
-set(KUDU_TEST_LINK_LIBS kudu_client integration-tests ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(client-test)
+set(KUDU_TEST_LINK_LIBS
+  itest_util
+  kudu_client
+  mini_cluster
+  ${KUDU_MIN_TEST_LIBS})
+ADD_KUDU_TEST(client-test NUM_SHARDS 8 PROCESSORS 2)
 ADD_KUDU_TEST(client-unittest)
 ADD_KUDU_TEST(predicate-test)
-ADD_KUDU_TEST(scan_token-test)
+ADD_KUDU_TEST(scan_token-test PROCESSORS 2)

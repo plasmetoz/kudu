@@ -18,55 +18,78 @@
 #include "kudu/tablet/tablet.h"
 
 #include <algorithm>
+#include <cstdlib>
+#include <cstring>
 #include <iterator>
-#include <limits>
 #include <memory>
 #include <mutex>
 #include <ostream>
+#include <type_traits>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
 
-#include "kudu/cfile/cfile_writer.h"
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/encoded_key.h"
+#include "kudu/common/generic_iterators.h"
 #include "kudu/common/iterator.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/row.h"
 #include "kudu/common/row_changelist.h"
 #include "kudu/common/row_operations.h"
+#include "kudu/common/rowid.h"
 #include "kudu/common/scan_spec.h"
 #include "kudu/common/schema.h"
-#include "kudu/consensus/consensus.pb.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/types.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/log_anchor_registry.h"
-#include "kudu/consensus/opid_util.h"
-#include "kudu/gutil/atomicops.h"
-#include "kudu/gutil/map-util.h"
+#include "kudu/consensus/opid.pb.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/move.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/gutil/strings/human_readable.h"
-#include "kudu/gutil/strings/numbers.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/server/hybrid_clock.h"
+#include "kudu/gutil/threading/thread_collision_warner.h"
 #include "kudu/tablet/compaction.h"
 #include "kudu/tablet/compaction_policy.h"
-#include "kudu/tablet/delta_compaction.h"
+#include "kudu/tablet/delta_tracker.h"
 #include "kudu/tablet/diskrowset.h"
+#include "kudu/tablet/memrowset.h"
 #include "kudu/tablet/row_op.h"
 #include "kudu/tablet/rowset_info.h"
+#include "kudu/tablet/rowset_metadata.h"
 #include "kudu/tablet/rowset_tree.h"
 #include "kudu/tablet/svg_dump.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/tablet/tablet_metrics.h"
 #include "kudu/tablet/tablet_mm_ops.h"
 #include "kudu/tablet/transactions/alter_schema_transaction.h"
 #include "kudu/tablet/transactions/write_transaction.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/bitmap.h"
 #include "kudu/util/bloom_filter.h"
 #include "kudu/util/debug/trace_event.h"
-#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/fault_injection.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/maintenance_manager.h"
-#include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
-#include "kudu/util/scoped_cleanup.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/process_memory.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status_callback.h"
+#include "kudu/util/throttler.h"
 #include "kudu/util/trace.h"
 #include "kudu/util/url-coding.h"
 
@@ -144,24 +167,26 @@ METRIC_DEFINE_entity(tablet);
 METRIC_DEFINE_gauge_size(tablet, memrowset_size, "MemRowSet Memory Usage",
                          kudu::MetricUnit::kBytes,
                          "Size of this tablet's memrowset");
-METRIC_DEFINE_gauge_size(tablet, on_disk_size, "Tablet Size On Disk",
+METRIC_DEFINE_gauge_size(tablet, on_disk_data_size, "Tablet Data Size On Disk",
                          kudu::MetricUnit::kBytes,
-                         "Size of this tablet on disk.");
+                         "Space used by this tablet's data blocks.");
 
-using base::subtle::Barrier_AtomicIncrement;
 using kudu::MaintenanceManager;
-using kudu::consensus::OpId;
-using kudu::consensus::MaximumOpId;
+using kudu::clock::HybridClock;
 using kudu::log::LogAnchorRegistry;
-using kudu::server::HybridClock;
+using std::ostream;
+using std::pair;
 using std::shared_ptr;
 using std::string;
-using std::unique_ptr;
 using std::unordered_set;
 using std::vector;
 using strings::Substitute;
 
 namespace kudu {
+
+class RowBlock;
+struct IteratorStats;
+
 namespace tablet {
 
 static CompactionPolicy *CreateCompactionPolicy() {
@@ -181,7 +206,7 @@ TabletComponents::TabletComponents(shared_ptr<MemRowSet> mrs,
 ////////////////////////////////////////////////////////////
 
 Tablet::Tablet(const scoped_refptr<TabletMetadata>& metadata,
-               const scoped_refptr<server::Clock>& clock,
+               const scoped_refptr<clock::Clock>& clock,
                const shared_ptr<MemTracker>& parent_mem_tracker,
                MetricRegistry* metric_registry,
                const scoped_refptr<LogAnchorRegistry>& log_anchor_registry)
@@ -198,7 +223,6 @@ Tablet::Tablet(const scoped_refptr<TabletMetadata>& metadata,
 
   if (metric_registry) {
     MetricEntity::AttributeMap attrs;
-    // TODO(KUDU-745): table_id is apparently not set in the metadata.
     attrs["table_id"] = metadata_->table_id();
     attrs["table_name"] = metadata_->table_name();
     attrs["partition"] = metadata_->partition_schema().PartitionDebugString(metadata_->partition(),
@@ -208,8 +232,8 @@ Tablet::Tablet(const scoped_refptr<TabletMetadata>& metadata,
     METRIC_memrowset_size.InstantiateFunctionGauge(
       metric_entity_, Bind(&Tablet::MemRowSetSize, Unretained(this)))
       ->AutoDetach(&metric_detacher_);
-    METRIC_on_disk_size.InstantiateFunctionGauge(
-      metric_entity_, Bind(&Tablet::EstimateOnDiskSize, Unretained(this)))
+    METRIC_on_disk_data_size.InstantiateFunctionGauge(
+      metric_entity_, Bind(&Tablet::OnDiskDataSize, Unretained(this)))
       ->AutoDetach(&metric_detacher_);
   }
 
@@ -225,10 +249,19 @@ Tablet::~Tablet() {
   Shutdown();
 }
 
+// Returns an error if the Tablet has been stopped, i.e. is 'kStopped' or
+// 'kShutdown', and otherwise checks that 'expected_state' matches 'state_'.
+#define RETURN_IF_STOPPED_OR_CHECK_STATE(expected_state) do { \
+  std::lock_guard<simple_spinlock> l(state_lock_); \
+  RETURN_NOT_OK(CheckHasNotBeenStoppedUnlocked()); \
+  CHECK_EQ(expected_state, state_); \
+} while (0);
+
 Status Tablet::Open() {
   TRACE_EVENT0("tablet", "Tablet::Open");
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kInitialized);
+
   std::lock_guard<rw_spinlock> lock(component_lock_);
-  CHECK_EQ(state_, kInitialized) << "already open";
   CHECK(schema()->has_column_ids());
 
   next_mrs_id_ = metadata_->last_durable_mrs_id() + 1;
@@ -261,21 +294,57 @@ Status Tablet::Open() {
                                   &new_mrs));
   components_ = new TabletComponents(new_mrs, new_rowset_tree);
 
-  state_ = kBootstrapping;
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    if (state_ != kInitialized) {
+      DCHECK(state_ == kStopped || state_ == kShutdown);
+      return Status::IllegalState("Expected the Tablet to be initialized");
+    }
+    set_state_unlocked(kBootstrapping);
+  }
   return Status::OK();
 }
 
-void Tablet::MarkFinishedBootstrapping() {
-  CHECK_EQ(state_, kBootstrapping);
-  state_ = kOpen;
+void Tablet::Stop() {
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    if (state_ == kStopped || state_ == kShutdown) {
+      return;
+    }
+    set_state_unlocked(kStopped);
+  }
+
+  // Close MVCC so Applying transactions will not complete and will not be
+  // waited on. This prevents further snapshotting of the tablet.
+  mvcc_.Close();
+
+  // Stop tablet ops from being scheduled by the maintenance manager.
+  CancelMaintenanceOps();
+}
+
+Status Tablet::MarkFinishedBootstrapping() {
+  std::lock_guard<simple_spinlock> l(state_lock_);
+  if (state_ != kBootstrapping) {
+    DCHECK(state_ == kStopped || state_ == kShutdown);
+    return Status::IllegalState("The tablet has been stopped");
+  }
+  set_state_unlocked(kOpen);
+  return Status::OK();
 }
 
 void Tablet::Shutdown() {
+  Stop();
   UnregisterMaintenanceOps();
 
   std::lock_guard<rw_spinlock> lock(component_lock_);
   components_ = nullptr;
-  state_ = kShutdown;
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    set_state_unlocked(kShutdown);
+  }
+  if (metric_entity_) {
+    metric_entity_->Unpublish();
+  }
 
   // In the case of deleting a tablet, we still keep the metadata around after
   // ShutDown(), and need to flush the metadata to indicate that the tablet is deleted.
@@ -290,7 +359,7 @@ Status Tablet::GetMappedReadProjection(const Schema& projection,
   return cur_schema->GetMappedReadProjection(projection, mapped_projection);
 }
 
-BloomFilterSizing Tablet::bloom_sizing() const {
+BloomFilterSizing Tablet::DefaultBloomSizing() {
   return BloomFilterSizing::BySizeAndFPRate(FLAGS_tablet_bloom_block_size,
                                             FLAGS_tablet_bloom_target_fp_rate);
 }
@@ -307,7 +376,7 @@ Status Tablet::NewRowIterator(const Schema &projection,
                               const MvccSnapshot &snap,
                               const OrderMode order,
                               gscoped_ptr<RowwiseIterator> *iter) const {
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   if (metrics_) {
     metrics_->scans_started->Increment();
   }
@@ -339,17 +408,10 @@ Status Tablet::DecodeWriteOperations(const Schema* client_schema,
   RETURN_NOT_OK(dec.DecodeOperations(&ops));
   TRACE_COUNTER_INCREMENT("num_ops", ops.size());
 
-  // Create RowOp objects for each
-  vector<RowOp*> row_ops;
-  row_ops.reserve(ops.size());
-  for (const DecodedRowOperation& op : ops) {
-    row_ops.push_back(new RowOp(op));
-  }
-
   // Important to set the schema before the ops -- we need the
   // schema in order to stringify the ops.
   tx_state->set_schema_at_decode_time(schema());
-  tx_state->swap_row_ops(&row_ops);
+  tx_state->SetRowOps(std::move(ops));
 
   return Status::OK();
 }
@@ -419,6 +481,35 @@ void Tablet::StartTransaction(WriteTransactionState* tx_state) {
   tx_state->SetMvccTx(std::move(mvcc_tx));
 }
 
+bool Tablet::ValidateOpOrMarkFailed(RowOp* op) const {
+  if (op->validated) return true;
+
+  Status s = ValidateOp(*op);
+  if (PREDICT_FALSE(!s.ok())) {
+    // TODO(todd): add a metric tracking the number of invalid ops.
+    op->SetFailed(s);
+    return false;
+  }
+  op->validated = true;
+  return true;
+}
+
+Status Tablet::ValidateOp(const RowOp& op) const {
+  switch (op.decoded_op.type) {
+    case RowOperationsPB::INSERT:
+    case RowOperationsPB::UPSERT:
+      return ValidateInsertOrUpsertUnlocked(op);
+
+    case RowOperationsPB::UPDATE:
+    case RowOperationsPB::DELETE:
+      return ValidateMutateUnlocked(op);
+
+    default:
+      LOG_WITH_PREFIX(FATAL) << RowOperationsPB::Type_Name(op.decoded_op.type);
+  }
+  abort(); // unreachable
+}
+
 Status Tablet::ValidateInsertOrUpsertUnlocked(const RowOp& op) const {
   // Check that no individual cell is larger than the specified max.
   ConstContiguousRow row(schema(), op.decoded_op.row_data);
@@ -483,33 +574,22 @@ Status Tablet::ValidateMutateUnlocked(const RowOp& op) const {
 Status Tablet::InsertOrUpsertUnlocked(WriteTransactionState *tx_state,
                                       RowOp* op,
                                       ProbeStats* stats) {
-
-  Status s = ValidateInsertOrUpsertUnlocked(*op);
-  if (PREDICT_FALSE(!s.ok())) {
-    // TODO(todd): add a metric tracking the number of invalid ops.
-    op->SetFailed(s);
-    return s;
-  }
+  DCHECK(op->checked_present);
+  DCHECK(op->validated);
 
   const bool is_upsert = op->decoded_op.type == RowOperationsPB::UPSERT;
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
 
-  // First, ensure that it is a unique key by checking all the open RowSets.
-  vector<RowSet *> to_check = FindRowSetsToCheck(op, comps);
-  for (RowSet *rowset : to_check) {
-    bool present = false;
-    RETURN_NOT_OK(rowset->CheckRowPresent(*op->key_probe, &present, stats));
-    if (present) {
-      if (is_upsert) {
-        return ApplyUpsertAsUpdate(tx_state, op, rowset, stats);
-      }
-      Status s = Status::AlreadyPresent("key already present");
-      if (metrics_) {
-        metrics_->insertions_failed_dup_key->Increment();
-      }
-      op->SetFailed(s);
-      return s;
+  if (op->present_in_rowset) {
+    if (is_upsert) {
+      return ApplyUpsertAsUpdate(tx_state, op, op->present_in_rowset, stats);
     }
+    Status s = Status::AlreadyPresent("key already present");
+    if (metrics_) {
+      metrics_->insertions_failed_dup_key->Increment();
+    }
+    op->SetFailed(s);
+    return s;
   }
 
   Timestamp ts = tx_state->timestamp();
@@ -520,7 +600,7 @@ Status Tablet::InsertOrUpsertUnlocked(WriteTransactionState *tx_state,
 
   // Now try to op into memrowset. The memrowset itself will return
   // AlreadyPresent if it has already been oped there.
-  s = comps->memrowset->Insert(ts, row, tx_state->op_id());
+  Status s = comps->memrowset->Insert(ts, row, tx_state->op_id());
   if (s.ok()) {
     op->SetInsertSucceeded(comps->memrowset->mrs_id());
   } else {
@@ -577,6 +657,9 @@ Status Tablet::ApplyUpsertAsUpdate(WriteTransactionState* tx_state,
                                result.get());
   CHECK(!s.IsNotFound());
   if (s.ok()) {
+    if (metrics_) {
+      metrics_->upserts_as_updates->Increment();
+    }
     upsert->SetMutateSucceeded(std::move(result));
   } else {
     upsert->SetFailed(s);
@@ -584,7 +667,7 @@ Status Tablet::ApplyUpsertAsUpdate(WriteTransactionState* tx_state,
   return s;
 }
 
-vector<RowSet*> Tablet::FindRowSetsToCheck(RowOp* op,
+vector<RowSet*> Tablet::FindRowSetsToCheck(const RowOp* op,
                                            const TabletComponents* comps) {
   vector<RowSet*> to_check;
   if (PREDICT_TRUE(!op->orig_result_from_log_)) {
@@ -627,55 +710,32 @@ vector<RowSet*> Tablet::FindRowSetsToCheck(RowOp* op,
 Status Tablet::MutateRowUnlocked(WriteTransactionState *tx_state,
                                  RowOp* mutate,
                                  ProbeStats* stats) {
-  // Validate the mutation.
-  Status s = ValidateMutateUnlocked(*mutate);
-  if (!s.ok()) {
-    mutate->SetFailed(s);
-    return s;
-  }
+  DCHECK(mutate->checked_present);
+  DCHECK(mutate->validated);
 
   gscoped_ptr<OperationResultPB> result(new OperationResultPB());
   const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
   Timestamp ts = tx_state->timestamp();
 
-  // First try to update in memrowset.
-  s = comps->memrowset->MutateRow(ts,
-                            *mutate->key_probe,
-                            mutate->decoded_op.changelist,
-                            tx_state->op_id(),
-                            stats,
-                            result.get());
-  if (s.ok()) {
+  // If we found the row in any existing RowSet, mutate it there. Otherwise
+  // attempt to mutate in the MRS.
+  RowSet* rs_to_attempt = mutate->present_in_rowset ?
+      mutate->present_in_rowset : comps->memrowset.get();
+  Status s = rs_to_attempt->MutateRow(ts,
+                                      *mutate->key_probe,
+                                      mutate->decoded_op.changelist,
+                                      tx_state->op_id(),
+                                      stats,
+                                      result.get());
+  if (PREDICT_TRUE(s.ok())) {
     mutate->SetMutateSucceeded(std::move(result));
-    return s;
-  }
-  if (!s.IsNotFound()) {
+  } else {
+    if (s.IsNotFound()) {
+      // Replace internal error messages with one more suitable for users.
+      s = Status::NotFound("key not found");
+    }
     mutate->SetFailed(s);
-    return s;
   }
-
-  // Next, check the disk rowsets.
-
-  vector<RowSet *> to_check = FindRowSetsToCheck(mutate, comps);
-  for (RowSet *rs : to_check) {
-    s = rs->MutateRow(ts,
-                      *mutate->key_probe,
-                      mutate->decoded_op.changelist,
-                      tx_state->op_id(),
-                      stats,
-                      result.get());
-    if (s.ok()) {
-      mutate->SetMutateSucceeded(std::move(result));
-      return s;
-    }
-    if (!s.IsNotFound()) {
-      mutate->SetFailed(s);
-      return s;
-    }
-  }
-
-  s = Status::NotFound("key not found");
-  mutate->SetFailed(s);
   return s;
 }
 
@@ -685,52 +745,227 @@ void Tablet::StartApplying(WriteTransactionState* tx_state) {
   tx_state->set_tablet_components(components_);
 }
 
-void Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
-  // Allocate the ProbeStats objects from the transaction's arena, so
-  // they're all contiguous and we don't need to do any central allocation.
+Status Tablet::BulkCheckPresence(WriteTransactionState* tx_state) {
   int num_ops = tx_state->row_ops().size();
-  ProbeStats* stats_array = static_cast<ProbeStats*>(
-      tx_state->arena()->AllocateBytesAligned(sizeof(ProbeStats) * num_ops,
-                                              alignof(ProbeStats)));
 
-  StartApplying(tx_state);
-  int i = 0;
-  for (RowOp* row_op : tx_state->row_ops()) {
-    ProbeStats* stats = &stats_array[i++];
-    // Manually run the constructor to clear the stats to 0 before collecting
-    // them.
-    new (stats) ProbeStats();
-    ApplyRowOperation(tx_state, row_op, stats);
+  // TODO(todd) determine why we sometimes get empty writes!
+  if (PREDICT_FALSE(num_ops == 0)) return Status::OK();
+
+  // The compiler seems to be bad at hoisting this load out of the loops,
+  // so load it up top.
+  RowOp* const * row_ops_base = tx_state->row_ops().data();
+
+  // Run all of the ops through the RowSetTree.
+  vector<pair<Slice, int>> keys_and_indexes;
+  keys_and_indexes.reserve(num_ops);
+  for (int i = 0; i < num_ops; i++) {
+    RowOp* op = row_ops_base[i];
+    // If the op already failed in validation, or if we've got the original result
+    // filled in already during replay, then we don't need to consult the RowSetTree.
+    if (op->has_result() || op->orig_result_from_log_) continue;
+    keys_and_indexes.emplace_back(op->key_probe->encoded_key_slice(), i);
   }
 
-  if (metrics_) {
-    metrics_->AddProbeStats(stats_array, num_ops, tx_state->arena());
+  // Sort the query points by their probe keys, retaining the equivalent indexes.
+  //
+  // It's important to do a stable-sort here so that the 'unique' call
+  // below retains only the _first_ op the user specified, instead of
+  // an arbitrary one.
+  //
+  // TODO(todd): benchmark stable_sort vs using sort() and falling back to
+  // comparing 'a.second' when a.first == b.first. Some microbenchmarks
+  // seem to indicate stable_sort is actually faster.
+  // TODO(todd): could also consider weaving in a check in the loop above to
+  // see if the incoming batch is already totally-ordered and in that case
+  // skip this sort and std::unique call.
+  std::stable_sort(keys_and_indexes.begin(), keys_and_indexes.end(),
+                   [](const pair<Slice, int>& a,
+                      const pair<Slice, int>& b) {
+                     return a.first.compare(b.first) < 0;
+                   });
+  // If the batch has more than one operation for the same row, then we can't
+  // use the up-front presence optimization on those operations, since the
+  // first operation may change the result of the later presence-checks.
+  keys_and_indexes.erase(std::unique(
+      keys_and_indexes.begin(), keys_and_indexes.end(),
+      [](const pair<Slice, int>& a,
+         const pair<Slice, int>& b) {
+        return a.first == b.first;
+      }), keys_and_indexes.end());
+
+  // Unzip the keys into a separate array (since the RowSetTree API just wants a vector of
+  // Slices)
+  vector<Slice> keys(keys_and_indexes.size());
+  for (int i = 0; i < keys.size(); i++) {
+    keys[i] = keys_and_indexes[i].first;
   }
+
+  // Actually perform the presence checks. We use the "bulk query" functionality
+  // provided by RowSetTree::ForEachRowSetContainingKeys(), which yields results
+  // via a callback, with grouping guarantees that callbacks for the same RowSet
+  // will be grouped together with increasing query keys.
+  //
+  // We want to process each such "group" (set of subsequent calls for the same
+  // RowSet) one at a time. So, the callback itself aggregates results into
+  // 'pending_group' and then calls 'ProcessPendingGroup' when the next group
+  // begins.
+  vector<pair<RowSet*, int>> pending_group;
+  Status s;
+  const auto& ProcessPendingGroup = [&]() {
+    if (pending_group.empty() || !s.ok()) return;
+    // Check invariant of the batch RowSetTree query: within each output group
+    // we should have fully-sorted keys.
+    DCHECK(std::is_sorted(pending_group.begin(), pending_group.end(),
+                          [&](const pair<RowSet*, int>& a,
+                              const pair<RowSet*, int>& b) {
+                            auto s_a = keys[a.second];
+                            auto s_b = keys[b.second];
+                            return s_a.compare(s_b) < 0;
+                          }));
+    RowSet* rs = pending_group[0].first;
+    for (auto it = pending_group.begin();
+         it != pending_group.end();
+         ++it) {
+      DCHECK_EQ(it->first, rs) << "All results within a group should be for the same RowSet";
+      int op_idx = keys_and_indexes[it->second].second;
+      RowOp* op = row_ops_base[op_idx];
+      if (op->present_in_rowset) {
+        // Already found this op present somewhere.
+        continue;
+      }
+
+      bool present = false;
+      s = rs->CheckRowPresent(*op->key_probe, &present, tx_state->mutable_op_stats(op_idx));
+      if (PREDICT_FALSE(!s.ok())) {
+        LOG(WARNING) << Substitute("Tablet $0 failed to check row presence for op $1: $2",
+            tablet_id(), op->ToString(key_schema_), s.ToString());
+        return;
+      }
+      if (present) {
+        op->present_in_rowset = rs;
+      }
+    }
+    pending_group.clear();
+  };
+
+  const TabletComponents* comps = DCHECK_NOTNULL(tx_state->tablet_components());
+  comps->rowsets->ForEachRowSetContainingKeys(
+      keys,
+      [&](RowSet* rs, int i) {
+        if (!pending_group.empty() && rs != pending_group.back().first) {
+          ProcessPendingGroup();
+        }
+        pending_group.emplace_back(rs, i);
+      });
+  // Process the last group.
+  ProcessPendingGroup();
+  RETURN_NOT_OK_PREPEND(s, "Error while checking presence of rows");
+
+  // Mark all of the ops as having been checked.
+  // TODO(todd): this could potentially be weaved into the std::unique() call up
+  // above to avoid some cache misses.
+  for (auto& p : keys_and_indexes) {
+    row_ops_base[p.second]->checked_present = true;
+  }
+  return Status::OK();
 }
 
-void Tablet::ApplyRowOperation(WriteTransactionState* tx_state,
-                               RowOp* row_op,
-                               ProbeStats* stats) {
-  CHECK(state_ == kOpen || state_ == kBootstrapping);
+bool Tablet::HasBeenStopped() const {
+  std::lock_guard<simple_spinlock> l(state_lock_);
+  return state_ == kStopped || state_ == kShutdown;
+}
+
+Status Tablet::CheckHasNotBeenStoppedUnlocked() const {
+  DCHECK(state_lock_.is_locked());
+  if (PREDICT_FALSE(state_ == kStopped || state_ == kShutdown)) {
+    return Status::IllegalState("Tablet has been stopped");
+  }
+  return Status::OK();
+}
+
+Status Tablet::ApplyRowOperations(WriteTransactionState* tx_state) {
+  int num_ops = tx_state->row_ops().size();
+
+  StartApplying(tx_state);
+
+  // Validate all of the ops.
+  for (RowOp* op : tx_state->row_ops()) {
+    ValidateOpOrMarkFailed(op);
+  }
+
+  RETURN_NOT_OK(BulkCheckPresence(tx_state));
+
+  // Actually apply the ops.
+  for (int op_idx = 0; op_idx < num_ops; op_idx++) {
+    RowOp* row_op = tx_state->row_ops()[op_idx];
+    if (row_op->has_result()) continue;
+
+    RETURN_NOT_OK(ApplyRowOperation(tx_state, row_op, tx_state->mutable_op_stats(op_idx)));
+    DCHECK(row_op->has_result());
+  }
+
+  if (metrics_ && num_ops > 0) {
+    metrics_->AddProbeStats(tx_state->mutable_op_stats(0), num_ops, tx_state->arena());
+  }
+  return Status::OK();
+}
+
+Status Tablet::ApplyRowOperation(WriteTransactionState* tx_state,
+                                 RowOp* row_op,
+                                 ProbeStats* stats) {
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    RETURN_NOT_OK_PREPEND(CheckHasNotBeenStoppedUnlocked(),
+        Substitute("Apply of $0 exited early", tx_state->ToString()));
+    CHECK(state_ == kOpen || state_ == kBootstrapping);
+  }
   DCHECK(row_op->has_row_lock()) << "RowOp must hold the row lock.";
   DCHECK(tx_state != nullptr) << "must have a WriteTransactionState";
   DCHECK(tx_state->op_id().IsInitialized()) << "TransactionState OpId needed for anchoring";
   DCHECK_EQ(tx_state->schema_at_decode_time(), schema());
 
+  if (!ValidateOpOrMarkFailed(row_op)) {
+    return Status::OK();
+  }
+
+  // If we were unable to check rowset presence in batch (e.g. because we are processing
+  // a batch which contains some duplicate keys) we need to do so now.
+  if (PREDICT_FALSE(!row_op->checked_present)) {
+    vector<RowSet *> to_check = FindRowSetsToCheck(row_op, tx_state->tablet_components());
+    for (RowSet *rowset : to_check) {
+      bool present = false;
+      RETURN_NOT_OK_PREPEND(rowset->CheckRowPresent(*row_op->key_probe, &present, stats),
+          "Failed to check if row is present");
+      if (present) {
+        row_op->present_in_rowset = rowset;
+        break;
+      }
+    }
+    row_op->checked_present = true;
+  }
+
+  Status s;
   switch (row_op->decoded_op.type) {
     case RowOperationsPB::INSERT:
     case RowOperationsPB::UPSERT:
-      ignore_result(InsertOrUpsertUnlocked(tx_state, row_op, stats));
-      return;
+      s = InsertOrUpsertUnlocked(tx_state, row_op, stats);
+      if (s.IsAlreadyPresent()) {
+        return Status::OK();
+      }
+      return s;
 
     case RowOperationsPB::UPDATE:
     case RowOperationsPB::DELETE:
-      ignore_result(MutateRowUnlocked(tx_state, row_op, stats));
-      return;
+      s = MutateRowUnlocked(tx_state, row_op, stats);
+      if (s.IsNotFound()) {
+        return Status::OK();
+      }
+      return s;
 
     default:
       LOG_WITH_PREFIX(FATAL) << RowOperationsPB::Type_Name(row_op->decoded_op.type);
   }
+  return Status::OK();
 }
 
 void Tablet::ModifyRowSetTree(const RowSetTree& old_tree,
@@ -786,8 +1021,8 @@ void Tablet::AtomicSwapRowSetsUnlocked(const RowSetVector &to_remove,
 }
 
 Status Tablet::DoMajorDeltaCompaction(const vector<ColumnId>& col_ids,
-                                      shared_ptr<RowSet> input_rs) {
-  CHECK_EQ(state_, kOpen);
+                                      const shared_ptr<RowSet>& input_rs) {
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   Status s = down_cast<DiskRowSet*>(input_rs.get())
       ->MajorCompactDeltaStoresWithColumnIds(col_ids, GetHistoryGcOpts());
   return s;
@@ -831,6 +1066,7 @@ Status Tablet::Flush() {
 
 Status Tablet::FlushUnlocked() {
   TRACE_EVENT0("tablet", "Tablet::FlushUnlocked");
+  RETURN_NOT_OK(CheckHasNotBeenStopped());
   RowSetsInCompaction input;
   shared_ptr<MemRowSet> old_mrs;
   {
@@ -841,7 +1077,9 @@ Status Tablet::FlushUnlocked() {
 
   // Wait for any in-flight transactions to finish against the old MRS
   // before we flush it.
-  mvcc_.WaitForApplyingTransactionsToCommit();
+  //
+  // This may fail if the tablet has been stopped.
+  RETURN_NOT_OK(mvcc_.WaitForApplyingTransactionsToCommit());
 
   // Note: "input" should only contain old_mrs.
   return FlushInternal(input, old_mrs);
@@ -876,7 +1114,11 @@ Status Tablet::ReplaceMemRowSetUnlocked(RowSetsInCompaction *compaction,
 
 Status Tablet::FlushInternal(const RowSetsInCompaction& input,
                              const shared_ptr<MemRowSet>& old_ms) {
-  CHECK(state_ == kOpen || state_ == kBootstrapping);
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    RETURN_NOT_OK(CheckHasNotBeenStoppedUnlocked());
+    CHECK(state_ == kOpen || state_ == kBootstrapping);
+  }
 
   // Step 1. Freeze the old memrowset by blocking readers and swapping
   // it in as a new rowset, replacing it with an empty one.
@@ -924,10 +1166,6 @@ Status Tablet::FlushInternal(const RowSetsInCompaction& input,
 
 Status Tablet::CreatePreparedAlterSchema(AlterSchemaTransactionState *tx_state,
                                          const Schema* schema) {
-  if (!key_schema_.KeyEquals(*schema)) {
-    return Status::InvalidArgument("Schema keys cannot be altered",
-                                   schema->CreateKeyProjection().ToString());
-  }
 
   if (!schema->has_column_ids()) {
     // this probably means that the request is not from the Master
@@ -944,8 +1182,8 @@ Status Tablet::CreatePreparedAlterSchema(AlterSchemaTransactionState *tx_state,
 }
 
 Status Tablet::AlterSchema(AlterSchemaTransactionState *tx_state) {
-  DCHECK(key_schema_.KeyEquals(*DCHECK_NOTNULL(tx_state->schema()))) <<
-    "Schema keys cannot be altered";
+  DCHECK(key_schema_.KeyTypeEquals(*DCHECK_NOTNULL(tx_state->schema()))) <<
+    "Schema keys cannot be altered(except name)";
 
   // Prevent any concurrent flushes. Otherwise, we run into issues where
   // we have an MRS in the rowset tree, and we can't alter its schema
@@ -983,13 +1221,13 @@ Status Tablet::AlterSchema(AlterSchemaTransactionState *tx_state) {
 
 Status Tablet::RewindSchemaForBootstrap(const Schema& new_schema,
                                         int64_t schema_version) {
-  CHECK_EQ(state_, kBootstrapping);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kBootstrapping);
 
   // We know that the MRS should be empty at this point, because we
   // rewind the schema before replaying any operations. So, we just
   // swap in a new one with the correct schema, rather than attempting
   // to flush.
-  LOG_WITH_PREFIX(INFO) << "Rewinding schema during bootstrap to " << new_schema.ToString();
+  VLOG_WITH_PREFIX(1) << "Rewinding schema during bootstrap to " << new_schema.ToString();
 
   metadata_->SetSchema(new_schema, schema_version);
   {
@@ -1037,7 +1275,7 @@ bool Tablet::ShouldThrottleAllow(int64_t bytes) {
 
 Status Tablet::PickRowSetsToCompact(RowSetsInCompaction *picked,
                                     CompactFlags flags) const {
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   // Grab a local reference to the current RowSetTree. This is to avoid
   // holding the component_lock_ for too long. See the comment on component_lock_
   // in tablet.h for details on why that would be bad.
@@ -1086,16 +1324,19 @@ Status Tablet::PickRowSetsToCompact(RowSetsInCompaction *picked,
     picked->AddRowSet(rs, std::move(lock));
   }
 
-  // When we iterated through the current rowsets, we should have found all of the
-  // rowsets that we picked. If we didn't, that implies that some other thread swapped
-  // them out while we were making our selection decision -- that's not possible
-  // since we only picked rowsets that were marked as available for compaction.
+  // When we iterated through the current rowsets, we should have found all of
+  // the rowsets that we picked. If we didn't, that implies that some other
+  // thread swapped them out while we were making our selection decision --
+  // that's not possible since we only picked rowsets that were marked as
+  // available for compaction.
   if (!picked_set.empty()) {
     for (const RowSet* not_found : picked_set) {
       LOG_WITH_PREFIX(ERROR) << "Rowset selected for compaction but not available anymore: "
                              << not_found->ToString();
     }
-    LOG_WITH_PREFIX(FATAL) << "Was unable to find all rowsets selected for compaction";
+    const char* msg = "Was unable to find all rowsets selected for compaction";
+    LOG_WITH_PREFIX(DFATAL) << msg;
+    return Status::RuntimeError(msg);
   }
   return Status::OK();
 }
@@ -1112,39 +1353,68 @@ void Tablet::GetRowSetsForTests(RowSetVector* out) {
 }
 
 void Tablet::RegisterMaintenanceOps(MaintenanceManager* maint_mgr) {
-  CHECK_EQ(state_, kOpen);
-  DCHECK(maintenance_ops_.empty());
+  // This method must be externally synchronized to not coincide with other
+  // calls to it or to UnregisterMaintenanceOps.
+  DFAKE_SCOPED_LOCK(maintenance_registration_fake_lock_);
+  {
+    std::lock_guard<simple_spinlock> l(state_lock_);
+    if (state_ == kStopped || state_ == kShutdown) {
+      LOG(WARNING) << "Could not register maintenance ops";
+      return;
+    }
+    CHECK_EQ(kOpen, state_);
+    DCHECK(maintenance_ops_.empty());
+  }
 
+  vector<MaintenanceOp*> maintenance_ops;
   gscoped_ptr<MaintenanceOp> rs_compact_op(new CompactRowSetsOp(this));
   maint_mgr->RegisterOp(rs_compact_op.get());
-  maintenance_ops_.push_back(rs_compact_op.release());
+  maintenance_ops.push_back(rs_compact_op.release());
 
   gscoped_ptr<MaintenanceOp> minor_delta_compact_op(new MinorDeltaCompactionOp(this));
   maint_mgr->RegisterOp(minor_delta_compact_op.get());
-  maintenance_ops_.push_back(minor_delta_compact_op.release());
+  maintenance_ops.push_back(minor_delta_compact_op.release());
 
   gscoped_ptr<MaintenanceOp> major_delta_compact_op(new MajorDeltaCompactionOp(this));
   maint_mgr->RegisterOp(major_delta_compact_op.get());
-  maintenance_ops_.push_back(major_delta_compact_op.release());
+  maintenance_ops.push_back(major_delta_compact_op.release());
 
   if (FLAGS_enable_undo_delta_block_gc) {
     gscoped_ptr<MaintenanceOp> undo_delta_block_gc_op(new UndoDeltaBlockGCOp(this));
     maint_mgr->RegisterOp(undo_delta_block_gc_op.get());
-    maintenance_ops_.push_back(undo_delta_block_gc_op.release());
+    maintenance_ops.push_back(undo_delta_block_gc_op.release());
   }
+
+  std::lock_guard<simple_spinlock> l(state_lock_);
+  maintenance_ops_.swap(maintenance_ops);
 }
 
 void Tablet::UnregisterMaintenanceOps() {
+  // This method must be externally synchronized to not coincide with other
+  // calls to it or to RegisterMaintenanceOps.
+  DFAKE_SCOPED_LOCK(maintenance_registration_fake_lock_);
+
   // First cancel all of the operations, so that while we're waiting for one
   // operation to finish in Unregister(), a different one can't get re-scheduled.
-  for (MaintenanceOp* op : maintenance_ops_) {
-    op->CancelAndDisable();
-  }
+  CancelMaintenanceOps();
 
+  // We don't lock here because unregistering ops may take a long time.
+  // 'maintenance_registration_fake_lock_' is sufficient to ensure nothing else
+  // is updating 'maintenance_ops_'.
   for (MaintenanceOp* op : maintenance_ops_) {
     op->Unregister();
   }
+
+  // Finally, delete the ops under lock.
+  std::lock_guard<simple_spinlock> l(state_lock_);
   STLDeleteElements(&maintenance_ops_);
+}
+
+void Tablet::CancelMaintenanceOps() {
+  std::lock_guard<simple_spinlock> l(state_lock_);
+  for (MaintenanceOp* op : maintenance_ops_) {
+    op->CancelAndDisable();
+  }
 }
 
 Status Tablet::FlushMetadata(const RowSetVector& to_remove,
@@ -1182,7 +1452,7 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   shared_ptr<CompactionInput> merge;
   RETURN_NOT_OK(input.CreateCompactionInput(flush_snap, schema(), &merge));
 
-  RollingDiskRowSetWriter drsw(metadata_.get(), merge->schema(), bloom_sizing(),
+  RollingDiskRowSetWriter drsw(metadata_.get(), merge->schema(), DefaultBloomSizing(),
                                compaction_policy_->target_rowset_size());
   RETURN_NOT_OK_PREPEND(drsw.Open(), "Failed to open DiskRowSet for flush");
 
@@ -1298,7 +1568,7 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   // those transactions in 'applying_during_swap', but MVCC doesn't implement the
   // ability to wait for a specific set. So instead we wait for all currently applying --
   // a bit more than we need, but still correct.
-  mvcc_.WaitForApplyingTransactionsToCommit();
+  RETURN_NOT_OK(mvcc_.WaitForApplyingTransactionsToCommit());
 
   // Then we want to consider all those transactions that were in-flight when we did the
   // swap as committed in 'non_duplicated_txns_snap'.
@@ -1343,13 +1613,19 @@ Status Tablet::DoMergeCompactionOrFlush(const RowSetsInCompaction &input,
   if (input.num_rowsets() > 1) {
     MAYBE_FAULT(FLAGS_fault_crash_before_flush_tablet_meta_after_compaction);
   } else if (input.num_rowsets() == 1 &&
-             input.rowsets()[0]->EstimateOnDiskSize() == 0) {
+      input.rowsets()[0]->OnDiskBaseDataSizeWithRedos() == 0) {
     MAYBE_FAULT(FLAGS_fault_crash_before_flush_tablet_meta_after_flush_mrs);
   }
 
   // Write out the new Tablet Metadata and remove old rowsets.
   RETURN_NOT_OK_PREPEND(FlushMetadata(input.rowsets(), new_drs_metas, mrs_being_flushed),
                         "Failed to flush new tablet metadata");
+
+  // Now that we've completed the operation, mark any rowsets that have been
+  // compacted, preventing them from being considered for future compactions.
+  for (const auto& rs : input.rowsets()) {
+    rs->set_has_been_compacted();
+  }
 
   // Replace the compacted rowsets with the new on-disk rowsets, making them visible now that
   // their metadata was written to disk.
@@ -1379,14 +1655,14 @@ Status Tablet::HandleEmptyCompactionOrFlush(const RowSetVector& rowsets,
 }
 
 Status Tablet::Compact(CompactFlags flags) {
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
 
   RowSetsInCompaction input;
   // Step 1. Capture the rowsets to be merged
   RETURN_NOT_OK_PREPEND(PickRowSetsToCompact(&input, flags),
                         "Failed to pick rowsets to compact");
   LOG_WITH_PREFIX(INFO) << "Compaction: stage 1 complete, picked "
-                        << input.num_rowsets() << " rowsets to compact";
+                        << input.num_rowsets() << " rowsets to compact or flush";
   if (compaction_hooks_) {
     RETURN_NOT_OK_PREPEND(compaction_hooks_->PostSelectIterators(),
                           "PostSelectIterators hook failed");
@@ -1394,11 +1670,17 @@ Status Tablet::Compact(CompactFlags flags) {
 
   input.DumpToLog();
 
-  return DoMergeCompactionOrFlush(input,
-                                  TabletMetadata::kNoMrsFlushed);
+  return DoMergeCompactionOrFlush(input, TabletMetadata::kNoMrsFlushed);
 }
 
 void Tablet::UpdateCompactionStats(MaintenanceOpStats* stats) {
+
+  if (mvcc_.GetCleanTimestamp() == Timestamp::kInitialTimestamp) {
+    KLOG_EVERY_N_SECS(WARNING, 30) << LogPrefix() <<  "Can't schedule compaction. Clean time has "
+                                   << "not been advanced past its initial value.";
+    stats->set_runnable(false);
+    return;
+  }
 
   // TODO: use workload statistics here to find out how "hot" the tablet has
   // been in the last 5 minutes, and somehow scale the compaction quality
@@ -1443,21 +1725,23 @@ Status Tablet::DebugDump(vector<string> *lines) {
 }
 
 Status Tablet::CaptureConsistentIterators(
-  const Schema *projection,
-  const MvccSnapshot &snap,
-  const ScanSpec *spec,
-  OrderMode order,
-  vector<shared_ptr<RowwiseIterator> > *iters) const {
+    const Schema* projection,
+    const MvccSnapshot& snap,
+    const ScanSpec* spec,
+    OrderMode order,
+    vector<shared_ptr<RowwiseIterator>>* iters) const {
+
   shared_lock<rw_spinlock> l(component_lock_);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
 
   // Construct all the iterators locally first, so that if we fail
   // in the middle, we don't modify the output arguments.
-  vector<shared_ptr<RowwiseIterator> > ret;
+  vector<shared_ptr<RowwiseIterator>> ret;
 
   // Grab the memrowset iterator.
   gscoped_ptr<RowwiseIterator> ms_iter;
   RETURN_NOT_OK(components_->memrowset->NewRowIterator(projection, snap, order, &ms_iter));
-  ret.push_back(shared_ptr<RowwiseIterator>(ms_iter.release()));
+  ret.emplace_back(ms_iter.release());
 
   // Cull row-sets in the case of key-range queries.
   if (spec != nullptr && spec->lower_bound_key() && spec->exclusive_upper_bound_key()) {
@@ -1475,7 +1759,7 @@ Status Tablet::CaptureConsistentIterators(
       RETURN_NOT_OK_PREPEND(rs->NewRowIterator(projection, snap, order, &row_it),
                             Substitute("Could not create iterator for rowset $0",
                                        rs->ToString()));
-      ret.push_back(shared_ptr<RowwiseIterator>(row_it.release()));
+      ret.emplace_back(row_it.release());
     }
     ret.swap(*iters);
     return Status::OK();
@@ -1488,7 +1772,7 @@ Status Tablet::CaptureConsistentIterators(
     RETURN_NOT_OK_PREPEND(rs->NewRowIterator(projection, snap, order, &row_it),
                           Substitute("Could not create iterator for rowset $0",
                                      rs->ToString()));
-    ret.push_back(shared_ptr<RowwiseIterator>(row_it.release()));
+    ret.emplace_back(row_it.release());
   }
 
   // Swap results into the parameters.
@@ -1536,7 +1820,21 @@ size_t Tablet::MemRowSetLogReplaySize(const ReplaySizeMap& replay_size_map) cons
   return GetReplaySizeForIndex(comps->memrowset->MinUnflushedLogIndex(), replay_size_map);
 }
 
-size_t Tablet::EstimateOnDiskSize() const {
+size_t Tablet::OnDiskSize() const {
+  scoped_refptr<TabletComponents> comps;
+  GetComponents(&comps);
+
+  if (!comps) return 0;
+
+  size_t ret = metadata()->on_disk_size();
+  for (const shared_ptr<RowSet> &rowset : comps->rowsets->all_rowsets()) {
+    ret += rowset->OnDiskSize();
+  }
+
+  return ret;
+}
+
+size_t Tablet::OnDiskDataSize() const {
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
 
@@ -1544,9 +1842,8 @@ size_t Tablet::EstimateOnDiskSize() const {
 
   size_t ret = 0;
   for (const shared_ptr<RowSet> &rowset : comps->rowsets->all_rowsets()) {
-    ret += rowset->EstimateOnDiskSize();
+    ret += rowset->OnDiskBaseDataSize();
   }
-
   return ret;
 }
 
@@ -1589,7 +1886,8 @@ void Tablet::GetInfoForBestDMSToFlush(const ReplaySizeMap& replay_size_map,
   }
 }
 
-Status Tablet::FlushDMSWithHighestRetention(const ReplaySizeMap& replay_size_map) const {
+Status Tablet::FlushBestDMS(const ReplaySizeMap &replay_size_map) const {
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   shared_ptr<RowSet> rowset = FindBestDMSToFlush(replay_size_map);
   if (rowset) {
     return rowset->FlushDeltas();
@@ -1601,7 +1899,13 @@ shared_ptr<RowSet> Tablet::FindBestDMSToFlush(const ReplaySizeMap& replay_size_m
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
   int64_t mem_size = 0;
-  int64_t retention_size = 0;
+  double max_score = 0;
+  double mem_weight = 0;
+  // If system is under memory pressure, we use the percentage of the hard limit consumed
+  // as mem_weight, so the tighter memory, the higher weight. Otherwise just left the
+  // mem_weight to 0.
+  process_memory::UnderMemoryPressure(&mem_weight);
+
   shared_ptr<RowSet> best_dms;
   for (const shared_ptr<RowSet> &rowset : comps->rowsets->all_rowsets()) {
     if (rowset->DeltaMemStoreEmpty()) {
@@ -1609,11 +1913,13 @@ shared_ptr<RowSet> Tablet::FindBestDMSToFlush(const ReplaySizeMap& replay_size_m
     }
     int64_t size = GetReplaySizeForIndex(rowset->MinUnflushedLogIndex(),
                                          replay_size_map);
-    if ((size > retention_size) ||
-        (size == retention_size &&
-         (rowset->DeltaMemStoreSize() > mem_size))) {
-      mem_size = rowset->DeltaMemStoreSize();
-      retention_size = size;
+    int64_t mem = rowset->DeltaMemStoreSize();
+    double score = mem * mem_weight + size * (100 - mem_weight);
+
+    if ((score > max_score) ||
+        (score > max_score - 1 && mem > mem_size)) {
+      max_score = score;
+      mem_size = mem;
       best_dms = rowset;
     }
   }
@@ -1636,7 +1942,7 @@ int64_t Tablet::GetReplaySizeForIndex(int64_t min_log_index,
 }
 
 Status Tablet::FlushBiggestDMS() {
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
 
@@ -1653,7 +1959,7 @@ Status Tablet::FlushBiggestDMS() {
 }
 
 Status Tablet::FlushAllDMSForTests() {
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
   for (const auto& rowset : comps->rowsets->all_rowsets()) {
@@ -1664,7 +1970,7 @@ Status Tablet::FlushAllDMSForTests() {
 
 Status Tablet::MajorCompactAllDeltaStoresForTests() {
   LOG_WITH_PREFIX(INFO) << "Major compacting all delta stores, for tests";
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   scoped_refptr<TabletComponents> comps;
   GetComponents(&comps);
   for (const auto& rs : comps->rowsets->all_rowsets()) {
@@ -1678,7 +1984,7 @@ Status Tablet::MajorCompactAllDeltaStoresForTests() {
 }
 
 Status Tablet::CompactWorstDeltas(RowSet::DeltaCompactionType type) {
-  CHECK_EQ(state_, kOpen);
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   shared_ptr<RowSet> rs;
 
   // We're required to grab the rowset's compact_flush_lock under the compact_select_lock_.
@@ -1828,6 +2134,7 @@ Status Tablet::InitAncientUndoDeltas(MonoDelta time_budget, int64_t* bytes_in_an
 }
 
 Status Tablet::DeleteAncientUndoDeltas(int64_t* blocks_deleted, int64_t* bytes_deleted) {
+  RETURN_IF_STOPPED_OR_CHECK_STATE(kOpen);
   MonoTime tablet_delete_start = MonoTime::Now();
 
   Timestamp ancient_history_mark;
@@ -1967,6 +2274,7 @@ Tablet::Iterator::Iterator(const Tablet* tablet, const Schema& projection,
 Tablet::Iterator::~Iterator() {}
 
 Status Tablet::Iterator::Init(ScanSpec *spec) {
+  RETURN_NOT_OK(tablet_->CheckHasNotBeenStopped());
   DCHECK(iter_.get() == nullptr);
 
   RETURN_NOT_OK(tablet_->GetMappedReadProjection(projection_, &projection_));
@@ -1977,11 +2285,11 @@ Status Tablet::Iterator::Init(ScanSpec *spec) {
 
   switch (order_) {
     case ORDERED:
-      iter_.reset(new MergeIterator(projection_, iters));
+      iter_.reset(new MergeIterator(projection_, std::move(iters)));
       break;
     case UNORDERED:
     default:
-      iter_.reset(new UnionIterator(iters));
+      iter_.reset(new UnionIterator(std::move(iters)));
       break;
   }
 

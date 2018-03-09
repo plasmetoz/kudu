@@ -15,12 +15,18 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <ostream>
+#include <string>
+
 #include <gtest/gtest.h>
 #include <glog/logging.h>
-#include <strstream>
 
+#include "kudu/gutil/integral_types.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/gutil/spinlock.h"
 #include "kudu/util/spinlock_profiling.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/trace.h"
 
@@ -52,7 +58,7 @@ TEST_F(SpinLockProfilingTest, TestSpinlockProfiling) {
     ADOPT_TRACE(t.get());
     gutil::SubmitSpinLockProfileData(&lock, 4000000);
   }
-  string result = t->DumpToString();
+  std::string result = t->DumpToString();
   LOG(INFO) << "trace: " << result;
   ASSERT_STR_CONTAINS(result, "\"spinlock_wait_cycles\":4000000");
   // We can't assert more specifically because the CyclesPerSecond
@@ -71,7 +77,7 @@ TEST_F(SpinLockProfilingTest, TestStackCollection) {
   std::ostringstream str;
   int64_t dropped = 0;
   FlushSynchronizationProfile(&str, &dropped);
-  string s = str.str();
+  std::string s = str.str();
   ASSERT_STR_CONTAINS(s, "12345\t1 @ ");
   ASSERT_EQ(0, dropped);
 }

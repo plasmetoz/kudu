@@ -18,31 +18,34 @@
 #ifndef KUDU_FS_FILE_BLOCK_MANAGER_H
 #define KUDU_FS_FILE_BLOCK_MANAGER_H
 
+#include <cstdint>
 #include <memory>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
-#include "kudu/fs/block_id.h"
 #include "kudu/fs/block_manager.h"
-#include "kudu/fs/data_dirs.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/util/atomic.h"
+#include "kudu/util/file_cache.h"
 #include "kudu/util/locks.h"
 #include "kudu/util/random.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
+class BlockId;
 class Env;
-template <class FileType>
-class FileCache;
 class MemTracker;
-class MetricEntity;
 class RandomAccessFile;
-class WritableFile;
 
 namespace fs {
+class DataDirManager;
+class FsErrorManager;
+struct FsReport;
 
 namespace internal {
+class FileBlockDeletionTransaction;
 class FileBlockLocation;
 class FileReadableBlock;
 class FileWritableBlock;
@@ -62,47 +65,55 @@ struct BlockManagerMetrics;
 // resolved back into a filesystem path when the block is opened for reading.
 // The structure of this ID limits the block manager to at most 65,536 disks.
 //
-// When creating blocks, the block manager will round robin through the
-// available filesystem paths.
-//
-// TODO: Support path-based block placement hints.
+// When creating blocks, the block manager will place blocks based on the
+// provided CreateBlockOptions.
 
 // The file-backed block manager.
 class FileBlockManager : public BlockManager {
  public:
-
-  // Creates a new in-memory instance of a FileBlockManager.
-  //
-  // 'env' should remain alive for the lifetime of the block manager.
-  FileBlockManager(Env* env, const BlockManagerOptions& opts);
+  // Note: all objects passed as pointers should remain alive for the lifetime
+  // of the block manager.
+  FileBlockManager(Env* env,
+                   DataDirManager* dd_manager,
+                   FsErrorManager* error_manager,
+                   BlockManagerOptions opts);
 
   virtual ~FileBlockManager();
 
-  virtual Status Create() OVERRIDE;
+  Status Open(FsReport* report) override;
 
-  virtual Status Open() OVERRIDE;
+  Status CreateBlock(const CreateBlockOptions& opts,
+                     std::unique_ptr<WritableBlock>* block) override;
 
-  virtual Status CreateBlock(const CreateBlockOptions& opts,
-                             gscoped_ptr<WritableBlock>* block) OVERRIDE;
+  Status OpenBlock(const BlockId& block_id,
+                   std::unique_ptr<ReadableBlock>* block) override;
 
-  virtual Status CreateBlock(gscoped_ptr<WritableBlock>* block) OVERRIDE;
+  std::unique_ptr<BlockCreationTransaction> NewCreationTransaction() override;
 
-  virtual Status OpenBlock(const BlockId& block_id,
-                           gscoped_ptr<ReadableBlock>* block) OVERRIDE;
+  std::shared_ptr<BlockDeletionTransaction> NewDeletionTransaction() override;
 
-  virtual Status DeleteBlock(const BlockId& block_id) OVERRIDE;
+  Status GetAllBlockIds(std::vector<BlockId>* block_ids) override;
 
-  virtual Status CloseBlocks(const std::vector<WritableBlock*>& blocks) OVERRIDE;
+  void NotifyBlockId(BlockId block_id) override;
 
-  virtual Status GetAllBlockIds(std::vector<BlockId>* block_ids) OVERRIDE;
+  FsErrorManager* error_manager() override { return error_manager_; }
 
  private:
+  friend class internal::FileBlockDeletionTransaction;
   friend class internal::FileBlockLocation;
   friend class internal::FileReadableBlock;
   friend class internal::FileWritableBlock;
 
-  // Synchronizes the metadata for a block with the given id.
-  Status SyncMetadata(const internal::FileBlockLocation& block_id);
+  // Deletes an existing block, allowing its space to be reclaimed by the
+  // filesystem. The change is immediately made durable.
+  //
+  // Blocks may be deleted while they are open for reading or writing;
+  // the actual deletion will take place after the last open reader or
+  // writer is closed.
+  Status DeleteBlock(const BlockId& block_id);
+
+  // Synchronizes the metadata for a block with the given location.
+  Status SyncMetadata(const internal::FileBlockLocation& location);
 
   // Looks up the path of the file backing a particular block ID.
   //
@@ -114,18 +125,22 @@ class FileBlockManager : public BlockManager {
   // For manipulating files.
   Env* env_;
 
-  // If true, only read operations are allowed.
-  const bool read_only_;
+  // Manages and owns the data directories in which the block manager will
+  // place its blocks.
+  DataDirManager* dd_manager_;
 
-  // Manages and owns all of the block manager's data directories.
-  DataDirManager dd_manager_;
+  // Manages callbacks used to handle disk failure.
+  FsErrorManager* error_manager_;
+
+  // The options that the FileBlockManager was created with.
+  const BlockManagerOptions opts_;
 
   // Manages files opened for reading.
-  std::unique_ptr<FileCache<RandomAccessFile>> file_cache_;
+  FileCache<RandomAccessFile> file_cache_;
 
   // For generating block IDs.
   ThreadSafeRandom rand_;
-  AtomicInt<int64_t> next_block_id_;
+  AtomicInt<uint64_t> next_block_id_;
 
   // Protects 'dirty_dirs_'.
   mutable simple_spinlock lock_;
@@ -136,7 +151,7 @@ class FileBlockManager : public BlockManager {
 
   // Metric container for the block manager.
   // May be null if instantiated without metrics.
-  gscoped_ptr<internal::BlockManagerMetrics> metrics_;
+  std::unique_ptr<internal::BlockManagerMetrics> metrics_;
 
   // Tracks memory consumption of any allocations numerous enough to be
   // interesting.

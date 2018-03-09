@@ -18,30 +18,44 @@
 #ifndef KUDU_CONSENSUS_LOG_H_
 #define KUDU_CONSENSUS_LOG_H_
 
+#include <atomic>
+#include <cstddef>
+#include <cstdint>
 #include <limits>
 #include <map>
 #include <memory>
 #include <string>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
 #include "kudu/common/schema.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/log.pb.h"
 #include "kudu/consensus/log_util.h"
-#include "kudu/consensus/opid_util.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/ref_counted_replicate.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
-#include "kudu/gutil/spinlock.h"
-#include "kudu/util/async_util.h"
 #include "kudu/util/blocking_queue.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/rw_mutex.h"
 #include "kudu/util/promise.h"
+#include "kudu/util/rw_mutex.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
+#include "kudu/util/status_callback.h"
 
 namespace kudu {
 
+class CompressionCodec;
 class FsManager;
 class MetricEntity;
 class ThreadPool;
+class WritableFile;
+struct WritableFileOptions;
 
 namespace log {
 
@@ -58,24 +72,12 @@ typedef BlockingQueue<LogEntryBatch*, LogEntryBatchLogicalSize> LogEntryBatchQue
 // Kudu as a normal Write Ahead Log and also plays the role of persistent
 // storage for the consensus state machine.
 //
-// Note: This class is not thread safe, the caller is expected to synchronize
-// Log::Reserve() and Log::Append() calls.
-//
 // Log uses group commit to improve write throughput and latency
-// without compromising ordering and durability guarantees.
+// without compromising ordering and durability guarantees. A single background
+// thread per Log instance is responsible for accumulating pending writes
+// and flushing them to the log.
 //
-// To add operations to the log, the caller must obtain the lock and
-// call Reserve() with the collection of operations to be added. Then,
-// the caller may release the lock and call AsyncAppend(). Reserve()
-// reserves a slot on a queue for the log entry; AsyncAppend()
-// indicates that the entry in the slot is safe to write to disk and
-// adds a callback that will be invoked once the entry is written and
-// synchronized to disk.
-//
-// For sample usage see mt-log-test.cc
-//
-// Methods on this class are _not_ thread-safe and must be externally
-// synchronized unless otherwise noted.
+// This class is thread-safe unless otherwise noted.
 //
 // Note: The Log needs to be Close()d before any log-writing class is
 // destroyed, otherwise the Log might hold references to these classes
@@ -99,31 +101,13 @@ class Log : public RefCountedThreadSafe<Log> {
 
   ~Log();
 
-  // Reserves a spot in the log's queue for 'entry_batch'.
-  //
-  // 'reserved_entry' is initialized by this method and any resources
-  // associated with it will be released in AsyncAppend().  In order
-  // to ensure correct ordering of operations across multiple threads,
-  // calls to this method must be externally synchronized.
-  //
-  // WARNING: the caller _must_ call AsyncAppend() or else the log
-  // will "stall" and will never be able to make forward progress.
-  Status Reserve(LogEntryTypePB type,
-                 gscoped_ptr<LogEntryBatchPB> entry_batch,
-                 LogEntryBatch** reserved_entry);
-
-  // Asynchronously appends 'entry_batch' to the log. Once the append
-  // completes and is synced, 'callback' will be invoked.
-  void AsyncAppend(LogEntryBatch* entry_batch,
-                   const StatusCallback& callback);
-
   // Synchronously append a new entry to the log.
   // Log does not take ownership of the passed 'entry'.
   Status Append(LogEntryPB* entry);
 
   // Append the given set of replicate messages, asynchronously.
   // This requires that the replicates have already been assigned OpIds.
-  Status AsyncAppendReplicates(const vector<consensus::ReplicateRefPtr>& replicates,
+  Status AsyncAppendReplicates(const std::vector<consensus::ReplicateRefPtr>& replicates,
                                const StatusCallback& callback);
 
   // Append the given commit message, asynchronously.
@@ -186,10 +170,6 @@ class Log : public RefCountedThreadSafe<Log> {
     return tablet_id_;
   }
 
-  // Gets the last-used OpId written to the log.
-  // If no entry has ever been written to the log, returns (0, 0)
-  void GetLatestEntryOpId(consensus::OpId* op_id) const;
-
   // Runs the garbage collector on the set of previous segments. Segments that
   // only refer to in-mem state that has been flushed are candidates for
   // garbage collection.
@@ -227,10 +207,17 @@ class Log : public RefCountedThreadSafe<Log> {
   // Note that the returned values are in units of bytes, not MB.
   void GetReplaySizeMap(std::map<int64_t, int64_t>* replay_size) const;
 
+  // Returns the total size of the current segments, in bytes.
+  // Returns 0 if the log is shut down.
+  int64_t OnDiskSize();
+
   // Returns the file system location of the currently active WAL segment.
   const std::string& ActiveSegmentPathForTests() const {
     return active_segment_->path();
   }
+
+  // Return true if the append thread is currently active.
+  bool append_thread_active_for_tests() const;
 
   // Forces the Log to allocate a new segment and roll over.
   // This can be used to make sure all entries appended up to this point are
@@ -281,6 +268,15 @@ class Log : public RefCountedThreadSafe<Log> {
   // Make segments roll over.
   Status RollOver();
 
+  static Status CreateBatchFromPB(LogEntryTypePB type,
+                                  std::unique_ptr<LogEntryBatchPB> entry_batch_pb,
+                                  std::unique_ptr<LogEntryBatch>* entry_batch);
+
+  // Asynchronously appends 'entry_batch' to the log. Once the append
+  // completes and is synced, 'callback' will be invoked.
+  Status AsyncAppend(std::unique_ptr<LogEntryBatch> entry_batch,
+                     const StatusCallback& callback);
+
   // Writes the footer and closes the current segment.
   Status CloseCurrentSegment();
 
@@ -300,9 +296,7 @@ class Log : public RefCountedThreadSafe<Log> {
   Status PreAllocateNewSegment();
 
   // Writes serialized contents of 'entry' to the log. Called inside
-  // AppenderThread. If 'caller_owns_operation' is true, then the
-  // 'operation' field of the entry will be released after the entry
-  // is appended.
+  // AppenderThread.
   Status DoAppend(LogEntryBatch* entry_batch);
 
   // Update footer_builder_ to reflect the log indexes seen in 'batch'.
@@ -376,14 +370,6 @@ class Log : public RefCountedThreadSafe<Log> {
   // of the operation in the log.
   scoped_refptr<LogIndex> log_index_;
 
-  // Lock to protect last_entry_op_id_, which is constantly written but
-  // read occasionally by things like consensus and log GC.
-  mutable rw_spinlock last_entry_op_id_lock_;
-
-  // The last known OpId for a REPLICATE message appended to this log
-  // (any segment). NOTE: this op is not necessarily durable.
-  consensus::OpId last_entry_op_id_;
-
   // A footer being prepared for the current segment.
   // When the segment is closed, it will be written.
   LogSegmentFooterPB footer_builder_;
@@ -391,8 +377,8 @@ class Log : public RefCountedThreadSafe<Log> {
   // The maximum segment size, in bytes.
   uint64_t max_segment_size_;
 
-  // The queue used to communicate between the thread calling
-  // Reserve() and the Log Appender thread
+  // The queue used to communicate between the threads appending operations
+  // and the thread which actually appends them to the log.
   LogEntryBatchQueue entry_batch_queue_;
 
   // Thread writing to the log
@@ -421,6 +407,9 @@ class Log : public RefCountedThreadSafe<Log> {
   gscoped_ptr<LogMetrics> metrics_;
 
   std::shared_ptr<LogFaultHooks> log_hooks_;
+
+  // The cached on-disk size of the log, used to track its size even if it has been closed.
+  std::atomic<int64_t> on_disk_size_;
 
   DISALLOW_COPY_AND_ASSIGN(Log);
 };
@@ -468,7 +457,8 @@ class LogEntryBatch {
   friend class MultiThreadedLogTest;
 
   LogEntryBatch(LogEntryTypePB type,
-                gscoped_ptr<LogEntryBatchPB> entry_batch_pb, size_t count);
+                std::unique_ptr<LogEntryBatchPB> entry_batch_pb,
+                size_t count);
 
   // Serializes contents of the entry to an internal buffer.
   void Serialize();
@@ -485,27 +475,10 @@ class LogEntryBatch {
     return callback_;
   }
 
-  bool failed_to_append() const {
-    return state_ == kEntryFailedToAppend;
-  }
-
-  void set_failed_to_append() {
-    state_ = kEntryFailedToAppend;
-  }
-
-  // Mark the entry as reserved, but not yet ready to write to the log.
-  void MarkReserved();
-
-  // Mark the entry as ready to write to log.
-  void MarkReady();
-
-  // Wait (currently, by spinning on ready_lock_) until ready.
-  void WaitForReady();
 
   // Returns a Slice representing the serialized contents of the
   // entry.
   Slice data() const {
-    DCHECK_EQ(state_, kEntryReady);
     return Slice(buffer_);
   }
 
@@ -525,7 +498,7 @@ class LogEntryBatch {
     return entry_batch_pb_->entry(idx).replicate().id();
   }
 
-  void SetReplicates(const vector<consensus::ReplicateRefPtr>& replicates) {
+  void SetReplicates(const std::vector<consensus::ReplicateRefPtr>& replicates) {
     replicates_ = replicates;
   }
 
@@ -533,7 +506,7 @@ class LogEntryBatch {
   const LogEntryTypePB type_;
 
   // Contents of the log entries that will be written to disk.
-  gscoped_ptr<LogEntryBatchPB> entry_batch_pb_;
+  std::unique_ptr<LogEntryBatchPB> entry_batch_pb_;
 
    // Total size in bytes of all entries
   const uint32_t total_size_bytes_;
@@ -545,31 +518,15 @@ class LogEntryBatch {
   // Used only when type is REPLICATE, this makes sure there's at
   // least a reference to each replicate message until we're finished
   // appending.
-  vector<consensus::ReplicateRefPtr> replicates_;
+  std::vector<consensus::ReplicateRefPtr> replicates_;
 
   // Callback to be invoked upon the entries being written and
   // synced to disk.
   StatusCallback callback_;
 
-  // Used to coordinate the synchronizer thread and the caller
-  // thread: this lock starts out locked, and is unlocked by the
-  // caller thread (i.e., inside AppendThread()) once the entry is
-  // fully initialized (once the callback is set and data is
-  // serialized)
-  base::SpinLock ready_lock_;
-
   // Buffer to which 'phys_entries_' are serialized by call to
   // 'Serialize()'
   faststring buffer_;
-
-  enum LogEntryState {
-    kEntryInitialized,
-    kEntryReserved,
-    kEntrySerialized,
-    kEntryReady,
-    kEntryFailedToAppend
-  };
-  LogEntryState state_;
 
   DISALLOW_COPY_AND_ASSIGN(LogEntryBatch);
 };

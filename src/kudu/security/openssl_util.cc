@@ -17,25 +17,31 @@
 
 #include "kudu/security/openssl_util.h"
 
+#include <cerrno>
+#include <cstdint>
 #include <cstdio>
-#include <cstdlib>
 #include <mutex>
-#include <sstream>
 #include <string>
+#include <vector>
 
 #include <glog/logging.h>
+#include <openssl/crypto.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
-#include <openssl/ssl.h>
 
+#include "kudu/gutil/strings/split.h"
+#include "kudu/gutil/strings/strip.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/debug/leakcheck_disabler.h"
 #include "kudu/util/errno.h"
 #include "kudu/util/mutex.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/status.h"
-#include "kudu/util/thread.h"
+#include "kudu/util/subprocess.h"
 
 using std::ostringstream;
 using std::string;
+using std::vector;
 
 namespace kudu {
 namespace security {
@@ -77,12 +83,16 @@ Status CheckOpenSSLInitialized() {
   }
   auto ctx = ssl_make_unique(SSL_CTX_new(SSLv23_method()));
   if (!ctx) {
+    ERR_clear_error();
     return Status::RuntimeError("SSL library appears uninitialized (cannot create SSL_CTX)");
   }
   return Status::OK();
 }
 
 void DoInitializeOpenSSL() {
+  // In case the user's thread has left some error around, clear it.
+  ERR_clear_error();
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   if (g_disable_ssl_init) {
     VLOG(2) << "Not initializing OpenSSL (disabled by application)";
     return;
@@ -102,6 +112,10 @@ void DoInitializeOpenSSL() {
     // which we check before overriding. They aren't thread-safe, however -- that's why
     // we try to get embedding applications to do the right thing here rather than risk a
     // potential initialization race.
+  } else {
+    // As expected, SSL is not initialized, so SSL_CTX_new() failed. Make sure
+    // it didn't leave anything in our error queue.
+    ERR_clear_error();
   }
 
   SSL_load_error_strings();
@@ -125,6 +139,70 @@ void DoInitializeOpenSSL() {
 }
 
 } // anonymous namespace
+
+// Reads a STACK_OF(X509) from the BIO and returns it.
+STACK_OF(X509)* PEM_read_STACK_OF_X509(BIO* bio, void* /* unused */, pem_password_cb* /* unused */,
+    void* /* unused */) {
+  // Extract information from the chain certificate.
+  STACK_OF(X509_INFO)* info = PEM_X509_INFO_read_bio(bio, nullptr, nullptr, nullptr);
+  if (!info) return nullptr;
+  SCOPED_CLEANUP({
+    sk_X509_INFO_pop_free(info, X509_INFO_free);
+  });
+
+  // Initialize the Stack.
+  STACK_OF(X509)* sk = sk_X509_new_null();
+
+  // Iterate through the chain certificate and add each one to the stack.
+  for (int i = 0; i < sk_X509_INFO_num(info); ++i) {
+    X509_INFO *stack_item = sk_X509_INFO_value(info, i);
+    sk_X509_push(sk, stack_item->x509);
+    // We don't want the ScopedCleanup to free the x509 certificates as well since we will
+    // use it as a part of the STACK_OF(X509) object to be returned, so we set it to nullptr.
+    // We will take the responsibility of freeing it when we are done with the STACK_OF(X509).
+    stack_item->x509 = nullptr;
+  }
+  return sk;
+}
+
+// Writes a STACK_OF(X509) to the BIO.
+int PEM_write_STACK_OF_X509(BIO* bio, STACK_OF(X509)* obj) {
+  int chain_len = sk_X509_num(obj);
+  // Iterate through the stack and add each one to the BIO.
+  for (int i = 0; i < chain_len; ++i) {
+    X509* cert_item = sk_X509_value(obj, i);
+    int ret = PEM_write_bio_X509(bio, cert_item);
+    if (ret <= 0) return ret;
+  }
+  return 1;
+}
+
+// Reads a single X509 certificate and returns a STACK_OF(X509) with the single certificate.
+STACK_OF(X509)* DER_read_STACK_OF_X509(BIO* bio, void* /* unused */) {
+  // We don't support chain certificates written in DER format.
+  auto x = ssl_make_unique(d2i_X509_bio(bio, nullptr));
+  if (!x) return nullptr;
+  STACK_OF(X509)* sk = sk_X509_new_null();
+  if (sk_X509_push(sk, x.get()) == 0) {
+    return nullptr;
+  }
+  x.release();
+  return sk;
+}
+
+// Writes a single X509 certificate that it gets from the STACK_OF(X509) 'obj'.
+int DER_write_STACK_OF_X509(BIO* bio, STACK_OF(X509)* obj) {
+  int chain_len = sk_X509_num(obj);
+  // We don't support chain certificates written in DER format.
+  DCHECK_EQ(chain_len, 1);
+  X509* cert_item = sk_X509_value(obj, 0);
+  if (cert_item == nullptr) return 0;
+  return i2d_X509_bio(bio, cert_item);
+}
+
+void free_STACK_OF_X509(STACK_OF(X509)* sk) {
+  sk_X509_pop_free(sk, X509_free);
+}
 
 Status DisableOpenSSLInitialization() {
   if (g_disable_ssl_init) return Status::OK();
@@ -197,6 +275,22 @@ const string& DataFormatToString(DataFormat fmt) {
     default:
       return kStrFormatUnknown;
   }
+}
+
+Status GetPasswordFromShellCommand(const string& cmd, string* password) {
+  vector<string> argv = strings::Split(cmd, " ", strings::SkipEmpty());
+  if (argv.empty()) {
+    return Status::RuntimeError("invalid empty private key password command");
+  }
+  string stderr, stdout;
+  Status s = Subprocess::Call(argv, "" /* stdin */, &stdout, &stderr);
+  if (!s.ok()) {
+    return Status::RuntimeError(strings::Substitute(
+        "failed to run private key password command: $0", s.ToString()), stderr);
+  }
+  StripTrailingWhitespace(&stdout);
+  *password = stdout;
+  return Status::OK();
 }
 
 } // namespace security

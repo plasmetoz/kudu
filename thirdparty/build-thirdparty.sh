@@ -82,6 +82,7 @@ else
       "snappy")       F_SNAPPY=1 ;;
       "zlib")         F_ZLIB=1 ;;
       "squeasel")     F_SQUEASEL=1 ;;
+      "mustache")     F_MUSTACHE=1 ;;
       "gsg")          F_GSG=1 ;;
       "gcovr")        F_GCOVR=1 ;;
       "curl")         F_CURL=1 ;;
@@ -92,6 +93,12 @@ else
       "nvml")         F_NVML=1 ;;
       "boost")        F_BOOST=1 ;;
       "breakpad")     F_BREAKPAD=1 ;;
+      "sparsehash")   F_SPARSEHASH=1 ;;
+      "sparsepp")     F_SPARSEPP=1 ;;
+      "thrift")       F_THRIFT=1 ;;
+      "bison")        F_BISON=1 ;;
+      "hadoop")       F_HADOOP=1 ;;
+      "hive")         F_HIVE=1 ;;
       *)              echo "Unknown module: $arg"; exit 1 ;;
     esac
   done
@@ -118,7 +125,7 @@ for PREFIX_DIR in $PREFIX_COMMON $PREFIX_DEPS $PREFIX_DEPS_TSAN; do
     # On some systems, autotools installs libraries to lib64 rather than lib.  Fix
     # this by setting up lib64 as a symlink to lib.  We have to do this step first
     # to handle cases where one third-party library depends on another.
-    ln -sf "$PREFIX_DIR/lib" "$PREFIX_DIR/lib64"
+    ln -nsf "$PREFIX_DIR/lib" "$PREFIX_DIR/lib64"
   fi
 done
 
@@ -189,6 +196,15 @@ else
   exit 1
 fi
 
+### Detect and enable 'ninja' instead of 'make' for faster builds.
+if which ninja-build > /dev/null ; then
+  NINJA=ninja-build
+  EXTRA_CMAKE_FLAGS=-GNinja
+elif which ninja > /dev/null ; then
+  NINJA=ninja
+  EXTRA_CMAKE_FLAGS=-GNinja
+fi
+
 ### Build common tools and header-only libraries
 
 PREFIX=$PREFIX_COMMON
@@ -215,6 +231,30 @@ fi
 
 if [ -n "$F_COMMON" -o -n "$F_TRACE_VIEWER" ]; then
   build_trace_viewer
+fi
+
+if [ -n "$F_COMMON" -o -n "$F_SPARSEHASH" ]; then
+  build_sparsehash
+fi
+
+if [ -n "$F_COMMON" -o -n "$F_SPARSEPP" ]; then
+  build_sparsepp
+fi
+
+if [ -n "$F_COMMON" -o -n "$F_BISON" ]; then
+  build_bison
+fi
+
+# Install Hadoop and Hive by symlinking their source directories (which are
+# pre-built) into $PREFIX/opt.
+if [ -n "$F_COMMON" -o -n "$F_HADOOP" ]; then
+  mkdir -p $PREFIX/opt
+  ln -nsf $HADOOP_SOURCE $PREFIX/opt/hadoop
+fi
+
+if [ -n "$F_COMMON" -o -n "$F_HIVE" ]; then
+  mkdir -p $PREFIX/opt
+  ln -nsf $HIVE_SOURCE $PREFIX/opt/hive
 fi
 
 ### Build C dependencies without instrumentation
@@ -310,8 +350,16 @@ if [ -n "$F_UNINSTRUMENTED" -o -n "$F_BOOST" ]; then
   build_boost normal
 fi
 
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_MUSTACHE" ]; then
+  build_mustache
+fi
+
 if [ -n "$F_UNINSTRUMENTED" -o -n "$F_BREAKPAD" ]; then
   build_breakpad
+fi
+
+if [ -n "$F_UNINSTRUMENTED" -o -n "$F_THRIFT" ]; then
+  build_thrift
 fi
 
 restore_env
@@ -457,10 +505,6 @@ if [ -n "$F_TSAN" -o -n "$F_GLOG" ]; then
   build_glog
 fi
 
-if [ -n "$F_TSAN" -o -n "$F_GPERFTOOLS" ]; then
-  build_gperftools
-fi
-
 if [ -n "$F_TSAN" -o -n "$F_GMOCK" ]; then
   build_gmock
 fi
@@ -477,8 +521,16 @@ if [ -n "$F_TSAN" -o -n "$F_BOOST" ]; then
   build_boost tsan
 fi
 
+if [ -n "$F_TSAN" -o -n "$F_MUSTACHE" ]; then
+  build_mustache
+fi
+
 if [ -n "$F_TSAN" -o -n "$F_BREAKPAD" ]; then
   build_breakpad
+fi
+
+if [ -n "$F_TSAN" -o -n "$F_THRIFT" ]; then
+  build_thrift
 fi
 
 restore_env

@@ -17,52 +17,75 @@
 
 #include "kudu/client/batcher.h"
 
-#include <algorithm>
+#include <cstddef>
 #include <memory>
 #include <mutex>
+#include <ostream>
 #include <set>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 
-#include <boost/bind.hpp>
 #include <glog/logging.h>
 
 #include "kudu/client/callbacks.h"
-#include "kudu/client/client.h"
 #include "kudu/client/client-internal.h"
+#include "kudu/client/client.h"
 #include "kudu/client/error_collector.h"
 #include "kudu/client/meta_cache.h"
+#include "kudu/client/schema.h"
 #include "kudu/client/session-internal.h"
-#include "kudu/client/write_op.h"
+#include "kudu/client/shared_ptr.h"
 #include "kudu/client/write_op-internal.h"
-#include "kudu/common/encoded_key.h"
+#include "kudu/client/write_op.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/partition.h"
 #include "kudu/common/row_operations.h"
 #include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/atomic_refcount.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
+#include "kudu/gutil/gscoped_ptr.h"
 #include "kudu/gutil/map-util.h"
+#include "kudu/gutil/move.h"
 #include "kudu/gutil/stl_util.h"
-#include "kudu/gutil/strings/human_readable.h"
-#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/rpc/messenger.h"
-#include "kudu/rpc/request_tracker.h"
+#include "kudu/rpc/connection.h"
+#include "kudu/rpc/response_callback.h"
 #include "kudu/rpc/retriable_rpc.h"
 #include "kudu/rpc/rpc.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tserver/tserver.pb.h"
 #include "kudu/tserver/tserver_service.proxy.h"
-#include "kudu/util/debug-util.h"
 #include "kudu/util/logging.h"
 #include "kudu/util/pb_util.h"
 
 using std::pair;
 using std::set;
 using std::shared_ptr;
+using std::string;
 using std::unique_ptr;
 using std::unordered_map;
+using std::vector;
 using strings::Substitute;
 
 namespace kudu {
 
+class KuduPartialRow;
+class Schema;
+
+namespace rpc {
+class Messenger;
+class RequestTracker;
+}
+
+using pb_util::SecureDebugString;
+using pb_util::SecureShortDebugString;
+using rpc::CredentialsPolicy;
 using rpc::ErrorStatusPB;
 using rpc::Messenger;
 using rpc::RequestTracker;
@@ -218,6 +241,7 @@ class WriteRpc : public RetriableRpc<RemoteTabletServer, WriteRequestPB, WriteRe
   void Try(RemoteTabletServer* replica, const ResponseCallback& callback) override;
   RetriableRpcStatus AnalyzeResponse(const Status& rpc_cb_status) override;
   void Finish(const Status& status) override;
+  bool GetNewAuthnTokenAndRetry() override;
 
  private:
   // Pointer back to the batcher. Processes the write response when it
@@ -337,19 +361,36 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
     result.status = mutable_retrier()->controller().status();
   }
 
+  // Check for specific RPC errors.
   if (result.status.IsRemoteError()) {
     const ErrorStatusPB* err = mutable_retrier()->controller().error_response();
-    if (err &&
-        err->has_code() &&
-        err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY) {
-      result.result = RetriableRpcStatus::SERVER_BUSY;
+    if (err && err->has_code() &&
+        (err->code() == ErrorStatusPB::ERROR_SERVER_TOO_BUSY ||
+         err->code() == ErrorStatusPB::ERROR_UNAVAILABLE)) {
+      result.result = RetriableRpcStatus::SERVICE_UNAVAILABLE;
+      return result;
+    }
+  }
+
+  if (result.status.IsServiceUnavailable()) {
+    result.result = RetriableRpcStatus::SERVICE_UNAVAILABLE;
+    return result;
+  }
+
+  // Check whether it's an invalid authn token. That's the error code the server
+  // sends back if authn token is expired.
+  if (result.status.IsNotAuthorized()) {
+    const ErrorStatusPB* err = mutable_retrier()->controller().error_response();
+    if (err && err->has_code() &&
+        err->code() == ErrorStatusPB::FATAL_INVALID_AUTHENTICATION_TOKEN) {
+      result.result = RetriableRpcStatus::INVALID_AUTHENTICATION_TOKEN;
       return result;
     }
   }
 
   // Failover to a replica in the event of any network failure or of a DNS resolution problem.
   //
-  // TODO: This is probably too harsh; some network failures should be
+  // TODO(adar): This is probably too harsh; some network failures should be
   // retried on the current replica.
   if (result.status.IsNetworkError()) {
     result.result = RetriableRpcStatus::SERVER_NOT_ACCESSIBLE;
@@ -381,12 +422,35 @@ RetriableRpcStatus WriteRpc::AnalyzeResponse(const Status& rpc_cb_status) {
     return result;
   }
 
+  // Handle the connection negotiation failure case if overall RPC's timeout
+  // hasn't expired yet: if the connection negotiation returned non-OK status,
+  // mark the server as not accessible and rely on the RetriableRpc's logic
+  // to switch to an alternative tablet replica.
+  //
+  // NOTE: Connection negotiation errors related to security are handled in the
+  //       code above: see the handlers for IsNotAuthorized(), IsRemoteError().
+  if (!rpc_cb_status.IsTimedOut() && !result.status.ok() &&
+      mutable_retrier()->controller().negotiation_failed()) {
+    result.result = RetriableRpcStatus::SERVER_NOT_ACCESSIBLE;
+    return result;
+  }
+
   if (result.status.ok()) {
     result.result = RetriableRpcStatus::OK;
   } else {
     result.result = RetriableRpcStatus::NON_RETRIABLE_ERROR;
   }
   return result;
+}
+
+bool WriteRpc::GetNewAuthnTokenAndRetry() {
+  // To get a new authn token it's necessary to authenticate with the master
+  // using any other credentials but already existing authn token.
+  KuduClient* c = batcher_->client_;
+  c->data_->ConnectToClusterAsync(c, retrier().deadline(),
+      Bind(&RetriableRpc::GetNewAuthnTokenAndRetryCb, Unretained(this)),
+      CredentialsPolicy::PRIMARY_CREDENTIALS);
+  return true;
 }
 
 Batcher::Batcher(KuduClient* client,
@@ -577,8 +641,7 @@ void Batcher::MarkInFlightOpFailed(InFlightOp* op, const Status& s) {
 void Batcher::MarkInFlightOpFailedUnlocked(InFlightOp* op, const Status& s) {
   CHECK_EQ(1, ops_.erase(op))
     << "Could not remove op " << op->ToString() << " from in-flight list";
-  gscoped_ptr<KuduError> error(new KuduError(op->write_op.release(), s));
-  error_collector_->AddError(std::move(error));
+  error_collector_->AddError(unique_ptr<KuduError>(new KuduError(op->write_op.release(), s)));
   had_errors_ = true;
   delete op;
 }
@@ -727,7 +790,7 @@ void Batcher::ProcessWriteResponse(const WriteRpc& rpc,
   } else {
     // Mark each of the rows in the write op as failed, since the whole RPC failed.
     for (InFlightOp* op : rpc.ops()) {
-      gscoped_ptr<KuduError> error(new KuduError(op->write_op.release(), s));
+      unique_ptr<KuduError> error(new KuduError(op->write_op.release(), s));
       error_collector_->AddError(std::move(error));
     }
 
@@ -751,7 +814,7 @@ void Batcher::ProcessWriteResponse(const WriteRpc& rpc,
     VLOG(2) << "Error on op " << op->ToString() << ": "
             << SecureShortDebugString(err_pb.error());
     Status op_status = StatusFromPB(err_pb.error());
-    gscoped_ptr<KuduError> error(new KuduError(op.release(), op_status));
+    unique_ptr<KuduError> error(new KuduError(op.release(), op_status));
     error_collector_->AddError(std::move(error));
     MarkHadErrors();
   }

@@ -17,32 +17,37 @@
 
 #pragma once
 
+#include <cstdint>
 #include <map>
 #include <memory>
+#include <ostream>
 #include <string>
 #include <vector>
 
 #include <glog/logging.h>
 
+#include "kudu/gutil/port.h"
 #include "kudu/util/status.h"
 
 namespace kudu {
 
-class Env;
 class Subprocess;
 
 struct MiniKdcOptions {
 
   // Kerberos Realm.
-  // Default: "KRBTEST.COM"
+  //
+  // Default: "KRBTEST.COM".
   std::string realm;
 
   // Directory in which to store data.
+  //
   // Default: "", which auto-generates a unique path for this KDC.
   // The default may only be used from a gtest unit test.
   std::string data_root;
 
   // KDC port.
+  //
   // Default: 0 (ephemeral port).
   uint16_t port = 0;
 
@@ -62,7 +67,7 @@ class MiniKdc {
   MiniKdc();
 
   // Creates a new MiniKdc with the provided options.
-  explicit MiniKdc(const MiniKdcOptions& options);
+  explicit MiniKdc(MiniKdcOptions options);
 
   ~MiniKdc();
 
@@ -121,10 +126,6 @@ class MiniKdc {
 
   // Creates a krb5.conf in the data root.
   Status CreateKdcConf() const WARN_UNUSED_RESULT;
-
-  // Determine the ports that the KDC bound to. Will wait for the KDC if it is
-  // still initializing.
-  Status WaitForKdcPorts() WARN_UNUSED_RESULT;
 
   std::unique_ptr<Subprocess> kdc_process_;
   MiniKdcOptions options_;

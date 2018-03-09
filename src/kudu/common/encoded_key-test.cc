@@ -17,15 +17,27 @@
 
 #include "kudu/common/encoded_key.h"
 
+#include <cstdint>
+#include <string>
+
 #include <gtest/gtest.h>
 
-#include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/slice.h"
-#include "kudu/util/stopwatch.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/key_encoder.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/strings/substitute.h" // IWYU pragma: keep
+#include "kudu/util/faststring.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/memory/arena.h"
 #include "kudu/util/random.h"
 #include "kudu/util/random_util.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/stopwatch.h" // IWYU pragma: keep
 #include "kudu/util/test_util.h"
 #include "kudu/util/test_macros.h"
+
+using std::string;
 
 namespace kudu {
 
@@ -162,6 +174,18 @@ TEST_F(EncodedKeyTest, TestDecodeSimpleKeys) {
   }
 
   {
+    int128_t val = INT128_MAX;
+    EXPECT_DECODED_KEY_EQ(INT128, "(int128 key=170141183460469231731687303715884105727)",
+                          "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff", &val);
+  }
+
+  {
+    int128_t val = -1234567891011121314;
+    EXPECT_DECODED_KEY_EQ(INT128, "(int128 key=-1234567891011121314)",
+                          "\x7f\xff\xff\xff\xff\xff\xff\xff\xee\xdd\xef\x0b\x4d\x2d\xcf\x5e", &val);
+  }
+
+  {
     Slice val("aKey");
     EXPECT_DECODED_KEY_EQ(STRING, R"((string key="aKey"))", "aKey", &val);
   }
@@ -223,7 +247,7 @@ TEST_F(EncodedKeyTest, TestDecodeCompoundKeys) {
 
 TEST_F(EncodedKeyTest, TestConstructFromEncodedString) {
   gscoped_ptr<EncodedKey> key;
-  Arena arena(1024, 1024*1024);
+  Arena arena(1024);
 
   {
     // Integer type compound key.
@@ -248,7 +272,7 @@ TEST_F(EncodedKeyTest, TestRandomStringEncoding) {
   Random r(SeedRandom());
   char buf[80];
   faststring encoded;
-  Arena arena(1024, 1024);
+  Arena arena(1024);
   for (int i = 0; i < 10000; i++) {
     encoded.clear();
     arena.Reset();

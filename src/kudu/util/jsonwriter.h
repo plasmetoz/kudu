@@ -17,8 +17,9 @@
 #ifndef KUDU_UTIL_JSONWRITER_H
 #define KUDU_UTIL_JSONWRITER_H
 
-#include <inttypes.h>
-
+#include <cstddef>
+#include <cstdint>
+#include <iosfwd>
 #include <memory>
 #include <string>
 
@@ -26,8 +27,9 @@
 
 namespace google {
 namespace protobuf {
-class Message;
 class FieldDescriptor;
+class Message;
+class Reflection;
 } // namespace protobuf
 } // namespace google
 
@@ -84,8 +86,10 @@ class JsonWriter {
 
  private:
   void ProtobufField(const google::protobuf::Message& pb,
+                     const google::protobuf::Reflection* reflection,
                      const google::protobuf::FieldDescriptor* field);
   void ProtobufRepeatedField(const google::protobuf::Message& pb,
+                             const google::protobuf::Reflection* reflection,
                              const google::protobuf::FieldDescriptor* field,
                              int index);
 

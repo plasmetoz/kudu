@@ -17,14 +17,16 @@
 
 package org.apache.kudu.client;
 
-import static org.junit.Assert.*;
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
+import static org.junit.Assert.assertTrue;
 
 import java.nio.ByteBuffer;
 import java.security.AccessController;
 import java.security.KeyStore;
 import java.security.cert.Certificate;
 import java.util.List;
-
 import javax.net.ssl.KeyManagerFactory;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLEngine;
@@ -33,30 +35,29 @@ import javax.net.ssl.SSLEngineResult.HandshakeStatus;
 import javax.net.ssl.SSLException;
 import javax.security.auth.Subject;
 
-import org.apache.kudu.client.Negotiator.Result;
-import org.apache.kudu.rpc.RpcHeader.AuthenticationTypePB;
-import org.apache.kudu.rpc.RpcHeader.ConnectionContextPB;
-import org.apache.kudu.rpc.RpcHeader.NegotiatePB;
-import org.apache.kudu.rpc.RpcHeader.RpcFeatureFlag;
-import org.apache.kudu.util.SecurityUtil;
-import org.apache.kudu.rpc.RpcHeader.NegotiatePB.NegotiateStep;
-import org.apache.kudu.rpc.RpcHeader.NegotiatePB.SaslMechanism;
-import org.apache.kudu.security.Token.SignedTokenPB;
-import org.apache.kudu.rpc.RpcHeader.ResponseHeader;
-import org.jboss.netty.buffer.ChannelBuffer;
-import org.jboss.netty.handler.codec.embedder.DecoderEmbedder;
-import org.jboss.netty.handler.ssl.SslHandler;
-import org.junit.Before;
-import org.junit.Test;
-
-import com.google.common.base.Throwables;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.Lists;
 import com.google.protobuf.ByteString;
 import com.google.protobuf.Message;
 import com.google.protobuf.TextFormat;
+import org.jboss.netty.buffer.ChannelBuffer;
+import org.jboss.netty.handler.codec.embedder.DecoderEmbedder;
+import org.jboss.netty.handler.ssl.SslHandler;
+import org.junit.Before;
+import org.junit.Test;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import org.apache.kudu.client.Negotiator.Success;
+import org.apache.kudu.rpc.RpcHeader.AuthenticationTypePB;
+import org.apache.kudu.rpc.RpcHeader.ConnectionContextPB;
+import org.apache.kudu.rpc.RpcHeader.NegotiatePB;
+import org.apache.kudu.rpc.RpcHeader.NegotiatePB.NegotiateStep;
+import org.apache.kudu.rpc.RpcHeader.NegotiatePB.SaslMechanism;
+import org.apache.kudu.rpc.RpcHeader.ResponseHeader;
+import org.apache.kudu.rpc.RpcHeader.RpcFeatureFlag;
+import org.apache.kudu.security.Token.SignedTokenPB;
+import org.apache.kudu.util.SecurityUtil;
 
 public class TestNegotiator {
   static final Logger LOG = LoggerFactory.getLogger(TestNegotiator.class);
@@ -101,7 +102,7 @@ public class TestNegotiator {
   }
 
   private void startNegotiation(boolean fakeLoopback) {
-    Negotiator negotiator = new Negotiator("127.0.0.1", secContext);
+    Negotiator negotiator = new Negotiator("127.0.0.1", secContext, false);
     negotiator.overrideLoopbackForTests = fakeLoopback;
     embedder = new DecoderEmbedder<Object>(negotiator);
     negotiator.sendHello(embedder.getPipeline().getChannel());
@@ -128,25 +129,25 @@ public class TestNegotiator {
       ctx.init(kmf.getKeyManagers(), null, null);
       return ctx.createSSLEngine();
     } catch (Exception e) {
-      throw Throwables.propagate(e);
+      throw new RuntimeException(e);
     }
   }
 
   /**
    * Checks that the client sends a connection context and then yields
-   * a Negotiation.Result to the pipeline.
+   * a Negotiation.Success to the pipeline.
    * @return the result
    */
-  private Result assertComplete() {
+  private Success assertComplete() {
     RpcOutboundMessage msg = (RpcOutboundMessage)embedder.poll();
     ConnectionContextPB connCtx = (ConnectionContextPB)msg.getBody();
     assertEquals(Negotiator.CONNECTION_CTX_CALL_ID, msg.getHeaderBuilder().getCallId());
     assertEquals(System.getProperty("user.name"), connCtx.getDEPRECATEDUserInfo().getRealUser());
 
-    // Expect the client to also emit a negotiation Result.
-    Result result = (Result)embedder.poll();
-    assertNotNull(result);
-    return result;
+    // Expect the client to also emit a negotiation Success.
+    Success success = (Success)embedder.poll();
+    assertNotNull(success);
+    return success;
   }
 
   @Test

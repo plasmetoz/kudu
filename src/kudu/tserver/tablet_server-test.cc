@@ -14,40 +14,120 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+
 #include "kudu/tserver/tablet_server-test-base.h"
 
+#include <stdlib.h>
+#include <unistd.h>
+
+#include <cstdint>
 #include <memory>
+#include <set>
 #include <sstream>
+#include <string>
+#include <thread>
+#include <utility>
+#include <vector>
 
-#include <zlib.h>
+#include <boost/bind.hpp>
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <google/protobuf/util/message_differencer.h>
+#include <gtest/gtest.h>
 
+#include "kudu/clock/clock.h"
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/encoded_key.h"
+#include "kudu/common/partial_row.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/row_operations.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/log-test-base.h"
+#include "kudu/consensus/log.h"
+#include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/fs/block_id.h"
+#include "kudu/fs/fs-test-util.h"
+#include "kudu/fs/fs.pb.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/callback.h"
+#include "kudu/gutil/casts.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/escaping.h"
+#include "kudu/gutil/strings/join.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/master/master.pb.h"
-#include "kudu/server/hybrid_clock.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/server/rpc_server.h"
 #include "kudu/server/server_base.pb.h"
 #include "kudu/server/server_base.proxy.h"
-#include "kudu/tablet/tablet_bootstrap.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
 #include "kudu/tserver/heartbeater.h"
+#include "kudu/tserver/mini_tablet_server.h"
+#include "kudu/tserver/scanners.h"
+#include "kudu/tserver/tablet_server.h"
+#include "kudu/tserver/tablet_server_options.h"
+#include "kudu/tserver/tablet_server_test_util.h"
+#include "kudu/tserver/ts_tablet_manager.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_admin.pb.h"
+#include "kudu/tserver/tserver_admin.proxy.h"
+#include "kudu/tserver/tserver_service.pb.h"
+#include "kudu/tserver/tserver_service.proxy.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/crc.h"
 #include "kudu/util/curl_util.h"
+#include "kudu/util/env.h"
+#include "kudu/util/faststring.h"
+#include "kudu/util/jsonwriter.h"
+#include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/path_util.h"
 #include "kudu/util/pb_util.h"
-#include "kudu/util/url-coding.h"
+#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/slice.h"
+#include "kudu/util/status.h"
+#include "kudu/util/stopwatch.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
 #include "kudu/util/zlib.h"
 
-using kudu::consensus::RaftConfigPB;
-using kudu::consensus::RaftPeerPB;
+using google::protobuf::util::MessageDifferencer;
+using kudu::clock::Clock;
+using kudu::clock::HybridClock;
+using kudu::consensus::ConsensusStatePB;
+using kudu::fs::CreateCorruptBlock;
+using kudu::pb_util::SecureDebugString;
+using kudu::pb_util::SecureShortDebugString;
 using kudu::rpc::Messenger;
 using kudu::rpc::MessengerBuilder;
 using kudu::rpc::RpcController;
-using kudu::server::Clock;
-using kudu::server::HybridClock;
+using kudu::tablet::RowSetDataPB;
 using kudu::tablet::Tablet;
-using kudu::tablet::TabletPeer;
+using kudu::tablet::TabletReplica;
+using kudu::tablet::TabletSuperBlockPB;
+using std::set;
 using std::shared_ptr;
 using std::string;
+using std::thread;
 using std::unique_ptr;
+using std::vector;
 using strings::Substitute;
 
 DEFINE_int32(single_threaded_insert_latency_bench_warmup_rows, 100,
@@ -58,18 +138,40 @@ DEFINE_int32(single_threaded_insert_latency_bench_insert_rows, 1000,
              "Number of rows to insert in the testing phase of the single threaded"
              " tablet server insert latency micro-benchmark");
 
+DEFINE_int32(delete_tablet_bench_num_flushes, 200,
+             "Number of disk row sets to flush in the delete tablet benchmark");
+
+DECLARE_bool(crash_on_eio);
+DECLARE_bool(enable_maintenance_manager);
 DECLARE_bool(fail_dns_resolution);
+DECLARE_double(env_inject_eio);
+DECLARE_int32(flush_threshold_mb);
+DECLARE_int32(flush_threshold_secs);
+DECLARE_int32(maintenance_manager_num_threads);
 DECLARE_int32(metrics_retirement_age_ms);
 DECLARE_int32(scanner_batch_size_rows);
+DECLARE_int32(scanner_gc_check_interval_us);
+DECLARE_int32(scanner_ttl_ms);
 DECLARE_string(block_manager);
+DECLARE_string(env_inject_eio_globs);
 
 // Declare these metrics prototypes for simpler unit testing of their behavior.
 METRIC_DECLARE_counter(rows_inserted);
 METRIC_DECLARE_counter(rows_updated);
 METRIC_DECLARE_counter(rows_deleted);
+METRIC_DECLARE_counter(scanners_expired);
 METRIC_DECLARE_gauge_uint64(log_block_manager_blocks_under_management);
+METRIC_DECLARE_gauge_uint64(log_block_manager_containers);
+METRIC_DECLARE_counter(log_block_manager_holes_punched);
+METRIC_DECLARE_gauge_size(active_scanners);
+METRIC_DECLARE_gauge_size(tablet_active_scanners);
 
 namespace kudu {
+
+namespace tablet {
+class RowSet;
+}
+
 namespace tserver {
 
 class TabletServerTest : public TabletServerTestBase {
@@ -77,10 +179,12 @@ class TabletServerTest : public TabletServerTestBase {
   // Starts the tablet server, override to start it later.
   virtual void SetUp() OVERRIDE {
     NO_FATALS(TabletServerTestBase::SetUp());
-    NO_FATALS(StartTabletServer());
+    NO_FATALS(StartTabletServer(/* num_data_dirs */ 1));
   }
 
   void DoOrderedScanTest(const Schema& projection, const string& expected_rows_as_string);
+
+  void ScanYourWritesTest(uint64_t propagated_timestamp, ScanResponsePB* resp);
 };
 
 TEST_F(TabletServerTest, TestPingServer) {
@@ -89,6 +193,55 @@ TEST_F(TabletServerTest, TestPingServer) {
   PingResponsePB resp;
   RpcController controller;
   ASSERT_OK(proxy_->Ping(req, &resp, &controller));
+}
+
+TEST_F(TabletServerTest, TestStatus) {
+  // Get the server's status.
+  server::GetStatusRequestPB req;
+  server::GetStatusResponsePB resp;
+  RpcController controller;
+  ASSERT_OK(generic_proxy_->GetStatus(req, &resp, &controller));
+  ASSERT_TRUE(resp.has_status());
+  ASSERT_TRUE(resp.status().has_node_instance());
+  ASSERT_EQ(mini_server_->uuid(), resp.status().node_instance().permanent_uuid());
+
+  // Regression test for KUDU-2148: try to get the status as the server is
+  // starting. To surface this more frequently, we restart the server a number
+  // of times.
+  CountDownLatch latch(1);
+  thread status_thread([&](){
+    server::GetStatusRequestPB req;
+    server::GetStatusResponsePB resp;
+    RpcController controller;
+    while (latch.count() > 0) {
+      controller.Reset();
+      resp.Clear();
+      Status s = generic_proxy_->GetStatus(req, &resp, &controller);
+      if (s.ok()) {
+        // These two fields are guaranteed even if the request yielded an error.
+        CHECK(resp.has_status());
+        CHECK(resp.status().has_node_instance());
+        if (resp.has_error()) {
+          // But this one isn't set if the request yielded an error.
+          CHECK(!resp.status().has_version_info());
+        }
+      }
+    }
+  });
+  SCOPED_CLEANUP({
+    status_thread.join();
+  });
+
+  // Can't safely restart unless we allow the replica to be destroyed.
+  tablet_replica_.reset();
+
+  for (int i = 0; i < (AllowSlowTests() ? 100 : 10); i++) {
+    mini_server_->Shutdown();
+    ASSERT_OK(mini_server_->Restart());
+  }
+
+  // All done, stop the test thread.
+  latch.CountDown();
 }
 
 TEST_F(TabletServerTest, TestServerClock) {
@@ -102,7 +255,8 @@ TEST_F(TabletServerTest, TestServerClock) {
 
 TEST_F(TabletServerTest, TestSetFlags) {
   server::GenericServiceProxy proxy(
-      client_messenger_, mini_server_->bound_rpc_addr());
+      client_messenger_, mini_server_->bound_rpc_addr(),
+      mini_server_->bound_rpc_addr().host());
 
   server::SetFlagRequestPB req;
   server::SetFlagResponsePB resp;
@@ -180,7 +334,7 @@ TEST_F(TabletServerTest, TestWebPages) {
   // Tablet page should include the schema.
   ASSERT_OK(c.FetchURL(Substitute("http://$0/tablet?id=$1", addr, kTabletId),
                        &buf));
-  ASSERT_STR_CONTAINS(buf.ToString(), "<th>key</th>");
+  ASSERT_STR_CONTAINS(buf.ToString(), "<th><u>key</u></th>");
   ASSERT_STR_CONTAINS(buf.ToString(), "<td>string NULLABLE</td>");
 
   // Test fetching metrics.
@@ -192,8 +346,7 @@ TEST_F(TabletServerTest, TestWebPages) {
   FLAGS_metrics_retirement_age_ms = 0;
   for (int i = 0; i < 3; i++) {
     SCOPED_TRACE(i);
-    ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/jsonmetricz", addr, kTabletId),
-                                &buf));
+    ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/jsonmetricz", addr), &buf));
 
     // Check that the tablet entry shows up.
     ASSERT_STR_CONTAINS(buf.ToString(), "\"type\": \"tablet\"");
@@ -226,7 +379,7 @@ TEST_F(TabletServerTest, TestWebPages) {
   string enable_req_json = "{\"categoryFilter\":\"*\", \"useContinuousTracing\": \"true\","
     " \"useSampling\": \"false\"}";
   string req_b64;
-  Base64Escape(enable_req_json, &req_b64);
+  strings::Base64Escape(enable_req_json, &req_b64);
 
   for (bool compressed : {false, true}) {
     ASSERT_OK(c.FetchURL(Substitute("http://$0/tracing/json/begin_recording?$1",
@@ -263,6 +416,189 @@ TEST_F(TabletServerTest, TestWebPages) {
 #endif
 }
 
+// Ensure that when a replica is in a failed / shutdown state, it returns an
+// error for ConsensusState() requests.
+TEST_F(TabletServerTest, TestFailedTabletsRejectConsensusState) {
+  scoped_refptr<TabletReplica> replica;
+  TSTabletManager* tablet_manager = mini_server_->server()->tablet_manager();
+  ASSERT_TRUE(tablet_manager->LookupTablet(kTabletId, &replica));
+  replica->SetError(Status::IOError("This error will leave the replica FAILED state at shutdown"));
+  replica->Shutdown();
+  ASSERT_EQ(tablet::FAILED, replica->state());
+
+  auto consensus = replica->shared_consensus();
+  ASSERT_TRUE(consensus);
+  ConsensusStatePB cstate;
+  Status s = consensus->ConsensusState(&cstate);
+  ASSERT_TRUE(s.IsIllegalState()) << s.ToString();
+  ASSERT_STR_CONTAINS(s.ToString(), "Tablet replica is shutdown");
+}
+
+// Test that tablets that get failed and deleted will eventually show up as
+// failed tombstones on the web UI.
+TEST_F(TabletServerTest, TestFailedTabletsOnWebUI) {
+  scoped_refptr<TabletReplica> replica;
+  TSTabletManager* tablet_manager = mini_server_->server()->tablet_manager();
+  ASSERT_TRUE(tablet_manager->LookupTablet(kTabletId, &replica));
+  replica->SetError(Status::IOError("This error will leave the replica FAILED state at shutdown"));
+  replica->Shutdown();
+  ASSERT_EQ(tablet::FAILED, replica->state());
+
+  // Now delete the tablet and leave it tombstoned, e.g. as if the failed
+  // replica were deleted.
+  TabletServerErrorPB::Code error_code;
+  ASSERT_OK(tablet_manager->DeleteTablet(kTabletId,
+      tablet::TABLET_DATA_TOMBSTONED, boost::none, &error_code));
+
+  EasyCurl c;
+  faststring buf;
+  const string addr = mini_server_->bound_http_addr().ToString();
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/tablets", addr), &buf));
+
+  // Ensure the html contains the "Tombstoned Tablets" header, indicating the
+  // failed tombstone is correctly displayed as a tombstone.
+  ASSERT_STR_CONTAINS(buf.ToString(), "Tombstoned Tablets");
+}
+
+// Test that tombstoned tablets are displayed correctly in the web ui:
+// - After restart, status message of "Tombstoned" instead of "Tablet initializing...".
+// - No consensus configuration.
+TEST_F(TabletServerTest, TestTombstonedTabletOnWebUI) {
+  TSTabletManager* tablet_manager = mini_server_->server()->tablet_manager();
+  TabletServerErrorPB::Code error_code;
+  ASSERT_OK(tablet_manager->DeleteTablet(kTabletId,
+                                         tablet::TABLET_DATA_TOMBSTONED, boost::none, &error_code));
+
+  // Restart the server. We drop the tablet_replica_ reference since it becomes
+  // invalid when the server shuts down.
+  tablet_replica_.reset();
+  mini_server_->Shutdown();
+  ASSERT_OK(mini_server_->Restart());
+  ASSERT_OK(mini_server_->WaitStarted());
+
+  EasyCurl c;
+  faststring buf;
+  const string addr = mini_server_->bound_http_addr().ToString();
+  ASSERT_OK(c.FetchURL(Substitute("http://$0/tablets", addr), &buf));
+
+  // Ensure the html contains the "Tombstoned Tablets" header and
+  // a table entry with the proper status message.
+  string s = buf.ToString();
+  ASSERT_STR_CONTAINS(s, "Tombstoned Tablets");
+  ASSERT_STR_CONTAINS(s, "<td>Tombstoned</td>");
+  ASSERT_STR_NOT_CONTAINS(s, "<td>Tablet initializing...</td>");
+
+  // Since the consensus config shouldn't be displayed, the html should not
+  // contain the server's RPC address.
+  ASSERT_STR_NOT_CONTAINS(s, mini_server_->bound_rpc_addr().ToString());
+}
+
+class TabletServerDiskFailureTest : public TabletServerTestBase {
+ public:
+  virtual void SetUp() override {
+    const int kNumDirs = 5;
+    NO_FATALS(TabletServerTestBase::SetUp());
+    // Ensure the server will flush frequently.
+    FLAGS_enable_maintenance_manager = true;
+    FLAGS_maintenance_manager_num_threads = kNumDirs;
+    FLAGS_flush_threshold_mb = 1;
+    FLAGS_flush_threshold_secs = 1;
+
+    // Create a brand new tablet server with multiple disks, ensuring it can
+    // survive at least one disk failure.
+    NO_FATALS(StartTabletServer(/*num_data_dirs=*/ kNumDirs));
+  }
+};
+
+// Test that applies random operations to a tablet with a non-zero disk-failure
+// injection rate.
+TEST_F(TabletServerDiskFailureTest, TestRandomOpSequence) {
+  if (!AllowSlowTests()) {
+    LOG(INFO) << "Not running slow test. To run, use KUDU_ALLOW_SLOW_TESTS=1";
+    return;
+  }
+  typedef vector<RowOperationsPB::Type> OpTypeList;
+  const OpTypeList kOpsIfKeyNotPresent = { RowOperationsPB::INSERT, RowOperationsPB::UPSERT };
+  const OpTypeList kOpsIfKeyPresent = { RowOperationsPB::UPSERT, RowOperationsPB::UPDATE,
+                                        RowOperationsPB::DELETE };
+  const int kMaxKey = 100000;
+
+  // Set these way up-front so we can change a single value to actually start
+  // injecting errors. Inject errors into all data dirs but one.
+  FLAGS_crash_on_eio = false;
+  const vector<string> failed_dirs = { mini_server_->options()->fs_opts.data_roots.begin() + 1,
+                                       mini_server_->options()->fs_opts.data_roots.end() };
+  FLAGS_env_inject_eio_globs = JoinStrings(JoinPathSegmentsV(failed_dirs, "**"), ",");
+
+  set<int> keys;
+  const auto GetRandomString = [] {
+    return StringPrintf("%d", rand() % kMaxKey);
+  };
+
+  // Perform a random op (insert, update, upsert, or delete).
+  const auto PerformOp = [&] {
+    // Set up the request.
+    WriteRequestPB req;
+    req.set_tablet_id(kTabletId);
+    RETURN_NOT_OK(SchemaToPB(schema_, req.mutable_schema()));
+
+    // Set up the other state.
+    WriteResponsePB resp;
+    RpcController controller;
+    RowOperationsPB::Type op_type;
+    int key = rand() % kMaxKey;
+    auto key_iter = keys.find(key);
+    if (key_iter == keys.end()) {
+      // If the key already exists, insert or upsert.
+      op_type = kOpsIfKeyNotPresent[rand() % kOpsIfKeyNotPresent.size()];
+    } else {
+      // ... else we can do anything but insert.
+      op_type = kOpsIfKeyPresent[rand() % kOpsIfKeyPresent.size()];
+    }
+
+    // Add the op to the request.
+    if (op_type != RowOperationsPB::DELETE) {
+      AddTestRowToPB(op_type, schema_, key, key, GetRandomString(),
+                     req.mutable_row_operations());
+      keys.insert(key);
+    } else {
+      AddTestKeyToPB(RowOperationsPB::DELETE, schema_, key, req.mutable_row_operations());
+      keys.erase(key_iter);
+    }
+
+    // Finally, write to the server and log the response.
+    RETURN_NOT_OK_PREPEND(proxy_->Write(req, &resp, &controller), "Failed to write");
+    LOG(INFO) << "Tablet server responded with: " << SecureDebugString(resp);
+    return resp.has_error() ?  StatusFromPB(resp.error().status()) : Status::OK();
+  };
+
+  // Perform some arbitrarily large number of ops, with some pauses to encourage flushes.
+  for (int i = 0; i < 500; i++) {
+    if (i % 10) {
+      SleepFor(MonoDelta::FromMilliseconds(100));
+    }
+    ASSERT_OK(PerformOp());
+  }
+  // At this point, a bunch of operations have gone through successfully. Fail
+  // one of the disks that the tablet lives on.
+  FLAGS_env_inject_eio = 0.01;
+
+  // The tablet will eventually be failed and will not be able to accept
+  // updates. Keep on inserting until that happens.
+  ASSERT_EVENTUALLY([&] {
+    Status s;
+    for (int i = 0; i < 150 && s.ok(); i++) {
+      s = PerformOp();
+    }
+    ASSERT_FALSE(s.ok());
+  });
+  LOG(INFO) << "Failure was caught by an op!";
+  ASSERT_EVENTUALLY([&] {
+    ASSERT_EQ(tablet::FAILED, tablet_replica_->state());
+  });
+  LOG(INFO) << "Tablet was successfully failed";
+}
+
 TEST_F(TabletServerTest, TestInsert) {
   WriteRequestPB req;
 
@@ -271,7 +607,7 @@ TEST_F(TabletServerTest, TestInsert) {
   WriteResponsePB resp;
   RpcController controller;
 
-  scoped_refptr<TabletPeer> tablet;
+  scoped_refptr<TabletReplica> tablet;
   ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
   scoped_refptr<Counter> rows_inserted =
     METRIC_rows_inserted.Instantiate(tablet->tablet()->GetMetricEntity());
@@ -375,7 +711,7 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_ClientPropagated) {
   WriteResponsePB resp;
   RpcController controller;
 
-  scoped_refptr<TabletPeer> tablet;
+  scoped_refptr<TabletReplica> tablet;
   ASSERT_TRUE(
       mini_server_->server()->tablet_manager()->LookupTablet(kTabletId,
                                                              &tablet));
@@ -426,7 +762,7 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_CommitWait) {
   RpcController controller;
   HybridClock* hclock = down_cast<HybridClock*, Clock>(mini_server_->server()->clock());
 
-  scoped_refptr<TabletPeer> tablet;
+  scoped_refptr<TabletReplica> tablet;
   ASSERT_TRUE(
       mini_server_->server()->tablet_manager()->LookupTablet(kTabletId,
                                                              &tablet));
@@ -490,7 +826,7 @@ TEST_F(TabletServerTest, TestExternalConsistencyModes_CommitWait) {
 
 TEST_F(TabletServerTest, TestInsertAndMutate) {
 
-  scoped_refptr<TabletPeer> tablet;
+  scoped_refptr<TabletReplica> tablet;
   ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
   scoped_refptr<Counter> rows_inserted =
       METRIC_rows_inserted.Instantiate(tablet->tablet()->GetMetricEntity());
@@ -728,7 +1064,7 @@ class MyCommonHooks : public Tablet::FlushCompactCommonHooks,
     iteration_(0) {}
 
   Status DoHook(int32_t key, int32_t new_int_val) {
-    test_->UpdateTestRowRemote(0, key, new_int_val);
+    test_->UpdateTestRowRemote(key, new_int_val);
     return Status::OK();
   }
 
@@ -775,15 +1111,15 @@ class MyCommonHooks : public Tablet::FlushCompactCommonHooks,
 // log produced on recovery allows to re-recover the original state.
 TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushing) {
 
-  InsertTestRowsRemote(0, 1, 7);
+  InsertTestRowsRemote(1, 7);
 
   shared_ptr<MyCommonHooks> hooks(new MyCommonHooks(this));
 
-  tablet_peer_->tablet()->SetFlushHooksForTests(hooks);
-  tablet_peer_->tablet()->SetCompactionHooksForTests(hooks);
-  tablet_peer_->tablet()->SetFlushCompactCommonHooksForTests(hooks);
+  tablet_replica_->tablet()->SetFlushHooksForTests(hooks);
+  tablet_replica_->tablet()->SetCompactionHooksForTests(hooks);
+  tablet_replica_->tablet()->SetFlushCompactCommonHooksForTests(hooks);
 
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   // Shutdown the tserver and try and rebuild the tablet from the log
   // produced on recovery (recovery flushed no state, but produced a new
@@ -815,16 +1151,16 @@ TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushing) {
 // DMS, when the initial one is flushed.
 TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushingAndCompacting) {
 
-  InsertTestRowsRemote(0, 1, 7);
+  InsertTestRowsRemote(1, 7);
 
   shared_ptr<MyCommonHooks> hooks(new MyCommonHooks(this));
 
-  tablet_peer_->tablet()->SetFlushHooksForTests(hooks);
-  tablet_peer_->tablet()->SetCompactionHooksForTests(hooks);
-  tablet_peer_->tablet()->SetFlushCompactCommonHooksForTests(hooks);
+  tablet_replica_->tablet()->SetFlushHooksForTests(hooks);
+  tablet_replica_->tablet()->SetCompactionHooksForTests(hooks);
+  tablet_replica_->tablet()->SetFlushCompactCommonHooksForTests(hooks);
 
   // flush the first time
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   ASSERT_NO_FATAL_FAILURE(ShutdownAndRebuildTablet());
   VerifyRows(schema_, { KeyValue(1, 10),
@@ -837,17 +1173,17 @@ TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushingAndCompacting) {
   hooks->increment_iteration();
 
   // set the hooks on the new tablet
-  tablet_peer_->tablet()->SetFlushHooksForTests(hooks);
-  tablet_peer_->tablet()->SetCompactionHooksForTests(hooks);
-  tablet_peer_->tablet()->SetFlushCompactCommonHooksForTests(hooks);
+  tablet_replica_->tablet()->SetFlushHooksForTests(hooks);
+  tablet_replica_->tablet()->SetCompactionHooksForTests(hooks);
+  tablet_replica_->tablet()->SetFlushCompactCommonHooksForTests(hooks);
 
   // insert an additional row so that we can flush
-  InsertTestRowsRemote(0, 8, 1);
+  InsertTestRowsRemote(8, 1);
 
   // flush an additional MRS so that we have two DiskRowSets and then compact
   // them making sure that mutations executed mid compaction are replayed as
   // expected
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   VerifyRows(schema_, { KeyValue(1, 11),
                         KeyValue(2, 21),
                         KeyValue(3, 31),
@@ -858,7 +1194,7 @@ TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushingAndCompacting) {
                         KeyValue(8, 8) });
 
   hooks->increment_iteration();
-  ASSERT_OK(tablet_peer_->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
+  ASSERT_OK(tablet_replica_->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
 
   // get the clock's current timestamp
   Timestamp now_before = mini_server_->server()->clock()->Now();
@@ -890,22 +1226,22 @@ TEST_F(TabletServerTest, TestRecoveryWithMutationsWhileFlushingAndCompacting) {
 TEST_F(TabletServerTest, TestKUDU_176_RecoveryAfterMajorDeltaCompaction) {
 
   // Flush a DRS with 1 rows.
-  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(0, 1, 1));
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(1, 1));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   ANFF(VerifyRows(schema_, { KeyValue(1, 1) }));
 
   // Update it, flush deltas.
-  ANFF(UpdateTestRowRemote(0, 1, 2));
-  ASSERT_OK(tablet_peer_->tablet()->FlushBiggestDMS());
+  ANFF(UpdateTestRowRemote(1, 2));
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
   ANFF(VerifyRows(schema_, { KeyValue(1, 2) }));
 
   // Major compact deltas.
   {
     vector<shared_ptr<tablet::RowSet> > rsets;
-    tablet_peer_->tablet()->GetRowSetsForTests(&rsets);
-    vector<ColumnId> col_ids = { tablet_peer_->tablet()->schema()->column_id(1),
-                                 tablet_peer_->tablet()->schema()->column_id(2) };
-    ASSERT_OK(tablet_peer_->tablet()->DoMajorDeltaCompaction(col_ids, rsets[0]))
+    tablet_replica_->tablet()->GetRowSetsForTests(&rsets);
+    vector<ColumnId> col_ids = { tablet_replica_->tablet()->schema()->column_id(1),
+                                 tablet_replica_->tablet()->schema()->column_id(2) };
+    ASSERT_OK(tablet_replica_->tablet()->DoMajorDeltaCompaction(col_ids, rsets[0]))
   }
 
   // Verify that data is still the same.
@@ -920,61 +1256,119 @@ TEST_F(TabletServerTest, TestKUDU_176_RecoveryAfterMajorDeltaCompaction) {
 // we have a DELETE for a row which is still live in multiple on-disk
 // rowsets.
 TEST_F(TabletServerTest, TestKUDU_1341) {
-  const int kTid = 0;
-
   for (int i = 0; i < 3; i++) {
     // Insert a row to DMS and flush it.
-    ANFF(InsertTestRowsRemote(kTid, 1, 1));
-    ASSERT_OK(tablet_peer_->tablet()->Flush());
+    ANFF(InsertTestRowsRemote(1, 1));
+    ASSERT_OK(tablet_replica_->tablet()->Flush());
 
     // Update and delete row (in DMS)
-    ANFF(UpdateTestRowRemote(kTid, 1, i));
+    ANFF(UpdateTestRowRemote(1, i));
     ANFF(DeleteTestRowsRemote(1, 1));
   }
 
   // Insert row again, update it in MRS before flush, and
   // flush.
-  ANFF(InsertTestRowsRemote(kTid, 1, 1));
-  ANFF(UpdateTestRowRemote(kTid, 1, 12345));
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ANFF(InsertTestRowsRemote(1, 1));
+  ANFF(UpdateTestRowRemote(1, 12345));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   ANFF(VerifyRows(schema_, { KeyValue(1, 12345) }));
 
   // Test restart.
   ASSERT_OK(ShutdownAndRebuildTablet());
   ANFF(VerifyRows(schema_, { KeyValue(1, 12345) }));
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   ANFF(VerifyRows(schema_, { KeyValue(1, 12345) }));
 
   // Test compaction after restart.
-  ASSERT_OK(tablet_peer_->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
+  ASSERT_OK(tablet_replica_->tablet()->Compact(Tablet::FORCE_COMPACT_ALL));
   ANFF(VerifyRows(schema_, { KeyValue(1, 12345) }));
+}
+
+TEST_F(TabletServerTest, TestExactlyOnceForErrorsAcrossRestart) {
+  WriteRequestPB req;
+  WriteResponsePB resp;
+  RpcController rpc;
+
+  // Set up a request to insert two rows.
+  req.set_tablet_id(kTabletId);
+  AddTestRowToPB(RowOperationsPB::INSERT, schema_, 1234, 5678, "hello world via RPC",
+                 req.mutable_row_operations());
+  AddTestRowToPB(RowOperationsPB::INSERT, schema_, 12345, 5679, "hello world via RPC2",
+                 req.mutable_row_operations());
+  ASSERT_OK(SchemaToPB(schema_, req.mutable_schema()));
+
+  // Insert it, assuming no errors.
+  {
+    SCOPED_TRACE(req.DebugString());
+    ASSERT_OK(proxy_->Write(req, &resp, &rpc));
+    SCOPED_TRACE(resp.DebugString());
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(0, resp.per_row_errors_size());
+  }
+
+  // Set up a RequestID to use in the later requests.
+  rpc::RequestIdPB req_id;
+  req_id.set_client_id("client-id");
+  req_id.set_seq_no(1);
+  req_id.set_first_incomplete_seq_no(1);
+  req_id.set_attempt_no(1);
+
+  // Insert the row again, with the request ID specified. We should expect an
+  // "ALREADY_PRESENT" error.
+  {
+    rpc.Reset();
+    rpc.SetRequestIdPB(unique_ptr<rpc::RequestIdPB>(new rpc::RequestIdPB(req_id)));
+    ASSERT_OK(proxy_->Write(req, &resp, &rpc));
+    SCOPED_TRACE(resp.DebugString());
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(2, resp.per_row_errors_size());
+  }
+
+  // Restart the tablet server several times, and after each restart, send a new attempt of the
+  // same request. We make the request itself invalid by clearing the schema and ops, but
+  // that shouldn't matter since it's just hitting the ResultTracker and returning the
+  // cached response. If the ResultTracker didn't have a cached response, then we'd get an
+  // error about an invalid request.
+  req.clear_schema();
+  req.clear_row_operations();
+  for (int i = 1; i <= 5; i++) {
+    SCOPED_TRACE(Substitute("restart attempt #$0", i));
+    NO_FATALS(ShutdownAndRebuildTablet());
+    rpc.Reset();
+    req_id.set_attempt_no(req_id.attempt_no() + 1);
+    rpc.SetRequestIdPB(unique_ptr<rpc::RequestIdPB>(new rpc::RequestIdPB(req_id)));
+    ASSERT_OK(proxy_->Write(req, &resp, &rpc));
+    SCOPED_TRACE(resp.DebugString());
+    ASSERT_FALSE(resp.has_error());
+    ASSERT_EQ(2, resp.per_row_errors_size());
+  }
 }
 
 // Regression test for KUDU-177. Ensures that after a major delta compaction,
 // rows that were in the old DRS's DMS are properly replayed.
 TEST_F(TabletServerTest, TestKUDU_177_RecoveryOfDMSEditsAfterMajorDeltaCompaction) {
   // Flush a DRS with 1 rows.
-  ANFF(InsertTestRowsRemote(0, 1, 1));
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ANFF(InsertTestRowsRemote(1, 1));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   ANFF(VerifyRows(schema_, { KeyValue(1, 1) }));
 
   // Update it, flush deltas.
-  ANFF(UpdateTestRowRemote(0, 1, 2));
-  ASSERT_OK(tablet_peer_->tablet()->FlushBiggestDMS());
+  ANFF(UpdateTestRowRemote(1, 2));
+  ASSERT_OK(tablet_replica_->tablet()->FlushBiggestDMS());
 
   // Update it again, so this last update is in the DMS.
-  ANFF(UpdateTestRowRemote(0, 1, 3));
+  ANFF(UpdateTestRowRemote(1, 3));
   ANFF(VerifyRows(schema_, { KeyValue(1, 3) }));
 
   // Major compact deltas. This doesn't include the DMS, but the old
   // DMS should "move over" to the output of the delta compaction.
   {
     vector<shared_ptr<tablet::RowSet> > rsets;
-    tablet_peer_->tablet()->GetRowSetsForTests(&rsets);
-    vector<ColumnId> col_ids = { tablet_peer_->tablet()->schema()->column_id(1),
-                                 tablet_peer_->tablet()->schema()->column_id(2) };
-    ASSERT_OK(tablet_peer_->tablet()->DoMajorDeltaCompaction(col_ids, rsets[0]));
+    tablet_replica_->tablet()->GetRowSetsForTests(&rsets);
+    vector<ColumnId> col_ids = { tablet_replica_->tablet()->schema()->column_id(1),
+                                 tablet_replica_->tablet()->schema()->column_id(2) };
+    ASSERT_OK(tablet_replica_->tablet()->DoMajorDeltaCompaction(col_ids, rsets[0]));
   }
   // Verify that data is still the same.
   ANFF(VerifyRows(schema_, { KeyValue(1, 3) }));
@@ -985,13 +1379,13 @@ TEST_F(TabletServerTest, TestKUDU_177_RecoveryOfDMSEditsAfterMajorDeltaCompactio
 }
 
 TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
-  ANFF(InsertTestRowsRemote(0, 1, 7));
+  ANFF(InsertTestRowsRemote(1, 7));
 
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   // Save the log path before shutting down the tablet (and destroying
-  // the tablet peer).
-  string log_path = tablet_peer_->log()->ActiveSegmentPathForTests();
+  // the TabletReplica).
+  string log_path = tablet_replica_->log()->ActiveSegmentPathForTests();
   ShutdownTablet();
 
   ASSERT_OK(log::CorruptLogFile(env_, log_path, log::FLIP_BYTE, 300));
@@ -1001,7 +1395,8 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
   // Connect to it.
   CreateTsClientProxies(mini_server_->bound_rpc_addr(),
                         client_messenger_,
-                        &proxy_, &admin_proxy_, &consensus_proxy_, &generic_proxy_);
+                        &tablet_copy_proxy_, &proxy_, &admin_proxy_, &consensus_proxy_,
+                        &generic_proxy_);
 
   WriteRequestPB req;
   req.set_tablet_id(kTabletId);
@@ -1011,17 +1406,28 @@ TEST_F(TabletServerTest, TestClientGetsErrorBackWhenRecoveryFailed) {
 
   // We're expecting the write to fail.
   ASSERT_OK(DCHECK_NOTNULL(proxy_.get())->Write(req, &resp, &controller));
-  ASSERT_EQ(TabletServerErrorPB::TABLET_NOT_RUNNING, resp.error().code());
+  ASSERT_EQ(TabletServerErrorPB::TABLET_FAILED, resp.error().code());
   ASSERT_STR_CONTAINS(resp.error().status().message(), "Tablet not RUNNING: FAILED");
 
-  // Check that the tablet peer's status message is updated with the failure.
-  ASSERT_STR_CONTAINS(tablet_peer_->last_status(),
+  // Check that the TabletReplica's status message is updated with the failure.
+  ASSERT_STR_CONTAINS(tablet_replica_->last_status(),
                       "Log file corruption detected");
 }
 
-TEST_F(TabletServerTest, TestScan) {
+TEST_F(TabletServerTest, TestReadLatest) {
   int num_rows = AllowSlowTests() ? 10000 : 1000;
   InsertTestRowsDirect(0, num_rows);
+
+  // Instantiate scanner metrics.
+  ASSERT_TRUE(mini_server_->server()->metric_entity());
+  // We don't care what the function is, since the metric is already instantiated.
+  auto active_scanners = METRIC_active_scanners.InstantiateFunctionGauge(
+      mini_server_->server()->metric_entity(), Callback<size_t(void)>());
+  scoped_refptr<TabletReplica> tablet;
+  ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
+  ASSERT_TRUE(tablet->tablet()->GetMetricEntity());
+  scoped_refptr<AtomicGauge<size_t>> tablet_active_scanners =
+      METRIC_tablet_active_scanners.Instantiate(tablet->tablet()->GetMetricEntity(), 0);
 
   ScanResponsePB resp;
   ASSERT_NO_FATAL_FAILURE(OpenScannerWithAllColumns(&resp));
@@ -1035,10 +1441,13 @@ TEST_F(TabletServerTest, TestScan) {
     ASSERT_TRUE(mini_server_->server()->scanner_manager()->LookupScanner(scanner_id, &junk));
   }
 
+  // Ensure that the scanner shows up in the server and tablet's metrics.
+  ASSERT_EQ(1, active_scanners->value());
+  ASSERT_EQ(1, tablet_active_scanners->value());
+
   // Drain all the rows from the scanner.
   vector<string> results;
-  ASSERT_NO_FATAL_FAILURE(
-    DrainScannerToStrings(resp.scanner_id(), schema_, &results));
+  ASSERT_NO_FATAL_FAILURE(DrainScannerToStrings(resp.scanner_id(), schema_, &results));
   ASSERT_EQ(num_rows, results.size());
 
   KuduPartialRow row(&schema_);
@@ -1054,18 +1463,150 @@ TEST_F(TabletServerTest, TestScan) {
     SharedScanner junk;
     ASSERT_FALSE(mini_server_->server()->scanner_manager()->LookupScanner(scanner_id, &junk));
   }
+
+  // Ensure that the metrics have been updated now that the scanner is unregistered.
+  ASSERT_EQ(0, active_scanners->value());
+  ASSERT_EQ(0, tablet_active_scanners->value());
 }
 
-TEST_F(TabletServerTest, TestScannerOpenWhenServerShutsDown) {
-  InsertTestRowsDirect(0, 1);
+class ExpiredScannerParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+
+TEST_P(ExpiredScannerParamTest, Test) {
+  const ReadMode mode = GetParam();
+
+  // Make scanners expire quickly.
+  FLAGS_scanner_ttl_ms = 1;
+
+  int num_rows = 100;
+  InsertTestRowsDirect(0, num_rows);
+
+  // Instantiate scanners expired metric.
+  ASSERT_TRUE(mini_server_->server()->metric_entity());
+  scoped_refptr<Counter> scanners_expired = METRIC_scanners_expired.Instantiate(
+      mini_server_->server()->metric_entity());
+
+  // Initially, there've been no scanners, so none of have expired.
+  ASSERT_EQ(0, scanners_expired->value());
+
+  // Open a scanner but don't read from it.
+  ScanResponsePB resp;
+  ASSERT_NO_FATAL_FAILURE(OpenScannerWithAllColumns(&resp, mode));
+
+  // The scanner should expire after a short time.
+  ASSERT_EVENTUALLY([&]() {
+    ASSERT_EQ(1, scanners_expired->value());
+  });
+
+  // Continue the scan. We should get a SCANNER_EXPIRED error.
+  ScanRequestPB req;
+  RpcController rpc;
+  req.set_scanner_id(resp.scanner_id());
+  req.set_call_seq_id(1);
+  resp.Clear();
+  ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+  ASSERT_TRUE(resp.has_error());
+  ASSERT_EQ(TabletServerErrorPB::SCANNER_EXPIRED, resp.error().code());
+}
+
+const ReadMode read_modes[] = {
+    READ_LATEST,
+    READ_AT_SNAPSHOT,
+    READ_YOUR_WRITES,
+};
+
+INSTANTIATE_TEST_CASE_P(Params, ExpiredScannerParamTest,
+                        testing::ValuesIn(read_modes));
+
+class ScanCorruptedDeltasParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+
+TEST_P(ScanCorruptedDeltasParamTest, Test) {
+  const ReadMode mode = GetParam();
+  // Ensure some rows get to disk with deltas.
+  InsertTestRowsDirect(0, 100);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  UpdateTestRowRemote(1, 100);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+
+  // Fudge with some delta blocks.
+  TabletSuperBlockPB superblock_pb;
+  tablet_replica_->tablet()->metadata()->ToSuperBlock(&superblock_pb);
+  FsManager* fs_manager = mini_server_->server()->fs_manager();
+  for (int rowset_no = 0; rowset_no < superblock_pb.rowsets_size(); rowset_no++) {
+    RowSetDataPB* rowset_pb = superblock_pb.mutable_rowsets(rowset_no);
+    for (int id = 0; id < rowset_pb->undo_deltas_size(); id++) {
+      BlockId block_id(rowset_pb->undo_deltas(id).block().id());
+      BlockId new_block_id;
+      // Make a copy of each block and rewrite the superblock to include these
+      // newly corrupted blocks.
+      ASSERT_OK(CreateCorruptBlock(fs_manager, block_id, 0, 0, &new_block_id));
+      rowset_pb->mutable_undo_deltas(id)->mutable_block()->set_id(new_block_id.id());
+    }
+  }
+  // Grab the deltafiles and corrupt them.
+  const string& meta_path = fs_manager->GetTabletMetadataPath(tablet_replica_->tablet_id());
+  ShutdownTablet();
+
+  // Flush the corruption and rebuild the server with the corrupt data.
+  ASSERT_OK(pb_util::WritePBContainerToPath(env_,
+      meta_path, superblock_pb, pb_util::OVERWRITE, pb_util::SYNC));
+  ASSERT_OK(ShutdownAndRebuildTablet());
+  LOG(INFO) << Substitute("Rebuilt tablet $0 with broken blocks", tablet_replica_->tablet_id());
+
+  // Now open a scanner for the server.
+  ScanRequestPB req;
+  ScanResponsePB resp;
+  RpcController rpc;
+  NewScanRequestPB* scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  scan->set_read_mode(mode);
+  ASSERT_OK(SchemaToColumnPBs(schema_, scan->mutable_projected_columns()));
+
+  // Send the call. This first call should attempt to init the corrupted
+  // deltafiles and return with an error. The second call should see that the
+  // previous call to init failed and should return the failed status.
+  req.set_batch_size_bytes(10000);
+  for (int i = 0; i < 2; i++) {
+    rpc.Reset();
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_TRUE(resp.has_error());
+    ASSERT_EQ(resp.error().status().code(), AppStatusPB::CORRUPTION);
+    ASSERT_STR_CONTAINS(resp.error().status().message(), "failed to init CFileReader");
+  }
+}
+
+INSTANTIATE_TEST_CASE_P(Params, ScanCorruptedDeltasParamTest,
+                        testing::ValuesIn(read_modes));
+
+class ScannerOpenWhenServerShutsDownParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+TEST_P(ScannerOpenWhenServerShutsDownParamTest, Test) {
+  const ReadMode mode = GetParam();
+  // Write and flush the write, so we have some rows in MRS and DRS
+  InsertTestRowsDirect(0, 100);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  UpdateTestRowRemote(1, 100);
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   ScanResponsePB resp;
-  ASSERT_NO_FATAL_FAILURE(OpenScannerWithAllColumns(&resp));
+  ASSERT_NO_FATAL_FAILURE(OpenScannerWithAllColumns(&resp, mode));
 
   // Scanner is now open. The test will now shut down the TS with the scanner still
   // out there. Due to KUDU-161 this used to fail, since the scanner (and thus the MRS)
   // stayed open longer than the anchor registry
 }
+
+INSTANTIATE_TEST_CASE_P(Params, ScannerOpenWhenServerShutsDownParamTest,
+                        testing::ValuesIn(read_modes));
 
 TEST_F(TabletServerTest, TestSnapshotScan) {
   const int num_rows = AllowSlowTests() ? 1000 : 100;
@@ -1073,7 +1614,7 @@ TEST_F(TabletServerTest, TestSnapshotScan) {
   vector<uint64_t> write_timestamps_collector;
 
   // perform a series of writes and collect the timestamps
-  InsertTestRowsRemote(0, 0, num_rows, num_batches, nullptr,
+  InsertTestRowsRemote(0, num_rows, num_batches, nullptr,
                        kTabletId, &write_timestamps_collector);
 
   // now perform snapshot scans.
@@ -1145,7 +1686,7 @@ TEST_F(TabletServerTest, TestSnapshotScan) {
 TEST_F(TabletServerTest, TestSnapshotScan_WithoutSnapshotTimestamp) {
   vector<uint64_t> write_timestamps_collector;
   // perform a write
-  InsertTestRowsRemote(0, 0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
+  InsertTestRowsRemote(0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
 
   ScanRequestPB req;
   ScanResponsePB resp;
@@ -1188,7 +1729,7 @@ TEST_F(TabletServerTest, TestSnapshotScan_WithoutSnapshotTimestamp) {
 TEST_F(TabletServerTest, TestSnapshotScan_SnapshotInTheFutureFails) {
   vector<uint64_t> write_timestamps_collector;
   // perform a write
-  InsertTestRowsRemote(0, 0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
+  InsertTestRowsRemote(0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
 
   ScanRequestPB req;
   ScanResponsePB resp;
@@ -1220,40 +1761,6 @@ TEST_F(TabletServerTest, TestSnapshotScan_SnapshotInTheFutureFails) {
   }
 }
 
-
-// Test tserver shutdown with an active scanner open.
-TEST_F(TabletServerTest, TestSnapshotScan_OpenScanner) {
-  vector<uint64_t> write_timestamps_collector;
-  // Write and flush and write, so we have some rows in MRS and DRS
-  InsertTestRowsRemote(0, 0, 100, 2, nullptr, kTabletId, &write_timestamps_collector);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
-  InsertTestRowsRemote(0, 100, 100, 2, nullptr, kTabletId, &write_timestamps_collector);
-
-  ScanRequestPB req;
-  ScanResponsePB resp;
-  RpcController rpc;
-
-  // Set up a new request with no predicates, all columns.
-  const Schema& projection = schema_;
-  NewScanRequestPB* scan = req.mutable_new_scan_request();
-  scan->set_tablet_id(kTabletId);
-  ASSERT_OK(SchemaToColumnPBs(projection, scan->mutable_projected_columns()));
-  req.set_call_seq_id(0);
-  req.set_batch_size_bytes(0);
-  scan->set_read_mode(READ_AT_SNAPSHOT);
-
-  // Send the call
-  {
-    SCOPED_TRACE(SecureDebugString(req));
-    ASSERT_OK(proxy_->Scan(req, &resp, &rpc));
-    SCOPED_TRACE(SecureDebugString(resp));
-    ASSERT_FALSE(resp.has_error());
-  }
-  // Intentionally do not drain the scanner at the end, to leave it open.
-  // This tests tablet server shutdown with an active scanner.
-}
-
-
 // Test retrying a snapshot scan using last_row.
 TEST_F(TabletServerTest, TestSnapshotScan_LastRow) {
   // Set the internal batching within the tserver to be small. Otherwise,
@@ -1266,7 +1773,7 @@ TEST_F(TabletServerTest, TestSnapshotScan_LastRow) {
 
   // Generate some interleaved rows
   for (int i = 0; i < batch_size; i++) {
-    ASSERT_OK(tablet_peer_->tablet()->Flush());
+    ASSERT_OK(tablet_replica_->tablet()->Flush());
     for (int j = 0; j < num_rows; j++) {
       if (j % batch_size == i) {
         InsertTestRowsDirect(j, 1);
@@ -1318,7 +1825,7 @@ TEST_F(TabletServerTest, TestSnapshotScan_LastRow) {
         ASSERT_FALSE(resp.has_error());
       }
       // Save the rows into 'results' vector.
-      StringifyRowsFromResponse(projection, rpc, resp, &results);
+      StringifyRowsFromResponse(projection, rpc, &resp, &results);
       // Retry the scan, setting the last_row_key and snapshot based on the response.
       scan->set_last_primary_key(resp.last_primary_key());
       scan->set_snap_timestamp(resp.snap_timestamp());
@@ -1337,14 +1844,13 @@ TEST_F(TabletServerTest, TestSnapshotScan_LastRow) {
   }
 }
 
-
 // Tests that a read in the future succeeds if a propagated_timestamp (that is even
 // further in the future) follows along. Also tests that the clock was updated so
 // that no writes will ever have a timestamp post this snapshot.
 TEST_F(TabletServerTest, TestSnapshotScan_SnapshotInTheFutureWithPropagatedTimestamp) {
   vector<uint64_t> write_timestamps_collector;
   // perform a write
-  InsertTestRowsRemote(0, 0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
+  InsertTestRowsRemote(0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
 
   ScanRequestPB req;
   ScanResponsePB resp;
@@ -1402,7 +1908,7 @@ TEST_F(TabletServerTest, TestSnapshotScan_SnapshotInTheFutureWithPropagatedTimes
 TEST_F(TabletServerTest, TestSnapshotScan__SnapshotInTheFutureBeyondPropagatedTimestampFails) {
   vector<uint64_t> write_timestamps_collector;
   // perform a write
-  InsertTestRowsRemote(0, 0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
+  InsertTestRowsRemote(0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
 
   ScanRequestPB req;
   ScanResponsePB resp;
@@ -1438,6 +1944,85 @@ TEST_F(TabletServerTest, TestSnapshotScan__SnapshotInTheFutureBeyondPropagatedTi
     ASSERT_TRUE(resp.has_error());
     ASSERT_EQ(TabletServerErrorPB::INVALID_SNAPSHOT, resp.error().code());
   }
+}
+
+// Scan with READ_YOUR_WRITES mode to ensure it can
+// satisfy read-your-writes/read-your-reads session guarantee.
+TEST_F(TabletServerTest, TestScanYourWrites) {
+  vector<uint64_t> write_timestamps_collector;
+  const int kNumRows = 100;
+  // Perform a write.
+  InsertTestRowsRemote(0, kNumRows, 1, nullptr, kTabletId, &write_timestamps_collector);
+
+  // Scan with READ_YOUR_WRITES mode and use the previous
+  // write response as the propagated timestamp.
+  ScanResponsePB resp;
+  int64_t propagated_timestamp = write_timestamps_collector[0];
+  ScanYourWritesTest(propagated_timestamp, &resp);
+
+  // Store the returned snapshot timestamp as the propagated
+  // timestamp for the next read.
+  propagated_timestamp = resp.snap_timestamp();
+  // Drain all the rows from the scanner.
+  vector<string> results;
+  ASSERT_NO_FATAL_FAILURE(DrainScannerToStrings(resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(kNumRows, results.size());
+  ASSERT_EQ(R"((int32 key=0, int32 int_val=0, string string_val="original0"))", results[0]);
+  ASSERT_EQ(R"((int32 key=99, int32 int_val=99, string string_val="original99"))", results[99]);
+
+  // Rescan the tablet to ensure READ_YOUR_WRITES mode can
+  // satisfy read-your-reads session guarantee.
+  ScanResponsePB new_resp;
+  ScanYourWritesTest(propagated_timestamp, &new_resp);
+  // Drain all the rows from the scanner.
+  results.clear();
+  ASSERT_NO_FATAL_FAILURE(DrainScannerToStrings(new_resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(kNumRows, results.size());
+  ASSERT_EQ(R"((int32 key=0, int32 int_val=0, string string_val="original0"))", results[0]);
+  ASSERT_EQ(R"((int32 key=99, int32 int_val=99, string string_val="original99"))", results[99]);
+}
+
+// Tests that a read succeeds even without propagated_timestamp.
+TEST_F(TabletServerTest, TestScanYourWrites_WithoutPropagatedTimestamp) {
+  vector<uint64_t> write_timestamps_collector;
+  // Perform a write.
+  InsertTestRowsRemote(0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
+
+  ScanResponsePB resp;
+  ScanYourWritesTest(Timestamp::kMin.ToUint64(), &resp);
+}
+
+// Tests that a read succeeds even with a future propagated_timestamp. Also
+// tests that the clock was updated so that no writes will ever have a
+// timestamp before this snapshot.
+TEST_F(TabletServerTest, TestScanYourWrites_PropagatedTimestampInTheFuture) {
+  vector<uint64_t> write_timestamps_collector;
+  // Perform a write.
+  InsertTestRowsRemote(0, 1, 1, nullptr, kTabletId, &write_timestamps_collector);
+
+  ScanResponsePB resp;
+  // Increment the write timestamp by 5 secs: the server will definitely consider
+  // this in the future.
+  Timestamp propagated_timestamp(write_timestamps_collector[0]);
+  propagated_timestamp = HybridClock::TimestampFromMicroseconds(
+      HybridClock::GetPhysicalValueMicros(propagated_timestamp) + 5000000);
+  ScanYourWritesTest(propagated_timestamp.ToUint64(), &resp);
+
+  // Make sure the server's current clock returns a value that is larger than the
+  // propagated timestamp. It should have the same physical time, but higher
+  // logical time (due to various calls to clock.Now() when processing the request).
+  Timestamp now = mini_server_->server()->clock()->Now();
+
+  ASSERT_EQ(HybridClock::GetPhysicalValueMicros(propagated_timestamp),
+            HybridClock::GetPhysicalValueMicros(now));
+
+  ASSERT_GT(HybridClock::GetLogicalValue(now),
+            HybridClock::GetLogicalValue(propagated_timestamp));
+
+  vector<string> results;
+  NO_FATALS(DrainScannerToStrings(resp.scanner_id(), schema_, &results));
+  ASSERT_EQ(1, results.size());
+  ASSERT_EQ(R"((int32 key=0, int32 int_val=0, string string_val="original0"))", results[0]);
 }
 
 TEST_F(TabletServerTest, TestScanWithStringPredicates) {
@@ -1587,13 +2172,19 @@ TEST_F(TabletServerTest, TestBadScannerID) {
 
 // Test passing a scanner ID, but also filling in some of the NewScanRequest
 // field.
-TEST_F(TabletServerTest, TestInvalidScanRequest_NewScanAndScannerID) {
+class InvalidScanRequest_NewScanAndScannerIDParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+TEST_P(InvalidScanRequest_NewScanAndScannerIDParamTest, Test) {
+  const ReadMode mode = GetParam();
   ScanRequestPB req;
   ScanResponsePB resp;
   RpcController rpc;
 
   NewScanRequestPB* scan = req.mutable_new_scan_request();
   scan->set_tablet_id(kTabletId);
+  scan->set_read_mode(mode);
   req.set_batch_size_bytes(0); // so it won't return data right away
   req.set_scanner_id("x");
   SCOPED_TRACE(SecureDebugString(req));
@@ -1602,6 +2193,8 @@ TEST_F(TabletServerTest, TestInvalidScanRequest_NewScanAndScannerID) {
   ASSERT_STR_CONTAINS(s.ToString(), "Must not pass both a scanner_id and new_scan_request");
 }
 
+INSTANTIATE_TEST_CASE_P(Params, InvalidScanRequest_NewScanAndScannerIDParamTest,
+                        testing::ValuesIn(read_modes));
 
 // Test that passing a projection with fields not present in the tablet schema
 // throws an exception.
@@ -1656,13 +2249,20 @@ TEST_F(TabletServerTest, TestInvalidScanRequest_BadProjectionTypes) {
 // Test that passing a projection with Column IDs throws an exception.
 // Column IDs are assigned to the user request schema on the tablet server
 // based on the latest schema.
-TEST_F(TabletServerTest, TestInvalidScanRequest_WithIds) {
-  const Schema* projection = tablet_peer_->tablet()->schema();
+class InvalidScanRequest_WithIdsParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+TEST_P(InvalidScanRequest_WithIdsParamTest, Test) {
+  const Schema* projection = tablet_replica_->tablet()->schema();
   ASSERT_TRUE(projection->has_column_ids());
   VerifyScanRequestFailure(*projection,
                            TabletServerErrorPB::INVALID_SCHEMA,
                            "User requests should not have Column IDs");
 }
+
+INSTANTIATE_TEST_CASE_P(Params, InvalidScanRequest_WithIdsParamTest,
+                        testing::ValuesIn(read_modes));
 
 // Test scanning a tablet that has no entries.
 TEST_F(TabletServerTest, TestScan_NoResults) {
@@ -1691,7 +2291,12 @@ TEST_F(TabletServerTest, TestScan_NoResults) {
 }
 
 // Test scanning a tablet that has no entries.
-TEST_F(TabletServerTest, TestScan_InvalidScanSeqId) {
+class InvalidScanSeqIdParamTest :
+    public TabletServerTest,
+    public ::testing::WithParamInterface<ReadMode> {
+};
+TEST_P(InvalidScanSeqIdParamTest, Test) {
+  const ReadMode mode = GetParam();
   InsertTestRowsDirect(0, 10);
 
   ScanRequestPB req;
@@ -1703,6 +2308,7 @@ TEST_F(TabletServerTest, TestScan_InvalidScanSeqId) {
     const Schema& projection = schema_;
     NewScanRequestPB* scan = req.mutable_new_scan_request();
     scan->set_tablet_id(kTabletId);
+    scan->set_read_mode(mode);
     ASSERT_OK(SchemaToColumnPBs(projection, scan->mutable_projected_columns()));
     req.set_call_seq_id(0);
     req.set_batch_size_bytes(0); // so it won't return data right away
@@ -1732,6 +2338,9 @@ TEST_F(TabletServerTest, TestScan_InvalidScanSeqId) {
   }
 }
 
+INSTANTIATE_TEST_CASE_P(Params, InvalidScanSeqIdParamTest,
+                        testing::ValuesIn(read_modes));
+
 // Regression test for KUDU-1789: when ScannerKeepAlive is called on a non-existent
 // scanner, it should properly respond with an error.
 TEST_F(TabletServerTest, TestScan_KeepAliveExpiredScanner) {
@@ -1746,12 +2355,45 @@ TEST_F(TabletServerTest, TestScan_KeepAliveExpiredScanner) {
   ASSERT_EQ(resp.error().code(), TabletServerErrorPB::SCANNER_EXPIRED);
 }
 
+void TabletServerTest::ScanYourWritesTest(uint64_t propagated_timestamp,
+                                          ScanResponsePB* resp) {
+  ScanRequestPB req;
+
+  // Set up a new request with no predicates, all columns.
+  const Schema &projection = schema_;
+  NewScanRequestPB *scan = req.mutable_new_scan_request();
+  scan->set_tablet_id(kTabletId);
+  scan->set_read_mode(READ_YOUR_WRITES);
+  if (propagated_timestamp != Timestamp::kInvalidTimestamp.ToUint64()) {
+    scan->set_propagated_timestamp(propagated_timestamp);
+  }
+  ASSERT_OK(SchemaToColumnPBs(projection, scan->mutable_projected_columns()));
+  req.set_call_seq_id(0);
+  req.set_batch_size_bytes(0); // so it won't return data right away
+
+  {
+    RpcController rpc;
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(proxy_->Scan(req, resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(*resp));
+    ASSERT_FALSE(resp->has_error());
+  }
+
+  // Make sure that the chosen snapshot timestamp is sent back and
+  // it is larger than the previous propagation timestamp.
+  ASSERT_TRUE(resp->has_snap_timestamp());
+  ASSERT_LT(propagated_timestamp, resp->snap_timestamp());
+  // The 'propagated_timestamp' field must be set for 'success' responses.
+  ASSERT_TRUE(resp->has_propagated_timestamp());
+  ASSERT_TRUE(resp->has_more_results());
+}
+
 void TabletServerTest::DoOrderedScanTest(const Schema& projection,
                                          const string& expected_rows_as_string) {
   InsertTestRowsDirect(0, 10);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   InsertTestRowsDirect(10, 10);
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   InsertTestRowsDirect(20, 10);
 
   ScanResponsePB resp;
@@ -1827,7 +2469,7 @@ TEST_F(TabletServerTest, TestAlterSchema) {
   AlterSchemaResponsePB resp;
   RpcController rpc;
 
-  InsertTestRowsRemote(0, 0, 2);
+  InsertTestRowsRemote(0, 2);
 
   // Add one column with a default value
   const int32_t c2_write_default = 5;
@@ -1850,8 +2492,8 @@ TEST_F(TabletServerTest, TestAlterSchema) {
   }
 
   {
-    InsertTestRowsRemote(0, 2, 2);
-    scoped_refptr<TabletPeer> tablet;
+    InsertTestRowsRemote(2, 2);
+    scoped_refptr<TabletReplica> tablet;
     ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
     ASSERT_OK(tablet->tablet()->Flush());
   }
@@ -1883,7 +2525,7 @@ TEST_F(TabletServerTest, TestAlterSchema_AddColWithoutWriteDefault) {
   AlterSchemaResponsePB resp;
   RpcController rpc;
 
-  InsertTestRowsRemote(0, 0, 2);
+  InsertTestRowsRemote(0, 2);
 
   // Add a column with a read-default but no write-default.
   const uint32_t c2_read_default = 7;
@@ -1946,7 +2588,7 @@ TEST_F(TabletServerTest, TestCreateTablet_TabletExists) {
 }
 
 TEST_F(TabletServerTest, TestDeleteTablet) {
-  scoped_refptr<TabletPeer> tablet;
+  scoped_refptr<TabletReplica> tablet;
 
   // Verify that the tablet exists
   ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
@@ -1963,9 +2605,9 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
 
   // Put some data in the tablet. We flush and insert more rows to ensure that
   // there is data both in the MRS and on disk.
-  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(0, 1, 1));
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
-  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(0, 2, 1));
+  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(1, 1));
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
+  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(2, 1));
 
   const int block_count_after_flush = ondisk->value();
   if (FLAGS_block_manager == "log") {
@@ -1975,7 +2617,7 @@ TEST_F(TabletServerTest, TestDeleteTablet) {
   // Drop any local references to the tablet from within this test,
   // so that when we delete it on the server, it's not held alive
   // by the test code.
-  tablet_peer_.reset();
+  tablet_replica_.reset();
   tablet.reset();
 
   DeleteTabletRequestPB req;
@@ -2037,11 +2679,58 @@ TEST_F(TabletServerTest, TestDeleteTablet_TabletNotCreated) {
   }
 }
 
+TEST_F(TabletServerTest, TestDeleteTabletBenchmark) {
+  // Collect some related metrics.
+  scoped_refptr<AtomicGauge<uint64_t>> block_count =
+      METRIC_log_block_manager_blocks_under_management.Instantiate(
+          mini_server_->server()->metric_entity(), 0);
+  scoped_refptr<AtomicGauge<uint64_t>> container =
+      METRIC_log_block_manager_containers.Instantiate(
+          mini_server_->server()->metric_entity(), 0);
+  scoped_refptr<Counter> holes_punched =
+      METRIC_log_block_manager_holes_punched.Instantiate(
+          mini_server_->server()->metric_entity());
+
+  // Put some data in the tablet. We insert rows and flush immediately to
+  // ensure that there is enough blocks on disk to run the benchmark.
+  for (int i = 0; i < FLAGS_delete_tablet_bench_num_flushes; i++) {
+    NO_FATALS(InsertTestRowsRemote(i, 1));
+    ASSERT_OK(tablet_replica_->tablet()->Flush());
+  }
+  const int block_count_before_delete = block_count->value();
+
+  // Drop any local references to the tablet from within this test,
+  // so that when we delete it on the server, it's not held alive
+  // by the test code.
+  tablet_replica_.reset();
+
+  DeleteTabletRequestPB req;
+  DeleteTabletResponsePB resp;
+  RpcController rpc;
+
+  req.set_dest_uuid(mini_server_->server()->fs_manager()->uuid());
+  req.set_tablet_id(kTabletId);
+  req.set_delete_type(tablet::TABLET_DATA_DELETED);
+
+  // Send the call and measure the time spent deleting the tablet.
+  LOG_TIMING(INFO, "deleting tablet") {
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(admin_proxy_->DeleteTablet(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // Log the related metrics.
+  LOG(INFO) << "block_count_before_delete : " << block_count_before_delete;
+  LOG(INFO) << "log_block_manager_containers : " << container->value();
+  LOG(INFO) << "log_block_manager_holes_punched : " << holes_punched->value();
+}
+
 // Test that with concurrent requests to delete the same tablet, one wins and
 // the other fails, with no assertion failures. Regression test for KUDU-345.
 TEST_F(TabletServerTest, TestConcurrentDeleteTablet) {
   // Verify that the tablet exists
-  scoped_refptr<TabletPeer> tablet;
+  scoped_refptr<TabletReplica> tablet;
   ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
 
   static const int kNumDeletes = 2;
@@ -2091,7 +2780,7 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
       FLAGS_single_threaded_insert_latency_bench_warmup_rows : 10;
 
   for (int i = 0; i < warmup; i++) {
-    InsertTestRowsRemote(0, i, 1);
+    InsertTestRowsRemote(i, 1);
   }
 
   uint64_t max_rows = AllowSlowTests() ?
@@ -2101,7 +2790,7 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
 
   for (int i = warmup; i < warmup + max_rows; i++) {
     MonoTime before = MonoTime::Now();
-    InsertTestRowsRemote(0, i, 1);
+    InsertTestRowsRemote(i, 1);
     MonoTime after = MonoTime::Now();
     MonoDelta delta = after - before;
     histogram->Increment(delta.ToMicroseconds());
@@ -2124,14 +2813,14 @@ TEST_F(TabletServerTest, TestInsertLatencyMicroBenchmark) {
 TEST_F(TabletServerTest, TestRpcServerCreateDestroy) {
   RpcServerOptions opts;
   {
-    RpcServer server1(opts);
+    RpcServer server(opts);
   }
   {
-    RpcServer server2(opts);
+    RpcServer server(opts);
     MessengerBuilder mb("foo");
     shared_ptr<Messenger> messenger;
     ASSERT_OK(mb.Build(&messenger));
-    ASSERT_OK(server2.Init(messenger));
+    ASSERT_OK(server.Init(messenger));
   }
 }
 
@@ -2231,7 +2920,7 @@ TEST_F(TabletServerTest, TestChecksumScan) {
 
   // First row.
   int32_t key = 1;
-  InsertTestRowsRemote(0, key, 1);
+  InsertTestRowsRemote(key, 1);
   controller.Reset();
   ASSERT_OK(proxy_->Checksum(req, &resp, &controller));
   total_crc += CalcTestRowChecksum(key);
@@ -2245,7 +2934,7 @@ TEST_F(TabletServerTest, TestChecksumScan) {
 
   // Second row (null string field).
   key = 2;
-  InsertTestRowsRemote(0, key, 1, 1, nullptr, kTabletId, nullptr, nullptr, false);
+  InsertTestRowsRemote(key, 1, 1, nullptr, kTabletId, nullptr, nullptr, false);
   controller.Reset();
   ASSERT_OK(proxy_->Checksum(req, &resp, &controller));
   total_crc += CalcTestRowChecksum(key, false);
@@ -2328,17 +3017,17 @@ void CompactAsync(Tablet* tablet, CountDownLatch* flush_done_latch) {
 TEST_F(TabletServerTest, TestKudu120PreRequisites) {
 
   // Insert a few rows...
-  InsertTestRowsRemote(0, 0, 10);
+  InsertTestRowsRemote(0, 10);
   // ... now flush ...
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
   // ... insert a few rows...
-  InsertTestRowsRemote(0, 10, 10);
+  InsertTestRowsRemote(10, 10);
   // ... and flush again so that we have two disk row sets.
-  ASSERT_OK(tablet_peer_->tablet()->Flush());
+  ASSERT_OK(tablet_replica_->tablet()->Flush());
 
   // Add a hook so that we can make the log wait right after an append
   // (before the callback is triggered).
-  log::Log* log = tablet_peer_->log();
+  log::Log* log = tablet_replica_->log();
   shared_ptr<DelayFsyncLogHook> log_hook(new DelayFsyncLogHook);
   log->SetLogFaultHooksForTests(log_hook);
 
@@ -2358,7 +3047,7 @@ TEST_F(TabletServerTest, TestKudu120PreRequisites) {
   CountDownLatch flush_done_latch(1);
   CHECK_OK(kudu::Thread::Create("CompactThread", "CompactThread",
                                 CompactAsync,
-                                tablet_peer_->tablet(),
+                                tablet_replica_->tablet(),
                                 &flush_done_latch,
                                 &flush_thread));
 
@@ -2392,6 +3081,81 @@ TEST_F(TabletServerTest, TestFailedDnsResolution) {
   mini_server_->server()->heartbeater()->TriggerASAP();
   // Wait to make sure the heartbeater thread attempts the DNS lookup.
   usleep(100 * 1000);
+}
+
+TEST_F(TabletServerTest, TestDataDirGroupsCreated) {
+  // Get the original superblock.
+  TabletSuperBlockPB superblock;
+  tablet_replica_->tablet()->metadata()->ToSuperBlock(&superblock);
+  DataDirGroupPB orig_group = superblock.data_dir_group();
+
+  // Remove the DataDirGroupPB on-disk.
+  superblock.clear_data_dir_group();
+  ASSERT_FALSE(superblock.has_data_dir_group());
+  string tablet_meta_path = JoinPathSegments(GetTestPath("TabletServerTest-fsroot"), "tablet-meta");
+  string pb_path = JoinPathSegments(tablet_meta_path, tablet_replica_->tablet_id());
+  ASSERT_OK(pb_util::WritePBContainerToPath(Env::Default(),
+      pb_path, superblock, pb_util::OVERWRITE, pb_util::SYNC));
+
+  // Verify that the on-disk copy has its DataDirGroup missing.
+  ASSERT_OK(tablet_replica_->tablet()->metadata()->ReadSuperBlockFromDisk(&superblock));
+  ASSERT_FALSE(superblock.has_data_dir_group());
+
+  // Restart the server and check that a new group is created. By default, the
+  // group will be created with all data directories and should be identical to
+  // the original one.
+  ASSERT_OK(ShutdownAndRebuildTablet());
+  tablet_replica_->tablet()->metadata()->ToSuperBlock(&superblock);
+  DataDirGroupPB new_group = superblock.data_dir_group();
+  MessageDifferencer md;
+  ASSERT_TRUE(md.Compare(orig_group, new_group));
+}
+
+TEST_F(TabletServerTest, TestNoMetricsForTombstonedTablet) {
+  // Force the metrics to be retired immediately.
+  FLAGS_metrics_retirement_age_ms = 0;
+
+  scoped_refptr<TabletReplica> tablet;
+  ASSERT_TRUE(mini_server_->server()->tablet_manager()->LookupTablet(kTabletId, &tablet));
+
+  // Insert one row and check the insertion is recorded in the metrics.
+  ASSERT_NO_FATAL_FAILURE(InsertTestRowsRemote(0, 1, 1));
+  scoped_refptr<Counter> rows_inserted =
+      METRIC_rows_inserted.Instantiate(tablet->tablet()->GetMetricEntity());
+  int64_t num_rows_running = rows_inserted->value();
+  ASSERT_EQ(1, num_rows_running);
+
+  // Tombstone the tablet.
+  DeleteTabletRequestPB req;
+  DeleteTabletResponsePB resp;
+  RpcController rpc;
+  req.set_dest_uuid(mini_server_->server()->fs_manager()->uuid());
+  req.set_tablet_id(kTabletId);
+  req.set_delete_type(tablet::TABLET_DATA_TOMBSTONED);
+  {
+    SCOPED_TRACE(SecureDebugString(req));
+    ASSERT_OK(admin_proxy_->DeleteTablet(req, &resp, &rpc));
+    SCOPED_TRACE(SecureDebugString(resp));
+    ASSERT_FALSE(resp.has_error());
+  }
+
+  // It takes three calls to /jsonmetricz for the tablet metrics to go away, based on the
+  // policy in MetricRegistry::RetireOldMetrics:
+  // 1. The entity's metrics are returned, but also marked for retirement.
+  // 2. The entity's metrics are returned, but also retired (causing the entity to be retired).
+  // 3. The metrics aren't returned-- the entity has been removed from the metrics registry.
+  EasyCurl c;
+  faststring buf;
+  for (int i = 0; i < 3; i++) {
+    ASSERT_OK(c.FetchURL(strings::Substitute("http://$0/jsonmetricz",
+                                             mini_server_->bound_http_addr().ToString()),
+                         &buf));
+    if (i < 2) {
+      ASSERT_STR_CONTAINS(buf.ToString(), "\"type\": \"tablet\"");
+    } else {
+      ASSERT_STR_NOT_CONTAINS(buf.ToString(), "\"type\": \"tablet\"");
+    }
+  }
 }
 
 } // namespace tserver

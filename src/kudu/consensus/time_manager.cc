@@ -15,12 +15,22 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cstdint>
 #include <mutex>
+#include <ostream>
+
 #include <gflags/gflags.h>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 
 #include "kudu/consensus/consensus.pb.h"
 #include "kudu/consensus/time_manager.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/countdown_latch.h"
 #include "kudu/util/flag_tags.h"
 
 DEFINE_bool(safe_time_advancement_without_writes, true,
@@ -42,11 +52,12 @@ TAG_FLAG(safe_time_max_lag_ms, experimental);
 DECLARE_int32(raft_heartbeat_interval_ms);
 DECLARE_int32(scanner_max_wait_ms);
 
+using kudu::clock::Clock;
+using std::string;
+using strings::Substitute;
+
 namespace kudu {
 namespace consensus {
-
-using server::Clock;
-using strings::Substitute;
 
 typedef std::lock_guard<simple_spinlock> Lock;
 
@@ -89,7 +100,7 @@ Status TimeManager::AssignTimestamp(ReplicateMsg* message) {
   Timestamp t;
   switch (GetMessageConsistencyMode(*message)) {
     case COMMIT_WAIT: t = GetSerialTimestampPlusMaxError(); break;
-    case CLIENT_PROPAGATED:  t = GetSerialTimestamp(); break;
+    case CLIENT_PROPAGATED:  t = GetSerialTimestampUnlocked(); break;
     default: return Status::NotSupported("Unsupported external consistency mode.");
   }
   message->set_timestamp(t.value());
@@ -140,6 +151,8 @@ void TimeManager::AdvanceSafeTime(Timestamp safe_time) {
 }
 
 bool TimeManager::HasAdvancedSafeTimeRecentlyUnlocked(string* error_message) {
+  DCHECK(lock_.is_locked());
+
   MonoDelta time_since_last_advance = MonoTime::Now() - last_advanced_safe_time_;
   int64_t max_last_advanced = FLAGS_missed_heartbeats_before_rejecting_snapshot_scans *
       FLAGS_raft_heartbeat_interval_ms;
@@ -157,6 +170,8 @@ bool TimeManager::HasAdvancedSafeTimeRecentlyUnlocked(string* error_message) {
 }
 
 bool TimeManager::IsSafeTimeLaggingUnlocked(Timestamp timestamp, string* error_message) {
+  DCHECK(lock_.is_locked());
+
   // Can't calculate safe time lag for the logical clock.
   if (PREDICT_FALSE(!clock_->HasPhysicalComponent())) return false;
   MonoDelta safe_time_diff = clock_->GetPhysicalComponentDifference(timestamp,
@@ -172,6 +187,8 @@ bool TimeManager::IsSafeTimeLaggingUnlocked(Timestamp timestamp, string* error_m
 }
 
 void TimeManager::MakeWaiterTimeoutMessageUnlocked(Timestamp timestamp, string* error_message) {
+  DCHECK(lock_.is_locked());
+
   string mode = mode_ == LEADER ? "LEADER" : "NON-LEADER";
   string clock_diff = clock_->HasPhysicalComponent() ? clock_->GetPhysicalComponentDifference(
       timestamp, last_safe_ts_).ToString() : "None (Logical clock)";
@@ -238,6 +255,8 @@ Status TimeManager::WaitUntilSafe(Timestamp timestamp, const MonoTime& deadline)
 }
 
 void TimeManager::AdvanceSafeTimeAndWakeUpWaitersUnlocked(Timestamp safe_time) {
+  DCHECK(lock_.is_locked());
+
   if (safe_time <= last_safe_ts_) {
     return;
   }
@@ -258,6 +277,11 @@ void TimeManager::AdvanceSafeTimeAndWakeUpWaitersUnlocked(Timestamp safe_time) {
   }
 }
 
+bool TimeManager::IsTimestampSafe(Timestamp timestamp) {
+  Lock l(lock_);
+  return IsTimestampSafeUnlocked(timestamp);
+}
+
 bool TimeManager::IsTimestampSafeUnlocked(Timestamp timestamp) {
   return timestamp <= GetSafeTimeUnlocked();
 }
@@ -268,6 +292,8 @@ Timestamp TimeManager::GetSafeTime()  {
 }
 
 Timestamp TimeManager::GetSafeTimeUnlocked() {
+  DCHECK(lock_.is_locked());
+
   switch (mode_) {
     case LEADER: {
       // In ASCII form, where 'S' represents a safe timestamp, 'A' represents the last assigned
@@ -307,6 +333,13 @@ Timestamp TimeManager::GetSafeTimeUnlocked() {
 }
 
 Timestamp TimeManager::GetSerialTimestamp() {
+  Lock l(lock_);
+  return GetSerialTimestampUnlocked();
+}
+
+Timestamp TimeManager::GetSerialTimestampUnlocked() {
+  DCHECK(lock_.is_locked());
+
   last_serial_ts_assigned_ = clock_->Now();
   return last_serial_ts_assigned_;
 }

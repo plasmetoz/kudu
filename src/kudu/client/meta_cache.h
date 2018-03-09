@@ -19,37 +19,39 @@
 #ifndef KUDU_CLIENT_META_CACHE_H
 #define KUDU_CLIENT_META_CACHE_H
 
-#include <boost/function.hpp>
 #include <map>
+#include <memory>
 #include <set>
 #include <string>
-#include <memory>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
+#include "kudu/client/replica_controller-internal.h"
 #include "kudu/common/partition.h"
 #include "kudu/consensus/metadata.pb.h"
 #include "kudu/gutil/macros.h"
 #include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc.h"
-#include "kudu/util/async_util.h"
 #include "kudu/util/locks.h"
-#include "kudu/util/memory/arena.h"
 #include "kudu/util/monotime.h"
 #include "kudu/util/net/net_util.h"
 #include "kudu/util/semaphore.h"
 #include "kudu/util/status.h"
+#include "kudu/util/status_callback.h"
 
 namespace kudu {
 
-class KuduPartialRow;
+class Sockaddr;
 
 namespace tserver {
 class TabletServerServiceProxy;
 } // namespace tserver
 
 namespace master {
-class MasterServiceProxy;
 class TabletLocationsPB_ReplicaPB;
 class TSInfoPB;
 } // namespace master
@@ -62,6 +64,15 @@ class KuduClient;
 class KuduTable;
 
 namespace internal {
+
+// The number of tablets to fetch from the master in a round trip when performing
+// a lookup of a single partition (e.g. for a write), or re-looking-up a tablet with
+// stale information.
+const int kFetchTabletsPerPointLookup = 10;
+// The number of tablets to fetch from the master when looking up a range of tablets.
+const int kFetchTabletsPerRangeLookup = 1000;
+
+////////////////////////////////////////////////////////////
 
 class LookupRpc;
 class MetaCache;
@@ -130,7 +141,12 @@ class MetaCacheServerPicker : public rpc::ServerPicker<RemoteTabletServer> {
 
   virtual ~MetaCacheServerPicker() {}
   void PickLeader(const ServerPickedCallback& callback, const MonoTime& deadline) override;
+
+  // In the case of this MetaCacheServerPicker class, the implementation of this
+  // method is very selective. It marks only servers hosting the remote tablet
+  // the MetaCacheServerPicker object is bound to, not the entire RemoteTabletServer.
   void MarkServerFailed(RemoteTabletServer* replica, const Status& status) override;
+
   void MarkReplicaNotLeader(RemoteTabletServer* replica) override;
   void MarkResourceNotFound(RemoteTabletServer* replica) override;
  private:
@@ -354,7 +370,7 @@ class MetaCacheEntry {
 class MetaCache : public RefCountedThreadSafe<MetaCache> {
  public:
   // The passed 'client' object must remain valid as long as MetaCache is alive.
-  explicit MetaCache(KuduClient* client);
+  MetaCache(KuduClient* client, ReplicaController::Visibility replica_visibility);
   ~MetaCache();
 
   // Look up which tablet hosts the given partition key for a table. When it is
@@ -378,7 +394,11 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
                                std::string partition_key,
                                const MonoTime& deadline,
                                scoped_refptr<RemoteTablet>* remote_tablet,
-                               const StatusCallback& callback);
+                               const StatusCallback& callback,
+                               int max_returned_locations = kFetchTabletsPerPointLookup);
+
+  // Clears the non-covered range entries from a table's meta cache.
+  void ClearNonCoveredRangeEntries(const std::string& table_id);
 
   // Clears the meta cache.
   void ClearCache();
@@ -402,7 +422,9 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
 
   // Called on the slow LookupTablet path when the master responds. Populates
   // the tablet caches and returns a reference to the first one.
-  Status ProcessLookupResponse(const LookupRpc& rpc, MetaCacheEntry* entry);
+  Status ProcessLookupResponse(const LookupRpc& rpc,
+                               MetaCacheEntry* cache_entry,
+                               int max_returned_locations);
 
   // Lookup the given tablet by key, only consulting local information.
   // Returns true and sets *remote_tablet if successful.
@@ -449,6 +471,9 @@ class MetaCache : public RefCountedThreadSafe<MetaCache> {
   // Prevents master lookup "storms" by delaying master lookups when all
   // permits have been acquired.
   Semaphore master_lookup_sem_;
+
+  // Policy on tablet replica visibility: what type of replicas to expose.
+  const ReplicaController::Visibility replica_visibility_;
 
   DISALLOW_COPY_AND_ASSIGN(MetaCache);
 };

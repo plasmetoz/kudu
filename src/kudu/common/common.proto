@@ -23,6 +23,7 @@
 // in common/wire_protocol.proto instead. If it is only used within
 // the server(s), it should go in cfile/cfile.proto, server/metadata.proto,
 // etc, as appropriate.
+syntax = "proto2";
 package kudu;
 
 option java_package = "org.apache.kudu";
@@ -49,6 +50,10 @@ enum DataType {
   DOUBLE = 11;
   BINARY = 12;
   UNIXTIME_MICROS = 13;
+  INT128 = 14;
+  DECIMAL32 = 15;
+  DECIMAL64 = 16;
+  DECIMAL128 = 17;
 }
 
 enum EncodingType {
@@ -61,6 +66,14 @@ enum EncodingType {
   RLE = 4;
   DICT_ENCODING = 5;
   BIT_SHUFFLE = 6;
+}
+
+// Holds detailed attributes for the column. Only certain fields will be set,
+// depending on the type of the column.
+message ColumnTypeAttributesPB {
+  // For decimal columns
+  optional int32 precision = 1;
+  optional int32 scale = 2;
 }
 
 // TODO: Differentiate between the schema attributes
@@ -93,6 +106,20 @@ message ColumnSchemaPB {
   optional EncodingType encoding = 8 [default=AUTO_ENCODING];
   optional CompressionType compression = 9 [default=DEFAULT_COMPRESSION];
   optional int32 cfile_block_size = 10 [default=0];
+
+  optional ColumnTypeAttributesPB type_attributes = 11;
+}
+
+message ColumnSchemaDeltaPB {
+  optional string name = 1;
+  optional string new_name = 2;
+
+  optional bytes default_value = 4;
+  optional bool remove_default = 5;
+
+  optional EncodingType encoding = 6;
+  optional CompressionType compression = 7;
+  optional int32 block_size = 8;
 }
 
 message SchemaPB {
@@ -190,7 +217,7 @@ enum ReadMode {
   // is lower than the snapshot's timestamp to complete.
   //
   // When mixing reads and writes clients that specify COMMIT_WAIT as their
-  // external consistency mode and then use the returned write_timestamp to
+  // external consistency mode and then use the returned write_timestamp
   // to perform snapshot reads are guaranteed that that snapshot time is
   // considered in the past by all servers and no additional action is
   // necessary. Clients using CLIENT_PROPAGATED however must forcibly propagate
@@ -204,6 +231,29 @@ enum ReadMode {
   // the former.
   // TODO implement actually signing the propagated timestamp.
   READ_AT_SNAPSHOT = 2;
+
+  // When READ_YOUR_WRITES is specified, the server will pick a timestamp to use
+  // for a server-local snapshot scan subject to the following criteria:
+  // (1) It will be higher than the propagated timestamp,
+  // (2) It will attempt to minimize latency caused by waiting for outstanding
+  //     write transactions to complete.
+  // More specifically, the server will choose the latest timestamp higher than
+  // the provided propagated timestamp bound that allows execution of the
+  // reads without being blocked by the in-flight transactions (however the
+  // read can be blocked if the propagated timestamp is higher than some in-flight
+  // transactions). If no propagated timestamp is provided the server will choose
+  // a timestamp such that all transactions before it are committed. The chosen
+  // timestamp will be returned back to the client as 'snapshot timestamp'. The Kudu
+  // client library will use it as the propagated timestamp for subsequent reads
+  // to avoid unnecessarily waiting.
+  //
+  // Reads in this mode are not repeatable: two READ_YOUR_WRITES reads, even if
+  // they provide the same propagated timestamp bound, can execute at different
+  // timestamps and thus return different results. However, it allows
+  // read-your-writes and read-your-reads for each client, as the chosen
+  // timestamp must be higher than the one of the last write or read,
+  // known from the propagated timestamp.
+  READ_YOUR_WRITES = 3;
 }
 
 // The possible order modes for clients.
@@ -216,6 +266,16 @@ enum OrderMode {
   // This is the default order mode.
   UNORDERED = 1;
   ORDERED = 2;
+}
+
+// Policy with which to choose among multiple replicas.
+enum ReplicaSelection {
+  UNKNOWN_REPLICA_SELECTION = 0;
+  // Select the LEADER replica.
+  LEADER_ONLY = 1;
+  // Select the closest replica to the client, or a random one if all replicas
+  // are equidistant.
+  CLOSEST_REPLICA = 2;
 }
 
 // The serialized format of a Kudu table partition schema.

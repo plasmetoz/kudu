@@ -21,6 +21,9 @@
 #include <vector>
 
 #include "kudu/client/client.h"
+#include "kudu/client/replica_controller-internal.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/util/monotime.h"
 
 namespace kudu {
 
@@ -35,6 +38,7 @@ class KuduClientBuilder::Data {
   MonoDelta default_admin_operation_timeout_;
   MonoDelta default_rpc_timeout_;
   std::string authn_creds_;
+  internal::ReplicaController::Visibility replica_visibility_;
 
   DISALLOW_COPY_AND_ASSIGN(Data);
 };

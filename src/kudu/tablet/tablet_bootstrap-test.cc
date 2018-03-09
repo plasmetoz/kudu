@@ -17,20 +17,66 @@
 
 #include "kudu/consensus/log-test-base.h"
 
+#include <cstddef>
+#include <cstdint>
+#include <limits>
 #include <memory>
+#include <ostream>
+#include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/clock/clock.h"
+#include "kudu/clock/logical_clock.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/iterator.h"
-#include "kudu/consensus/consensus_meta.h"
+#include "kudu/common/partition.h"
+#include "kudu/common/schema.h"
+#include "kudu/common/timestamp.h"
+#include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
 #include "kudu/consensus/consensus-test-util.h"
+#include "kudu/consensus/consensus.pb.h"
+#include "kudu/consensus/consensus_meta.h"
+#include "kudu/consensus/consensus_meta_manager.h"
+#include "kudu/consensus/log.h"
 #include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/log_reader.h"
 #include "kudu/consensus/log_util.h"
 #include "kudu/consensus/metadata.pb.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/consensus/opid_util.h"
-#include "kudu/server/logical_clock.h"
-#include "kudu/tablet/tablet_bootstrap.h"
+#include "kudu/consensus/raft_consensus.h"
+#include "kudu/consensus/ref_counted_replicate.h"
+#include "kudu/fs/data_dirs.h"
+#include "kudu/fs/fs_manager.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/rpc/result_tracker.h"
+#include "kudu/tablet/metadata.pb.h"
+#include "kudu/tablet/mvcc.h"
+#include "kudu/tablet/rowset_metadata.h"
+#include "kudu/tablet/tablet-harness.h"
 #include "kudu/tablet/tablet-test-util.h"
+#include "kudu/tablet/tablet.h"
+#include "kudu/tablet/tablet.pb.h"
+#include "kudu/tablet/tablet_bootstrap.h"
 #include "kudu/tablet/tablet_metadata.h"
+#include "kudu/tablet/tablet_replica.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/util/env.h"
+#include "kudu/util/logging_test_util.h"
+#include "kudu/util/pb_util.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 
 using std::shared_ptr;
 using std::string;
@@ -38,22 +84,26 @@ using std::unique_ptr;
 using std::vector;
 
 namespace kudu {
+
+class MemTracker;
+
 namespace tablet {
 
+using clock::Clock;
+using clock::LogicalClock;
 using consensus::ConsensusBootstrapInfo;
 using consensus::ConsensusMetadata;
-using consensus::kMinimumTerm;
+using consensus::ConsensusMetadataManager;
 using consensus::MakeOpId;
 using consensus::OpId;
 using consensus::ReplicateMsg;
 using consensus::ReplicateRefPtr;
+using consensus::kMinimumTerm;
 using consensus::make_scoped_refptr_replicate;
 using log::Log;
 using log::LogAnchorRegistry;
 using log::LogTestBase;
-using log::ReadableLogSegment;
-using server::Clock;
-using server::LogicalClock;
+using pb_util::SecureShortDebugString;
 using tserver::WriteRequestPB;
 
 class BootstrapTest : public LogTestBase {
@@ -61,6 +111,7 @@ class BootstrapTest : public LogTestBase {
 
   void SetUp() OVERRIDE {
     LogTestBase::SetUp();
+    cmeta_manager_.reset(new ConsensusMetadataManager(fs_manager_.get()));
   }
 
   Status LoadTestTabletMetadata(int mrs_id, int delta_id, scoped_refptr<TabletMetadata>* meta) {
@@ -75,12 +126,26 @@ class BootstrapTest : public LogTestBase {
                                                partition.first,
                                                partition.second,
                                                TABLET_DATA_READY,
+                                               /*tombstone_last_logged_opid=*/ boost::none,
                                                meta));
     (*meta)->SetLastDurableMrsIdForTests(mrs_id);
     if ((*meta)->GetRowSetForTests(0) != nullptr) {
       (*meta)->GetRowSetForTests(0)->SetLastDurableRedoDmsIdForTests(delta_id);
     }
     return (*meta)->Flush();
+  }
+
+  Status CreateConsensusMetadata(const scoped_refptr<TabletMetadata>& meta) {
+    consensus::RaftConfigPB config;
+    config.set_opid_index(consensus::kInvalidOpIdIndex);
+    consensus::RaftPeerPB* peer = config.add_peers();
+    peer->set_permanent_uuid(meta->fs_manager()->uuid());
+    peer->set_member_type(consensus::RaftPeerPB::VOTER);
+
+    RETURN_NOT_OK_PREPEND(cmeta_manager_->Create(meta->tablet_id(), config, kMinimumTerm),
+                          "Unable to create consensus metadata");
+
+    return Status::OK();
   }
 
   Status PersistTestTabletMetadataState(TabletDataState state) {
@@ -94,10 +159,15 @@ class BootstrapTest : public LogTestBase {
   Status RunBootstrapOnTestTablet(const scoped_refptr<TabletMetadata>& meta,
                                   shared_ptr<Tablet>* tablet,
                                   ConsensusBootstrapInfo* boot_info) {
+
+    scoped_refptr<ConsensusMetadata> cmeta;
+    RETURN_NOT_OK(cmeta_manager_->Load(meta->tablet_id(), &cmeta));
+
     scoped_refptr<LogAnchorRegistry> log_anchor_registry(new LogAnchorRegistry());
     // Now attempt to recover the log
     RETURN_NOT_OK(BootstrapTablet(
         meta,
+        cmeta->CommittedConfig(),
         scoped_refptr<Clock>(LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp)),
         shared_ptr<MemTracker>(),
         scoped_refptr<rpc::ResultTracker>(),
@@ -119,17 +189,7 @@ class BootstrapTest : public LogTestBase {
     RETURN_NOT_OK_PREPEND(LoadTestTabletMetadata(mrs_id, delta_id, &meta),
                           "Unable to load test tablet metadata");
 
-    consensus::RaftConfigPB config;
-    config.set_opid_index(consensus::kInvalidOpIdIndex);
-    consensus::RaftPeerPB* peer = config.add_peers();
-    peer->set_permanent_uuid(meta->fs_manager()->uuid());
-    peer->set_member_type(consensus::RaftPeerPB::VOTER);
-
-    unique_ptr<ConsensusMetadata> cmeta;
-    RETURN_NOT_OK_PREPEND(ConsensusMetadata::Create(meta->fs_manager(), meta->tablet_id(),
-                                                    meta->fs_manager()->uuid(),
-                                                    config, kMinimumTerm, &cmeta),
-                          "Unable to create consensus metadata");
+    RETURN_NOT_OK(CreateConsensusMetadata(meta));
 
     RETURN_NOT_OK_PREPEND(RunBootstrapOnTestTablet(meta, tablet, boot_info),
                           "Unable to bootstrap test tablet");
@@ -151,6 +211,8 @@ class BootstrapTest : public LogTestBase {
       VLOG(1) << result;
     }
   }
+
+  scoped_refptr<ConsensusMetadataManager> cmeta_manager_;
 };
 
 // Tests a normal bootstrap scenario
@@ -164,7 +226,17 @@ TEST_F(BootstrapTest, TestBootstrap) {
 
   shared_ptr<Tablet> tablet;
   ConsensusBootstrapInfo boot_info;
-  ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  StringVectorSink capture_logs;
+  {
+    // Capture the log messages during bootstrap.
+    ScopedRegisterSink reg(&capture_logs);
+    ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+  }
+
+  // Make sure we don't see anything in the logs that would make a user scared.
+  for (const string& s : capture_logs.logged_msgs()) {
+    ASSERT_STR_NOT_MATCHES(s, "[cC]orrupt");
+  }
 
   vector<string> results;
   IterateTabletRows(tablet.get(), &results);
@@ -202,6 +274,7 @@ TEST_F(BootstrapTest, TestIncompleteTabletCopy) {
   ASSERT_OK(PersistTestTabletMetadataState(TABLET_DATA_COPYING));
   shared_ptr<Tablet> tablet;
   ConsensusBootstrapInfo boot_info;
+  fs_manager_->dd_manager()->DeleteDataDirGroup(log::kTestTablet);
   Status s = BootstrapTestTablet(-1, -1, &tablet, &boot_info);
   ASSERT_TRUE(s.IsCorruption()) << "Expected corruption: " << s.ToString();
   ASSERT_STR_CONTAINS(s.ToString(), "TabletMetadata bootstrap state is TABLET_DATA_COPYING");
@@ -231,25 +304,33 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
   // Step 2) Write the corresponding COMMIT in the second segment.
   AppendCommit(opid);
 
+  scoped_refptr<TabletMetadata> meta;
+  ASSERT_OK(LoadTestTabletMetadata(/*mrs_id=*/ -1, /*delta_id=*/ -1, &meta));
+  ASSERT_OK(CreateConsensusMetadata(meta));
+
   {
     shared_ptr<Tablet> tablet;
     ConsensusBootstrapInfo boot_info;
 
     // Step 3) Apply the operations in the log to the tablet and flush
     // the tablet to disk.
-    ASSERT_OK(BootstrapTestTablet(-1, -1, &tablet, &boot_info));
+    ASSERT_OK(RunBootstrapOnTestTablet(meta, &tablet, &boot_info));
     ASSERT_OK(tablet->Flush());
 
     // Create a new log segment.
     ASSERT_OK(RollLog());
 
-    // Step 4) Create an orphanned commit by first adding a commit to
+    // Step 4) Create an orphaned commit by first adding a commit to
     // the newly rolled logfile, and then by removing the previous
     // commits.
     AppendCommit(opid);
     log::SegmentSequence segments;
     ASSERT_OK(log_->reader()->GetSegmentsSnapshot(&segments));
     fs_manager_->env()->DeleteFile(segments[0]->path());
+
+    // Untrack the tablet in the data dir manager so upon the next call to
+    // BootstrapTestTablet, the tablet metadata's data dir group can be loaded.
+    fs_manager_->dd_manager()->DeleteDataDirGroup(tablet->tablet_id());
   }
   {
     shared_ptr<Tablet> tablet;
@@ -257,7 +338,8 @@ TEST_F(BootstrapTest, TestOrphanCommit) {
 
     // Note: when GLOG_v=1, the test logs should include 'Ignoring
     // orphan commit: op_type: WRITE_OP...' line.
-    ASSERT_OK(BootstrapTestTablet(2, 1, &tablet, &boot_info));
+    ASSERT_OK(LoadTestTabletMetadata(/*mrs_id=*/ 2, /*delta_id=*/ 1, &meta));
+    ASSERT_OK(RunBootstrapOnTestTablet(meta, &tablet, &boot_info));
 
     // Confirm that the legitimate data (from Step 3) is still there.
     vector<string> results;
@@ -380,7 +462,7 @@ TEST_F(BootstrapTest, TestMissingConsensusMetadata) {
   Status s = RunBootstrapOnTestTablet(meta, &tablet, &boot_info);
 
   ASSERT_TRUE(s.IsNotFound());
-  ASSERT_STR_CONTAINS(s.ToString(), "Unable to load Consensus metadata");
+  ASSERT_STR_CONTAINS(s.ToString(), "Unable to load consensus metadata");
 }
 
 TEST_F(BootstrapTest, TestOperationOverwriting) {
@@ -572,7 +654,7 @@ TEST_F(BootstrapTest, TestConsensusOnlyOperationOutOfOrderTimestamp) {
   AppendCommit(std::move(mutate_commit));
 
   // ...and WRITE_OP...
-  mutate_commit.reset(new consensus::CommitMsg);
+  mutate_commit = gscoped_ptr<consensus::CommitMsg>(new consensus::CommitMsg);
   mutate_commit->set_op_type(consensus::WRITE_OP);
   *mutate_commit->mutable_commited_op_id() = write_replicate->get()->id();
   TxResultPB* result = mutate_commit->mutable_result();

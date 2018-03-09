@@ -17,22 +17,33 @@
 #ifndef KUDU_COMMON_MERGE_ITERATOR_H
 #define KUDU_COMMON_MERGE_ITERATOR_H
 
+#include <cstddef>
+#include <cstdint>
 #include <deque>
-#include <gtest/gtest_prod.h>
 #include <memory>
+#include <ostream>
 #include <string>
-#include <tuple>
-#include <unordered_map>
+#include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest_prod.h>
+
+#include "kudu/common/column_predicate.h"
 #include "kudu/common/iterator.h"
+#include "kudu/common/iterator_stats.h"
 #include "kudu/common/scan_spec.h"
+#include "kudu/common/schema.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
+#include "kudu/util/locks.h"
 #include "kudu/util/object_pool.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
-class Arena;
 class MergeIterState;
+class RowBlock;
 
 // An iterator which merges the results of other iterators, comparing
 // based on keys.
@@ -41,8 +52,8 @@ class MergeIterator : public RowwiseIterator {
   // TODO: clarify whether schema is just the projection, or must include the merge
   // key columns. It should probably just be the required projection, which must be
   // a subset of the columns in 'iters'.
-  MergeIterator(const Schema &schema,
-                const std::vector<std::shared_ptr<RowwiseIterator> > &iters);
+  MergeIterator(const Schema& schema,
+                std::vector<std::shared_ptr<RowwiseIterator>> iters);
   virtual ~MergeIterator();
 
   // The passed-in iterators should be already initialized.
@@ -50,7 +61,7 @@ class MergeIterator : public RowwiseIterator {
 
   virtual bool HasNext() const OVERRIDE;
 
-  virtual string ToString() const OVERRIDE;
+  virtual std::string ToString() const OVERRIDE;
 
   virtual const Schema& schema() const OVERRIDE;
 
@@ -67,10 +78,21 @@ class MergeIterator : public RowwiseIterator {
 
   bool initted_;
 
-  // Holds the subiterators until Init is called.
+  // Holds the subiterators until Init is called, at which point this is cleared.
   // This is required because we can't create a MergeIterState of an uninitialized iterator.
-  std::deque<std::shared_ptr<RowwiseIterator> > orig_iters_;
-  std::vector<std::unique_ptr<MergeIterState> > iters_;
+  std::vector<std::shared_ptr<RowwiseIterator>> orig_iters_;
+
+  // See UnionIterator::iters_lock_ for details on locking. This follows the same
+  // pattern.
+  mutable rw_spinlock iters_lock_;
+  std::vector<std::unique_ptr<MergeIterState>> iters_;
+
+  // Statistics (keyed by projection column index) accumulated so far by any
+  // fully-consumed sub-iterators.
+  std::vector<IteratorStats> finished_iter_stats_by_col_;
+
+  // The number of iterators, used by ToString().
+  const int num_orig_iters_;
 
   // When the underlying iterators are initialized, each needs its own
   // copy of the scan spec in order to do its own pushdown calculations, etc.
@@ -92,13 +114,13 @@ class UnionIterator : public RowwiseIterator {
   //
   // All passed-in iterators must be fully able to evaluate all predicates - i.e.
   // calling iter->Init(spec) should remove all predicates from the spec.
-  explicit UnionIterator(const std::vector<std::shared_ptr<RowwiseIterator> > &iters);
+  explicit UnionIterator(std::vector<std::shared_ptr<RowwiseIterator>> iters);
 
   Status Init(ScanSpec *spec) OVERRIDE;
 
   bool HasNext() const OVERRIDE;
 
-  string ToString() const OVERRIDE;
+  std::string ToString() const OVERRIDE;
 
   const Schema &schema() const OVERRIDE {
     CHECK(initted_);
@@ -116,14 +138,28 @@ class UnionIterator : public RowwiseIterator {
   void FinishBatch();
   Status InitSubIterators(ScanSpec *spec);
 
+  // Pop the front iterator from iters_ and accumulate its statistics into
+  // finished_iter_stats_by_col_.
+  void PopFront();
+
   // Schema: initialized during Init()
   gscoped_ptr<Schema> schema_;
   bool initted_;
-  std::deque<std::shared_ptr<RowwiseIterator> > iters_;
 
-  // Since we pop from 'iters_' this field is needed in order to keep
-  // the underlying iterators available for GetIteratorStats.
-  std::vector<std::shared_ptr<RowwiseIterator> > all_iters_;
+  // Lock protecting 'iters_' and 'finished_iter_stats_by_col_'.
+  //
+  // Scanners are mostly accessed by the thread doing the scanning, but the HTTP endpoint
+  // which lists running scans may occasionally need to read as well.
+  //
+  // The "owner" thread of the scanner doesn't need to acquire this in read mode, since
+  // it's the only thread which might write. However, it does need to acquire in write
+  // mode when changing 'iters_'.
+  mutable rw_spinlock iters_lock_;
+  std::deque<std::shared_ptr<RowwiseIterator>> iters_;
+
+  // Statistics (keyed by projection column index) accumulated so far by any
+  // fully-consumed sub-iterators.
+  std::vector<IteratorStats> finished_iter_stats_by_col_;
 
   // When the underlying iterators are initialized, each needs its own
   // copy of the scan spec in order to do its own pushdown calculations, etc.
@@ -147,7 +183,7 @@ class MaterializingIterator : public RowwiseIterator {
 
   bool HasNext() const OVERRIDE;
 
-  string ToString() const OVERRIDE;
+  std::string ToString() const OVERRIDE;
 
   const Schema &schema() const OVERRIDE {
     return iter_->schema();
@@ -167,8 +203,9 @@ class MaterializingIterator : public RowwiseIterator {
 
   std::shared_ptr<ColumnwiseIterator> iter_;
 
-  // List of (column index, predicate) in order of most to least selective.
-  std::vector<std::tuple<int32_t, ColumnPredicate>> col_idx_predicates_;
+  // List of (column index, predicate) in order of most to least selective, with
+  // ties broken by the index.
+  std::vector<std::pair<int32_t, ColumnPredicate>> col_idx_predicates_;
 
   // List of column indexes without predicates to materialize.
   std::vector<int32_t> non_predicate_column_indexes_;
@@ -201,7 +238,7 @@ class PredicateEvaluatingIterator : public RowwiseIterator {
 
   bool HasNext() const OVERRIDE;
 
-  string ToString() const OVERRIDE;
+  std::string ToString() const OVERRIDE;
 
   const Schema &schema() const OVERRIDE {
     return base_iter_->schema();
@@ -212,17 +249,20 @@ class PredicateEvaluatingIterator : public RowwiseIterator {
   }
 
  private:
+
   // Construct the evaluating iterator.
   // This is only called from ::InitAndMaybeWrap()
   // REQUIRES: base_iter is already Init()ed.
   explicit PredicateEvaluatingIterator(std::shared_ptr<RowwiseIterator> base_iter);
 
   FRIEND_TEST(TestPredicateEvaluatingIterator, TestPredicateEvaluation);
+  FRIEND_TEST(TestPredicateEvaluatingIterator, TestPredicateEvaluationOrder);
 
   std::shared_ptr<RowwiseIterator> base_iter_;
 
-  // List of (column index, predicate) in order of most to least selective.
-  std::vector<ColumnPredicate> col_idx_predicates_;
+  // List of predicates in order of most to least selective, with
+  // ties broken by the column index.
+  std::vector<ColumnPredicate> col_predicates_;
 };
 
 } // namespace kudu

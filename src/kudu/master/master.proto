@@ -14,6 +14,7 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
+syntax = "proto2";
 package kudu.master;
 
 option java_package = "org.apache.kudu.master";
@@ -21,6 +22,7 @@ option java_package = "org.apache.kudu.master";
 import "kudu/common/common.proto";
 import "kudu/common/wire_protocol.proto";
 import "kudu/consensus/metadata.proto";
+import "kudu/consensus/replica_management.proto";
 import "kudu/rpc/rpc_header.proto";
 import "kudu/security/token.proto";
 import "kudu/tablet/metadata.proto";
@@ -72,6 +74,10 @@ message MasterErrorPB {
 
     // The number of replicas requested is illegal (eg non-positive).
     ILLEGAL_REPLICATION_FACTOR = 11;
+
+    // The caller detected an application-level incompatibility with the callee.
+    // This might be caused by a misconfiguration, incompatible features, etc.
+    INCOMPATIBILITY = 12;
   }
 
   // The error code.
@@ -121,8 +127,8 @@ message SysTabletsEntryPB {
   // Tablet partition.
   optional PartitionPB partition = 7;
 
-  // The latest committed consensus configuration reported to the Master.
-  optional consensus.ConsensusStatePB committed_consensus_state = 3;
+  // The latest consensus state reported to the Master.
+  optional consensus.ConsensusStatePB consensus_state = 3;
 
   // Debug state for the tablet.
   optional State state = 4 [ default = UNKNOWN ];
@@ -210,10 +216,10 @@ message ReportedTabletPB {
   optional tablet.TabletStatePB state = 2 [ default = UNKNOWN ];
   optional tablet.TabletDataState tablet_data_state = 6 [ default = TABLET_DATA_UNKNOWN ];
 
-  // The latest _committed_ consensus state.
+  // The latest consensus state.
   // This will be missing if the tablet is not in a RUNNING state
   // (i.e. if it is BOOTSTRAPPING).
-  optional consensus.ConsensusStatePB committed_consensus_state = 3;
+  optional consensus.ConsensusStatePB consensus_state = 3;
 
   optional AppStatusPB error = 4;
   optional uint32 schema_version = 5;
@@ -282,6 +288,10 @@ message TSHeartbeatRequestPB {
   // The most recently known TSK sequence number. Allows the master to
   // selectively notify the tablet server of more recent TSKs.
   optional int64 latest_tsk_seq_num = 6;
+
+  // Replica management parameters that the tablet server is running with.
+  // This field is set only if the registration field is present.
+  optional consensus.ReplicaManagementInfoPB replica_management_info = 7;
 }
 
 message TSHeartbeatResponsePB {
@@ -360,9 +370,21 @@ message TSInfoPB {
   repeated HostPortPB rpc_addresses = 2;
 }
 
+// Selector to specify policy for listing tablet replicas in
+// GetTableLocationResponsePB and GetTabletLocationsResponsePB.
+enum ReplicaTypeFilter {
+  UNKNOWN = 999;
+  ANY_REPLICA = 0;
+  VOTER_REPLICA = 1;
+}
+
 message GetTabletLocationsRequestPB {
+
   // The tablet IDs about which to fetch info.
   repeated bytes tablet_ids = 1;
+
+  // What type of tablet replicas to include in the response.
+  optional ReplicaTypeFilter replica_type_filter = 2 [ default = VOTER_REPLICA ];
 }
 
 message GetTabletLocationsResponsePB {
@@ -444,6 +466,10 @@ message GetTableLocationsRequestPB {
   optional bytes partition_key_end = 4 [(kudu.REDACT) = true];
 
   optional uint32 max_returned_locations = 5 [ default = 10 ];
+
+  // What type of tablet replicas to include in the
+  // 'GetTableLocationsResponsePB::tablet_locations' response field.
+  optional ReplicaTypeFilter replica_type_filter = 6 [ default = VOTER_REPLICA ];
 }
 
 // The response to a GetTableLocations RPC. The master guarantees that:
@@ -476,9 +502,6 @@ message AlterTableRequestPB {
     ADD_COLUMN = 1;
     DROP_COLUMN = 2;
     RENAME_COLUMN = 3;
-
-    // TODO(KUDU-861): this will subsume RENAME_COLUMN, but not yet implemented
-    // on the master side.
     ALTER_COLUMN = 4;
     ADD_RANGE_PARTITION = 5;
     DROP_RANGE_PARTITION = 6;
@@ -493,10 +516,14 @@ message AlterTableRequestPB {
     // Name of the column to drop.
     required string name = 1;
   }
+  // This should eventually be deprecated in favor of AlterColumn.
   message RenameColumn {
     // Name of the column to rename;
     required string old_name = 1;
     required string new_name = 2;
+  }
+  message AlterColumn {
+    optional ColumnSchemaDeltaPB delta = 1;
   }
   message AddRangePartition {
     // A set of row operations containing the lower and upper range bound for
@@ -518,6 +545,7 @@ message AlterTableRequestPB {
     optional RenameColumn rename_column = 4;
     optional AddRangePartition add_range_partition = 5;
     optional DropRangePartition drop_range_partition = 6;
+    optional AlterColumn alter_column = 7;
   }
 
   required TableIdentifierPB table = 1;
@@ -560,6 +588,9 @@ message GetTableSchemaRequestPB {
 }
 
 message GetTableSchemaResponsePB {
+  // create_table_done (field number 6) was removed in Kudu 1.6.
+  reserved 6;
+
   // The error, if an error occurred with this request.
   optional MasterErrorPB error = 1;
 
@@ -576,9 +607,6 @@ message GetTableSchemaResponsePB {
 
   // The ID of the table.
   optional bytes table_id = 4;
-
-  // True if the create operation is completed, false otherwise.
-  optional bool create_table_done = 6;
 
   // The table name.
   optional string table_name = 7;
@@ -606,6 +634,18 @@ message ConnectToMasterResponsePB {
   // If the client requested an authentication token, and security is
   // enabled on the cluster, the master returns a signed authn token.
   optional security.SignedTokenPB authn_token = 4;
+
+  // The hosts and ports of the masters in this cluster.
+  //
+  // NOTE: Added in Kudu 1.6.
+  //
+  // NOTE: it is likely, but not guaranteed that the hostnames advertised here
+  // will be usable by all clients. Client implementations should not use this
+  // field for "discovery" of other masters, since then it's likely that
+  // users will configure applications to only talk to one the masters in
+  // an HA setup. If that master then fails, the applications would go
+  // offline.
+  repeated HostPortPB master_addrs = 5;
 }
 
 // ============================================================================
@@ -655,9 +695,11 @@ message ListMastersResponsePB {
   // An entry for each individual master server.
   repeated ServerEntryPB masters = 1;
 
-  // Set only if there's an error in retrieving the list of servers or
-  // in getting this server's own local registration information.
-  optional AppStatusPB error = 2;
+  // DEPRECATED, use 'error' field.
+  optional AppStatusPB DEPRECATED_error = 2;
+
+  // Set if there an error retrieving the registration information.
+  optional MasterErrorPB error = 3;
 }
 
 enum MasterFeatures {

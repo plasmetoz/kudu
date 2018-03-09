@@ -18,15 +18,23 @@
 #include "kudu/common/column_predicate.h"
 
 #include <algorithm>
-#include <utility>
+#include <cstring>
 
+#include <boost/optional/optional.hpp>
+
+#include "kudu/common/columnblock.h"
 #include "kudu/common/key_util.h"
 #include "kudu/common/rowblock.h"
 #include "kudu/common/schema.h"
 #include "kudu/common/types.h"
+#include "kudu/gutil/strings/join.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/util/bitmap.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/memory/arena.h"
 
 using std::move;
+using std::string;
 using std::vector;
 
 namespace kudu {
@@ -159,6 +167,8 @@ void ColumnPredicate::SetToNone() {
   upper_ = nullptr;
 }
 
+// TODO: For decimal columns, use column_.type_attributes().precision
+// to calculate the "true" max/min values for improved simplification.
 void ColumnPredicate::Simplify() {
   auto type_info = column_.type_info();
   switch (predicate_type_) {
@@ -589,6 +599,7 @@ bool ColumnPredicate::EvaluateCell(DataType type, const void* cell) const {
     case INT16: return EvaluateCell<INT16>(cell);
     case INT32: return EvaluateCell<INT32>(cell);
     case INT64: return EvaluateCell<INT64>(cell);
+    case INT128: return EvaluateCell<INT128>(cell);
     case UINT8: return EvaluateCell<UINT8>(cell);
     case UINT16: return EvaluateCell<UINT16>(cell);
     case UINT32: return EvaluateCell<UINT32>(cell);
@@ -608,6 +619,7 @@ void ColumnPredicate::Evaluate(const ColumnBlock& block, SelectionVector* sel) c
     case INT16: return EvaluateForPhysicalType<INT16>(block, sel);
     case INT32: return EvaluateForPhysicalType<INT32>(block, sel);
     case INT64: return EvaluateForPhysicalType<INT64>(block, sel);
+    case INT128: return EvaluateForPhysicalType<INT128>(block, sel);
     case UINT8: return EvaluateForPhysicalType<UINT8>(block, sel);
     case UINT16: return EvaluateForPhysicalType<UINT16>(block, sel);
     case UINT32: return EvaluateForPhysicalType<UINT32>(block, sel);
@@ -621,41 +633,36 @@ void ColumnPredicate::Evaluate(const ColumnBlock& block, SelectionVector* sel) c
 
 string ColumnPredicate::ToString() const {
   switch (predicate_type()) {
-    case PredicateType::None: return strings::Substitute("`$0` NONE", column_.name());
+    case PredicateType::None: return strings::Substitute("$0 NONE", column_.name());
     case PredicateType::Range: {
       if (lower_ == nullptr) {
-        return strings::Substitute("`$0` < $1", column_.name(), column_.Stringify(upper_));
-      } else if (upper_ == nullptr) {
-        return strings::Substitute("`$0` >= $1", column_.name(), column_.Stringify(lower_));
-      } else {
-        return strings::Substitute("`$0` >= $1 AND `$0` < $2",
-                                   column_.name(),
-                                   column_.Stringify(lower_),
-                                   column_.Stringify(upper_));
+        return strings::Substitute("$0 < $1", column_.name(), column_.Stringify(upper_));
       }
+      if (upper_ == nullptr) {
+        return strings::Substitute("$0 >= $1", column_.name(), column_.Stringify(lower_));
+      }
+      return strings::Substitute("$0 >= $1 AND $0 < $2",
+                                 column_.name(),
+                                 column_.Stringify(lower_),
+                                 column_.Stringify(upper_));
+
     };
     case PredicateType::Equality: {
-      return strings::Substitute("`$0` = $1", column_.name(), column_.Stringify(lower_));
+      return strings::Substitute("$0 = $1", column_.name(), column_.Stringify(lower_));
     };
     case PredicateType::IsNotNull: {
-      return strings::Substitute("`$0` IS NOT NULL", column_.name());
+      return strings::Substitute("$0 IS NOT NULL", column_.name());
     };
     case PredicateType::IsNull: {
-      return strings::Substitute("`$0` IS NULL", column_.name());
+      return strings::Substitute("$0 IS NULL", column_.name());
     };
     case PredicateType::InList: {
-      string ss = "`";
+      string ss;
       ss.append(column_.name());
-      ss.append("` IN (");
-      bool is_first = true;
-      for (auto* value : values_) {
-        if (is_first) {
-          is_first = false;
-        } else {
-          ss.append(", ");
-        }
-        ss.append(column_.Stringify(value));
-      }
+      ss.append(" IN (");
+      ss.append(KUDU_REDACT(JoinMapped(values_,
+                                       [&] (const void* value) { return column_.Stringify(value); },
+                                       ", ")));
       ss.append(")");
       return ss;
     };

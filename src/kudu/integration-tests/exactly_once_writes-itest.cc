@@ -15,11 +15,52 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
+#include <vector>
+
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
+#include "kudu/common/schema.h"
+#include "kudu/common/wire_protocol-test-util.h"
+#include "kudu/common/wire_protocol.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/map-util.h"
+#include "kudu/gutil/ref_counted.h"
+#include "kudu/gutil/strings/substitute.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/log_verifier.h"
 #include "kudu/integration-tests/ts_itest-base.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/rpc/messenger.h"
+#include "kudu/rpc/rpc_controller.h"
+#include "kudu/rpc/rpc_header.pb.h"
+#include "kudu/tserver/tserver.pb.h"
+#include "kudu/tserver/tserver_service.proxy.h"
 #include "kudu/util/barrier.h"
 #include "kudu/util/logging.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/random.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+#include "kudu/util/test_util.h"
+#include "kudu/util/thread.h"
+
+DECLARE_int32(consensus_rpc_timeout_ms);
+DECLARE_int32(num_replicas);
+DECLARE_int32(num_tablet_servers);
+
+using std::string;
+using std::unique_ptr;
+using std::vector;
 
 namespace kudu {
 namespace tserver {
@@ -69,7 +110,7 @@ void ExactlyOnceSemanticsITest::WriteRowsAndCollectResponses(int thread_idx,
   Sockaddr address = cluster_.get()->tablet_server(
       thread_idx % FLAGS_num_replicas)->bound_rpc_addr();
 
-  RpcController controller;
+  rpc::RpcController controller;
 
   const Schema schema = GetSimpleTestSchema();
 
@@ -77,8 +118,8 @@ void ExactlyOnceSemanticsITest::WriteRowsAndCollectResponses(int thread_idx,
   rpc::MessengerBuilder bld("Client");
   ASSERT_OK(bld.Build(&client_messenger));
 
-  std::unique_ptr<TabletServerServiceProxy> proxy(new TabletServerServiceProxy(client_messenger,
-                                                                               address));
+  unique_ptr<TabletServerServiceProxy> proxy(new TabletServerServiceProxy(
+      client_messenger, address, address.host()));
   for (int i = 0; i < num_batches; i++) {
     // Wait for all of the other writer threads to finish their attempts of the prior
     // batch before continuing on to the next one. This has two important effects:
@@ -111,7 +152,7 @@ void ExactlyOnceSemanticsITest::WriteRowsAndCollectResponses(int thread_idx,
       controller.Reset();
       WriteResponsePB response;
 
-      std::unique_ptr<rpc::RequestIdPB> request_id(new rpc::RequestIdPB());
+      unique_ptr<rpc::RequestIdPB> request_id(new rpc::RequestIdPB());
       request_id->set_client_id("test_client");
       request_id->set_seq_no(i);
       request_id->set_attempt_no(base_attempt_idx * kMaxAttempts + num_attempts);
@@ -149,9 +190,9 @@ void ExactlyOnceSemanticsITest::DoTestWritesWithExactlyOnceSemantics(
   const int kBatchSize = 10;
   const int kNumThreadsPerReplica = 2;
 
-  BuildAndStart(ts_flags, master_flags);
+  NO_FATALS(BuildAndStart(ts_flags, master_flags));
 
-  vector<TServerDetails*> tservers;
+  vector<itest::TServerDetails*> tservers;
   AppendValuesFromMap(tablet_servers_, &tservers);
 
   vector<scoped_refptr<kudu::Thread>> threads;
@@ -195,7 +236,7 @@ void ExactlyOnceSemanticsITest::DoTestWritesWithExactlyOnceSemantics(
     if (allow_crashes) {
       RestartAnyCrashedTabletServers();
     } else {
-      AssertNoTabletServersCrashed();
+      NO_FATALS(AssertNoTabletServersCrashed());
     }
 
     SleepFor(MonoDelta::FromMilliseconds(10));
@@ -205,12 +246,12 @@ void ExactlyOnceSemanticsITest::DoTestWritesWithExactlyOnceSemantics(
   bool mismatched = false;
   for (int i = 0; i < num_batches; i++) {
     for (int j = 0; j < num_threads; j++) {
-      string expected_response = SecureShortDebugString(responses[j][i]);
+      string expected_response = pb_util::SecureShortDebugString(responses[j][i]);
       string expected_ts = strings::Substitute(
           "T:$0 TSidx:$1 TSuuid:$2", j, j % FLAGS_num_replicas,
           cluster_.get()->tablet_server(j % FLAGS_num_replicas)->instance_id().permanent_uuid());
       for (int k = 0; k < num_threads; k++) {
-        string got_response = SecureShortDebugString(responses[k][i]);
+        string got_response = pb_util::SecureShortDebugString(responses[k][i]);
         string got_ts = strings::Substitute(
             "T:$0 TSidx:$1 TSuuid:$2", k, k % FLAGS_num_replicas,
             cluster_.get()->tablet_server(k % FLAGS_num_replicas)->instance_id().permanent_uuid());
@@ -246,17 +287,15 @@ TEST_F(ExactlyOnceSemanticsITest, TestWritesWithExactlyOnceSemanticsWithCrashyNo
   // Crash 2.5% of the time right after sending an RPC. This makes sure we stress the path
   // where there are duplicate handlers for a transaction as a leader crashes right
   // after sending requests to followers.
-  ts_flags.push_back("--fault_crash_after_leader_request_fraction=0.025");
+  ts_flags.emplace_back("--fault_crash_after_leader_request_fraction=0.025");
 
   // Make leader elections faster so we get through more cycles of leaders.
-  ts_flags.push_back("--raft_heartbeat_interval_ms=200");
-  ts_flags.push_back("--leader_failure_monitor_check_mean_ms=100");
-  ts_flags.push_back("--leader_failure_monitor_check_stddev_ms=50");
+  ts_flags.emplace_back("--raft_heartbeat_interval_ms=200");
 
   // Avoid preallocating segments since bootstrap is a little bit
   // faster if it doesn't have to scan forward through the preallocated
   // log area.
-  ts_flags.push_back("--log_preallocate_segments=false");
+  ts_flags.emplace_back("--log_preallocate_segments=false");
 
   int num_batches = 10;
   if (AllowSlowTests()) {
@@ -280,10 +319,8 @@ TEST_F(ExactlyOnceSemanticsITest, TestWritesWithExactlyOnceSemanticsWithChurnyEl
   // any progress at all.
   ts_flags.push_back("--raft_heartbeat_interval_ms=5");
 #else
-  ts_flags.push_back("--raft_heartbeat_interval_ms=2");
+  ts_flags.emplace_back("--raft_heartbeat_interval_ms=2");
 #endif
-  ts_flags.push_back("--leader_failure_monitor_check_mean_ms=2");
-  ts_flags.push_back("--leader_failure_monitor_check_stddev_ms=1");
 
   int num_batches = 200;
   if (AllowSlowTests()) {

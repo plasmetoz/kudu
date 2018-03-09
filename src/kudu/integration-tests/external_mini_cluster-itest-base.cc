@@ -17,20 +17,32 @@
 
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
 
+#include <ostream>
 #include <string>
+#include <utility>
 #include <vector>
 
+#include <gflags/gflags.h>
 #include <glog/logging.h>
 #include <gtest/gtest.h>
 
-#include "kudu/client/client.h"
 #include "kudu/gutil/stl_util.h"
 #include "kudu/integration-tests/cluster_itest_util.h"
-#include "kudu/integration-tests/external_mini_cluster.h"
-#include "kudu/integration-tests/external_mini_cluster_fs_inspector.h"
+#include "kudu/integration-tests/mini_cluster_fs_inspector.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/util/pstack_watcher.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
+
+DEFINE_bool(test_dump_stacks_on_failure, true,
+            "Whether to dump ExternalMiniCluster process stacks on test failure");
 
 namespace kudu {
+
+using cluster::ExternalMiniCluster;
+using cluster::ExternalMiniClusterOptions;
+using std::string;
+using std::vector;
 
 void ExternalMiniClusterITestBase::TearDown() {
   StopCluster();
@@ -38,17 +50,22 @@ void ExternalMiniClusterITestBase::TearDown() {
 }
 
 void ExternalMiniClusterITestBase::StartCluster(
-    const std::vector<std::string>& extra_ts_flags,
-    const std::vector<std::string>& extra_master_flags,
+    vector<string> extra_ts_flags,
+    vector<string> extra_master_flags,
     int num_tablet_servers) {
   ExternalMiniClusterOptions opts;
   opts.num_tablet_servers = num_tablet_servers;
-  opts.extra_master_flags = extra_master_flags;
-  opts.extra_tserver_flags = extra_ts_flags;
-  cluster_.reset(new ExternalMiniCluster(opts));
+  opts.extra_master_flags = std::move(extra_master_flags);
+  opts.extra_tserver_flags = std::move(extra_ts_flags);
+  StartClusterWithOpts(std::move(opts));
+}
+
+void ExternalMiniClusterITestBase::StartClusterWithOpts(
+    ExternalMiniClusterOptions opts) {
+  cluster_.reset(new ExternalMiniCluster(std::move(opts)));
   ASSERT_OK(cluster_->Start());
-  inspect_.reset(new itest::ExternalMiniClusterFsInspector(cluster_.get()));
-  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy().get(),
+  inspect_.reset(new itest::MiniClusterFsInspector(cluster_.get()));
+  ASSERT_OK(itest::CreateTabletServerMap(cluster_->master_proxy(),
                                          cluster_->messenger(),
                                          &ts_map_));
   ASSERT_OK(cluster_->CreateClient(nullptr, &client_));
@@ -59,7 +76,7 @@ void ExternalMiniClusterITestBase::StopCluster() {
     return;
   }
 
-  if (HasFatalFailure()) {
+  if (HasFatalFailure() && FLAGS_test_dump_stacks_on_failure) {
     LOG(INFO) << "Found fatal failure";
     for (int i = 0; i < cluster_->num_tablet_servers(); i++) {
       if (!cluster_->tablet_server(i)->IsProcessAlive()) {

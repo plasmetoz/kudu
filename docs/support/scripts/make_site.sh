@@ -28,10 +28,14 @@ BUILD_ROOT="$SOURCE_ROOT/build/$BUILD_TYPE"
 SITE_OUTPUT_DIR="$BUILD_ROOT/site"
 
 OPT_DOXYGEN=1 # By default, build doxygen docs.
+OPT_JAVADOC=1 # By default, build javadocs.
+OPT_FORCE='' # By default, don't overwrite the destination directory.
 
 usage() {
-  echo "Usage: $0 [--no-doxygen]"
+  echo "Usage: $0 [--no-doxygen] [--no-javadoc] [--force]"
   echo "Specify --no-doxygen to skip generation of the C++ client API docs"
+  echo "Specify --no-javadoc to skip generation of the Java API docs"
+  echo "Specify --force to overwrite the destination directory, if it exists"
   exit 1
 }
 
@@ -39,9 +43,11 @@ if [ $# -gt 0 ]; then
   for arg in $*; do
     case $arg in
       "--no-doxygen")  OPT_DOXYGEN='' ;;
+      "--no-javadoc")  OPT_JAVADOC='' ;;
+      "--force")       OPT_FORCE=1 ;;
       "--help")        usage ;;
       "-h")            usage ;;
-      *)               echo "Unknown command-line option: $arg"; usage ;;
+      *)               echo "$0: Unknown command-line option: $arg"; usage ;;
     esac
   done
 fi
@@ -54,6 +60,12 @@ fi
 set -x
 
 cd "$SOURCE_ROOT"
+
+GIT_REMOTE=$(git config --get remote.origin.url)
+if [ -z "$GIT_REMOTE" ]; then
+  echo "Error: The 'origin' git remote is expected but is not defined"
+  usage
+fi
 
 # Build Kudu thirdparty
 $SOURCE_ROOT/build-support/enable_devtoolset.sh $SOURCE_ROOT/thirdparty/build-if-necessary.sh
@@ -68,14 +80,17 @@ $SOURCE_ROOT/build-support/enable_devtoolset.sh \
     -DNO_TESTS=1 \
     -DCMAKE_BUILD_TYPE=$BUILD_TYPE \
     $SOURCE_ROOT
-MAKE_TARGETS=all
+MAKE_TARGETS="kudu kudu-tserver kudu-master"
 if [ -n "$OPT_DOXYGEN" ]; then
   MAKE_TARGETS="$MAKE_TARGETS doxygen"
 fi
 make -j$(getconf _NPROCESSORS_ONLN) $MAKE_TARGETS
 
 # Check out the gh-pages repo into $SITE_OUTPUT_DIR
-git clone -q $(git config --get remote.origin.url) --reference $SOURCE_ROOT -b gh-pages --depth 1 "$SITE_OUTPUT_DIR"
+if [ -d "$SITE_OUTPUT_DIR" -a -n "$OPT_FORCE" ]; then
+  rm -rf "$SITE_OUTPUT_DIR"
+fi
+git clone -q "$GIT_REMOTE" --reference "$SOURCE_ROOT" -b gh-pages --depth 1 "$SITE_OUTPUT_DIR"
 
 # Build the docs using the styles from the Jekyll site
 rm -Rf "$SITE_OUTPUT_DIR/docs"
@@ -87,22 +102,25 @@ else
   exit 1
 fi
 
-cd "$SOURCE_ROOT/java"
-mvn clean install -DskipTests
-if mvn clean javadoc:aggregate | tee /dev/stdout | fgrep -q "Javadoc Warnings"; then
-  echo "There are Javadoc warnings. Please fix them."
-  exit 1
-fi
+if [ -n "$OPT_JAVADOC" ]; then
+  JAVADOC_SUBDIR="apidocs"
+  cd "$SOURCE_ROOT/java"
+  mvn clean install -DskipTests
+  if mvn clean javadoc:aggregate | tee /dev/stdout | fgrep -q "Javadoc Warnings"; then
+    echo "There are Javadoc warnings. Please fix them."
+    exit 1
+  fi
 
-if [ -f "$SOURCE_ROOT/java/target/site/apidocs/index.html" ]; then
-  echo "Successfully built Javadocs."
-else
-  echo "Javadocs failed to build."
-  exit 1
-fi
+  if [ -f "$SOURCE_ROOT/java/target/site/$JAVADOC_SUBDIR/index.html" ]; then
+    echo "Successfully built Javadocs."
+  else
+    echo "Javadocs failed to build."
+    exit 1
+  fi
 
-rm -Rf "$SITE_OUTPUT_DIR/apidocs"
-cp -au "$SOURCE_ROOT/java/target/site/apidocs" "$SITE_OUTPUT_DIR/"
+  rm -Rf "$SITE_OUTPUT_DIR/$JAVADOC_SUBDIR"
+  cp -au "$SOURCE_ROOT/java/target/site/$JAVADOC_SUBDIR" "$SITE_OUTPUT_DIR/"
+fi
 
 if [ -n "$OPT_DOXYGEN" ]; then
   CPP_CLIENT_API_SUBDIR="cpp-client-api"
@@ -110,7 +128,10 @@ if [ -n "$OPT_DOXYGEN" ]; then
   cp -a "$BUILD_ROOT/docs/doxygen/client_api/html" "$SITE_OUTPUT_DIR/$CPP_CLIENT_API_SUBDIR"
 fi
 
-SITE_SUBDIRS="docs apidocs"
+SITE_SUBDIRS="docs"
+if [ -n "$OPT_JAVADOC" ]; then
+  SITE_SUBDIRS="$SITE_SUBDIRS $JAVADOC_SUBDIR"
+fi
 if [ -n "$OPT_DOXYGEN" ]; then
   SITE_SUBDIRS="$SITE_SUBDIRS $CPP_CLIENT_API_SUBDIR"
 fi
@@ -119,5 +140,7 @@ cd "$SITE_OUTPUT_DIR"
 SITE_ARCHIVE="$SITE_OUTPUT_DIR/website_archive.zip"
 zip -rq "$SITE_ARCHIVE" $SITE_SUBDIRS
 
+set +x
 echo "Generated web site at $SITE_OUTPUT_DIR"
 echo "Docs zip generated at $SITE_ARCHIVE"
+echo "To view live site locally, run: (cd $SITE_OUTPUT_DIR && ./site_tool jekyll serve)"

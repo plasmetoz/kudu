@@ -17,9 +17,11 @@
 
 #include "kudu/rpc/user_credentials.h"
 
+#include <cstddef>
 #include <string>
+#include <utility>
 
-#include <boost/functional/hash.hpp>
+#include <boost/functional/hash/hash.hpp>
 
 #include "kudu/gutil/strings/substitute.h"
 
@@ -32,8 +34,8 @@ bool UserCredentials::has_real_user() const {
   return !real_user_.empty();
 }
 
-void UserCredentials::set_real_user(const string& real_user) {
-  real_user_ = real_user;
+void UserCredentials::set_real_user(string real_user) {
+  real_user_ = std::move(real_user);
 }
 
 string UserCredentials::ToString() const {

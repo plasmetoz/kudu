@@ -15,16 +15,23 @@
 // specific language governing permissions and limitations
 // under the License.
 
-#include "kudu/client/row_result.h"
 #include "kudu/client/scan_batch.h"
-#include "kudu/client/scanner-internal.h"
-#include "kudu/client/schema.h"
 
+#include <cstring>
 #include <string>
 
+#include <glog/logging.h>
+
+#include "kudu/client/row_result.h"
+#include "kudu/client/scanner-internal.h"
+#include "kudu/common/common.pb.h"
 #include "kudu/common/schema.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/strings/stringpiece.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/util/bitmap.h"
+#include "kudu/util/int128.h"
+#include "kudu/util/logging.h"
 
 using std::string;
 using strings::Substitute;
@@ -52,6 +59,14 @@ KuduRowResult KuduScanBatch::Row(int idx) const {
 
 const KuduSchema* KuduScanBatch::projection_schema() const {
   return data_->client_projection_;
+}
+
+Slice KuduScanBatch::direct_data() const {
+  return data_->direct_data_;
+}
+
+Slice KuduScanBatch::indirect_data() const {
+  return data_->indirect_data_;
 }
 
 ////////////////////////////////////////////////////////////
@@ -137,6 +152,12 @@ Status KuduScanBatch::RowPtr::GetFloat(const Slice& col_name, float* val) const 
 
 Status KuduScanBatch::RowPtr::GetDouble(const Slice& col_name, double* val) const {
   return Get<TypeTraits<DOUBLE> >(col_name, val);
+}
+
+Status KuduScanBatch::RowPtr::GetUnscaledDecimal(const Slice& col_name, int128_t* val) const {
+  int col_idx;
+  RETURN_NOT_OK(FindColumn(*schema_, col_name, &col_idx));
+  return GetUnscaledDecimal(col_idx, val);
 }
 
 Status KuduScanBatch::RowPtr::GetString(const Slice& col_name, Slice* val) const {
@@ -239,6 +260,9 @@ template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<INT64> >(const Slice& col_name, int64_t* val) const;
 
 template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<INT128> >(const Slice& col_name, int128_t* val) const;
+
+template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<UNIXTIME_MICROS> >(
     const Slice& col_name, int64_t* val) const;
 
@@ -270,6 +294,9 @@ template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<INT64> >(int col_idx, int64_t* val) const;
 
 template
+Status KuduScanBatch::RowPtr::Get<TypeTraits<INT128> >(int col_idx, int128_t* val) const;
+
+template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<UNIXTIME_MICROS> >(int col_idx, int64_t* val) const;
 
 template
@@ -283,6 +310,32 @@ Status KuduScanBatch::RowPtr::Get<TypeTraits<STRING> >(int col_idx, Slice* val) 
 
 template
 Status KuduScanBatch::RowPtr::Get<TypeTraits<BINARY> >(int col_idx, Slice* val) const;
+
+Status KuduScanBatch::RowPtr::GetUnscaledDecimal(int col_idx, int128_t* val) const {
+  const ColumnSchema& col = schema_->column(col_idx);
+  const DataType col_type = col.type_info()->type();
+  switch (col_type) {
+    case DECIMAL32:
+      int32_t i32_val;
+      RETURN_NOT_OK(Get<TypeTraits<DECIMAL32> >(col_idx, &i32_val));
+      *val = i32_val;
+      return Status::OK();
+    case DECIMAL64:
+      int64_t i64_val;
+      RETURN_NOT_OK(Get<TypeTraits<DECIMAL64> >(col_idx, &i64_val));
+      *val = i64_val;
+      return Status::OK();
+    case DECIMAL128:
+      int128_t i128_val;
+      RETURN_NOT_OK(Get<TypeTraits<DECIMAL128> >(col_idx, &i128_val));
+      *val = i128_val;
+      return Status::OK();
+    default:
+      return Status::InvalidArgument(
+          Substitute("invalid type $0 provided for column '$1' (expected DECIMAL)",
+                     col.type_info()->name(), col.name()));
+  }
+}
 
 string KuduScanBatch::RowPtr::ToString() const {
   // Client-users calling ToString() will likely expect it to not be redacted.

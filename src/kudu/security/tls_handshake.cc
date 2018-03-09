@@ -20,14 +20,15 @@
 #include <memory>
 #include <string>
 
-#include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 
+#include "kudu/gutil/strings/strip.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/tls_socket.h"
-#include "kudu/util/net/sockaddr.h"
+#include "kudu/util/net/socket.h"
 #include "kudu/util/status.h"
 #include "kudu/util/trace.h"
 
@@ -37,11 +38,13 @@
 
 using std::string;
 using std::unique_ptr;
+using strings::Substitute;
 
 namespace kudu {
 namespace security {
 
 void TlsHandshake::SetSSLVerify() {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(ssl_);
   CHECK(!has_started_);
   int ssl_mode = 0;
@@ -77,12 +80,12 @@ void TlsHandshake::SetSSLVerify() {
 }
 
 Status TlsHandshake::Continue(const string& recv, string* send) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   if (!has_started_) {
     SetSSLVerify();
     has_started_ = true;
   }
   CHECK(ssl_);
-  ERR_clear_error();
 
   BIO* rbio = SSL_get_rbio(ssl_.get());
   int n = BIO_write(rbio, recv.data(), recv.size());
@@ -96,6 +99,9 @@ Status TlsHandshake::Continue(const string& recv, string* send) {
     if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
       return Status::RuntimeError("TLS Handshake error", GetSSLErrorDescription(ssl_err));
     }
+    // In the case that we got SSL_ERROR_WANT_READ or SSL_ERROR_WANT_WRITE,
+    // the OpenSSL implementation guarantees that there is no error entered into
+    // the ERR error queue, so no need to ERR_clear_error() here.
   }
 
   BIO* wbio = SSL_get_wbio(ssl_.get());
@@ -111,11 +117,11 @@ Status TlsHandshake::Continue(const string& recv, string* send) {
     DCHECK_GE(send->size(), 0);
     return Status::OK();
   }
-  DCHECK_GT(send->size(), 0);
   return Status::Incomplete("TLS Handshake incomplete");
 }
 
 Status TlsHandshake::Verify(const Socket& socket) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   DCHECK(SSL_is_init_finished(ssl_.get()));
   CHECK(ssl_);
 
@@ -124,14 +130,15 @@ Status TlsHandshake::Verify(const Socket& socket) const {
   }
   DCHECK(verification_mode_ == TlsVerificationMode::VERIFY_REMOTE_CERT_AND_HOST);
 
-  ERR_clear_error();
   int rc = SSL_get_verify_result(ssl_.get());
   if (rc != X509_V_OK) {
-    return Status::NotAuthorized("SSL_get_verify_result()", X509_verify_cert_error_string(rc));
+    return Status::NotAuthorized(Substitute("SSL cert verification failed: $0",
+                                            X509_verify_cert_error_string(rc)),
+                                 GetOpenSSLErrors());
   }
 
   // Get the peer certificate.
-  X509* cert = remote_cert_.GetRawData();
+  X509* cert = remote_cert_.GetTopOfChainX509();
   if (!cert) {
     if (SSL_get_verify_mode(ssl_.get()) & SSL_VERIFY_FAIL_IF_NO_PEER_CERT) {
       return Status::NotAuthorized("Handshake failed: unable to retreive peer certificate");
@@ -174,21 +181,23 @@ Status TlsHandshake::Verify(const Socket& socket) const {
 }
 
 Status TlsHandshake::GetCerts() {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   X509* cert = SSL_get_certificate(ssl_.get());
   if (cert) {
     // For whatever reason, SSL_get_certificate (unlike SSL_get_peer_certificate)
     // does not increment the X509's reference count.
-    local_cert_.AdoptAndAddRefRawData(cert);
+    local_cert_.AdoptAndAddRefX509(cert);
   }
 
   cert = SSL_get_peer_certificate(ssl_.get());
   if (cert) {
-    remote_cert_.AdoptRawData(cert);
+    remote_cert_.AdoptX509(cert);
   }
   return Status::OK();
 }
 
 Status TlsHandshake::Finish(unique_ptr<Socket>* socket) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   RETURN_NOT_OK(GetCerts());
   RETURN_NOT_OK(Verify(**socket));
 
@@ -208,11 +217,13 @@ Status TlsHandshake::Finish(unique_ptr<Socket>* socket) {
 }
 
 Status TlsHandshake::FinishNoWrap(const Socket& socket) {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   RETURN_NOT_OK(GetCerts());
   return Verify(socket);
 }
 
 Status TlsHandshake::GetLocalCert(Cert* cert) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   if (!local_cert_.GetRawData()) {
     return Status::RuntimeError("no local certificate");
   }
@@ -221,6 +232,7 @@ Status TlsHandshake::GetLocalCert(Cert* cert) const {
 }
 
 Status TlsHandshake::GetRemoteCert(Cert* cert) const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   if (!remote_cert_.GetRawData()) {
     return Status::RuntimeError("no remote certificate");
   }
@@ -229,13 +241,33 @@ Status TlsHandshake::GetRemoteCert(Cert* cert) const {
 }
 
 string TlsHandshake::GetCipherSuite() const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(has_started_);
   return SSL_get_cipher_name(ssl_.get());
 }
 
 string TlsHandshake::GetProtocol() const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
   CHECK(has_started_);
   return SSL_get_version(ssl_.get());
+}
+
+string TlsHandshake::GetCipherDescription() const {
+  SCOPED_OPENSSL_NO_PENDING_ERRORS;
+  CHECK(has_started_);
+  const SSL_CIPHER* cipher = SSL_get_current_cipher(ssl_.get());
+  if (!cipher) {
+    return "NONE";
+  }
+  char buf[512];
+  const char* description = SSL_CIPHER_description(cipher, buf, sizeof(buf));
+  if (!description) {
+    return "NONE";
+  }
+  string ret(description);
+  StripTrailingNewline(&ret);
+  StripDupCharacters(&ret, ' ', 0);
+  return ret;
 }
 
 } // namespace security

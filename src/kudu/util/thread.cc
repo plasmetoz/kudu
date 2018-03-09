@@ -19,38 +19,46 @@
 
 #include "kudu/util/thread.h"
 
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <sys/time.h>
-#include <sys/types.h>
-#include <unistd.h>
-
-#include <algorithm>
-#include <map>
-#include <memory>
-#include <set>
-#include <sstream>
-#include <vector>
-
 #if defined(__linux__)
 #include <sys/prctl.h>
 #endif // defined(__linux__)
+#include <sys/resource.h>
+#include <unistd.h>
+
+#include <algorithm>
+#include <cerrno>
+#include <cstring>
+#include <map>
+#include <memory>
+#include <sstream>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <boost/bind.hpp>
+#include <boost/smart_ptr/shared_ptr.hpp>
+#include <gflags/gflags.h>
+#include <glog/logging.h>
 
 #include "kudu/gutil/atomicops.h"
+#include "kudu/gutil/bind.h"
+#include "kudu/gutil/bind_helpers.h"
 #include "kudu/gutil/dynamic_annotations.h"
 #include "kudu/gutil/mathlimits.h"
 #include "kudu/gutil/once.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/util/debug-util.h"
-#include "kudu/util/errno.h"
-#include "kudu/util/logging.h"
+#include "kudu/util/flag_tags.h"
 #include "kudu/util/kernel_stack_watchdog.h"
+#include "kudu/util/logging.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
 #include "kudu/util/mutex.h"
 #include "kudu/util/os-util.h"
+#include "kudu/util/scoped_cleanup.h"
 #include "kudu/util/stopwatch.h"
-#include "kudu/util/url-coding.h"
 #include "kudu/util/trace.h"
+#include "kudu/util/url-coding.h"
 #include "kudu/util/web_callback_registry.h"
 
 using boost::bind;
@@ -59,6 +67,8 @@ using std::endl;
 using std::map;
 using std::ostringstream;
 using std::shared_ptr;
+using std::string;
+using std::vector;
 using strings::Substitute;
 
 METRIC_DEFINE_gauge_uint64(server, threads_started,
@@ -95,6 +105,11 @@ METRIC_DEFINE_gauge_uint64(server, involuntary_context_switches,
                            kudu::MetricUnit::kContextSwitches,
                            "Total involuntary context switches",
                            kudu::EXPOSE_AS_COUNTER);
+
+DEFINE_int32(thread_inject_start_latency_ms, 0,
+             "Number of ms to sleep when starting a new thread. (For tests).");
+TAG_FLAG(thread_inject_start_latency_ms, hidden);
+TAG_FLAG(thread_inject_start_latency_ms, unsafe);
 
 namespace kudu {
 
@@ -141,8 +156,7 @@ static GoogleOnceType once = GOOGLE_ONCE_INIT;
 class ThreadMgr {
  public:
   ThreadMgr()
-      : metrics_enabled_(false),
-        threads_started_metric_(0),
+      : threads_started_metric_(0),
         threads_running_metric_(0) {
   }
 
@@ -151,7 +165,7 @@ class ThreadMgr {
     thread_categories_.clear();
   }
 
-  static void SetThreadName(const std::string& name, int64 tid);
+  static void SetThreadName(const std::string& name, int64_t tid);
 
   Status StartInstrumentation(const scoped_refptr<MetricEntity>& metrics, WebCallbackRegistry* web);
 
@@ -194,14 +208,11 @@ class ThreadMgr {
   // All thread categorys, keyed on the category name.
   typedef map<string, ThreadCategory> ThreadCategoryMap;
 
-  // Protects thread_categories_ and metrics_enabled_
+  // Protects thread_categories_ and thread metrics.
   Mutex lock_;
 
   // All thread categorys that ever contained a thread, even if empty
   ThreadCategoryMap thread_categories_;
-
-  // True after StartInstrumentation(..) returns
-  bool metrics_enabled_;
 
   // Counters to track all-time total number of threads, and the
   // current number of running threads.
@@ -212,12 +223,13 @@ class ThreadMgr {
   uint64_t ReadThreadsStarted();
   uint64_t ReadThreadsRunning();
 
-  // Webpage callback; prints all threads by category
-  void ThreadPathHandler(const WebCallbackRegistry::WebRequest& args, ostringstream* output);
+  // Webpage callback; prints all threads by category.
+  void ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
+                         WebCallbackRegistry::PrerenderedWebResponse* resp);
   void PrintThreadCategoryRows(const ThreadCategory& category, ostringstream* output);
 };
 
-void ThreadMgr::SetThreadName(const string& name, int64 tid) {
+void ThreadMgr::SetThreadName(const string& name, int64_t tid) {
   // On linux we can get the thread names to show up in the debugger by setting
   // the process name for the LWP.  We don't want to do this for the main
   // thread because that would rename the process, causing tools like killall
@@ -245,7 +257,6 @@ void ThreadMgr::SetThreadName(const string& name, int64 tid) {
 Status ThreadMgr::StartInstrumentation(const scoped_refptr<MetricEntity>& metrics,
                                        WebCallbackRegistry* web) {
   MutexLock l(lock_);
-  metrics_enabled_ = true;
 
   // Use function gauges here so that we can register a unique copy of these metrics in
   // multiple tservers, even though the ThreadMgr is itself a singleton.
@@ -269,9 +280,11 @@ Status ThreadMgr::StartInstrumentation(const scoped_refptr<MetricEntity>& metric
         Bind(&GetInVoluntaryContextSwitches)));
 
   if (web) {
-    WebCallbackRegistry::PathHandlerCallback thread_callback =
+    WebCallbackRegistry::PrerenderedPathHandlerCallback thread_callback =
         bind<void>(mem_fn(&ThreadMgr::ThreadPathHandler), this, _1, _2);
-    DCHECK_NOTNULL(web)->RegisterPathHandler("/threadz", "Threads", thread_callback);
+    DCHECK_NOTNULL(web)->RegisterPrerenderedPathHandler("/threadz", "Threads", thread_callback,
+                                                        true /* is_styled*/,
+                                                        true /* is_on_nav_bar */);
   }
   return Status::OK();
 }
@@ -305,10 +318,8 @@ void ThreadMgr::AddThread(const pthread_t& pthread_id, const string& name,
   {
     MutexLock l(lock_);
     thread_categories_[category][pthread_id] = ThreadDescriptor(category, name, tid);
-    if (metrics_enabled_) {
-      threads_running_metric_++;
-      threads_started_metric_++;
-    }
+    threads_running_metric_++;
+    threads_started_metric_++;
   }
   ANNOTATE_IGNORE_SYNC_END();
   ANNOTATE_IGNORE_READS_AND_WRITES_END();
@@ -322,9 +333,7 @@ void ThreadMgr::RemoveThread(const pthread_t& pthread_id, const string& category
     auto category_it = thread_categories_.find(category);
     DCHECK(category_it != thread_categories_.end());
     category_it->second.erase(pthread_id);
-    if (metrics_enabled_) {
-      threads_running_metric_--;
-    }
+    threads_running_metric_--;
   }
   ANNOTATE_IGNORE_SYNC_END();
   ANNOTATE_IGNORE_READS_AND_WRITES_END();
@@ -347,7 +356,8 @@ void ThreadMgr::PrintThreadCategoryRows(const ThreadCategory& category,
 }
 
 void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
-    ostringstream* output) {
+                                  WebCallbackRegistry::PrerenderedWebResponse* resp) {
+  ostringstream* output = resp->output;
   MutexLock l(lock_);
   vector<const ThreadCategory*> categories_to_print;
   auto category_name = req.parsed_args.find("group");
@@ -371,19 +381,18 @@ void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
     }
 
     (*output) << "<table class='table table-hover table-border'>";
-    (*output) << "<tr><th>Thread name</th><th>Cumulative User CPU(s)</th>"
+    (*output) << "<thead><tr><th>Thread name</th><th>Cumulative User CPU(s)</th>"
               << "<th>Cumulative Kernel CPU(s)</th>"
-              << "<th>Cumulative IO-wait(s)</th></tr>";
+              << "<th>Cumulative IO-wait(s)</th></tr></thead>";
+    (*output) << "<tbody>\n";
 
     for (const ThreadCategory* category : categories_to_print) {
       PrintThreadCategoryRows(*category, output);
     }
-    (*output) << "</table>";
+    (*output) << "</tbody></table>";
   } else {
     (*output) << "<h2>Thread Groups</h2>";
-    if (metrics_enabled_) {
-      (*output) << "<h4>" << threads_running_metric_ << " thread(s) running";
-    }
+    (*output) << "<h4>" << threads_running_metric_ << " thread(s) running";
     (*output) << "<a href='/threadz?group=all'><h3>All Threads</h3>";
 
     for (const ThreadCategoryMap::value_type& category : thread_categories_) {
@@ -396,9 +405,6 @@ void ThreadMgr::ThreadPathHandler(const WebCallbackRegistry::WebRequest& req,
 }
 
 static void InitThreading() {
-  // Warm up the stack trace library. This avoids a race in libunwind initialization
-  // by making sure we initialize it before we start any other threads.
-  ignore_result(GetStackTraceHex());
   thread_manager.reset(new ThreadMgr());
 }
 
@@ -493,19 +499,61 @@ void Thread::CallAtExit(const Closure& cb) {
 }
 
 std::string Thread::ToString() const {
-  return Substitute("Thread $0 (name: \"$1\", category: \"$2\")", tid_, name_, category_);
+  return Substitute("Thread $0 (name: \"$1\", category: \"$2\")", tid(), name_, category_);
 }
+
+int64_t Thread::WaitForTid() const {
+  const string log_prefix = Substitute("$0 ($1) ", name_, category_);
+  SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix,
+                                   "waiting for new thread to publish its TID");
+  int loop_count = 0;
+  while (true) {
+    int64_t t = Acquire_Load(&tid_);
+    if (t != PARENT_WAITING_TID) return t;
+    boost::detail::yield(loop_count++);
+  }
+}
+
 
 Status Thread::StartThread(const std::string& category, const std::string& name,
                            const ThreadFunctor& functor, uint64_t flags,
                            scoped_refptr<Thread> *holder) {
   TRACE_COUNTER_INCREMENT("threads_started", 1);
   TRACE_COUNTER_SCOPE_LATENCY_US("thread_start_us");
+  GoogleOnceInit(&once, &InitThreading);
+
   const string log_prefix = Substitute("$0 ($1) ", name, category);
   SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, "starting thread");
 
   // Temporary reference for the duration of this function.
   scoped_refptr<Thread> t(new Thread(category, name, functor));
+
+  // Optional, and only set if the thread was successfully created.
+  //
+  // We have to set this before we even start the thread because it's
+  // allowed for the thread functor to access 'holder'.
+  if (holder) {
+    *holder = t;
+  }
+
+  t->tid_ = PARENT_WAITING_TID;
+
+  // Add a reference count to the thread since SuperviseThread() needs to
+  // access the thread object, and we have no guarantee that our caller
+  // won't drop the reference as soon as we return. This is dereferenced
+  // in FinishThread().
+  t->AddRef();
+
+  auto cleanup = MakeScopedCleanup([&]() {
+      // If we failed to create the thread, we need to undo all of our prep work.
+      t->tid_ = INVALID_TID;
+      t->Release();
+    });
+
+  if (PREDICT_FALSE(FLAGS_thread_inject_start_latency_ms > 0)) {
+    LOG(INFO) << "Injecting " << FLAGS_thread_inject_start_latency_ms << "ms sleep on thread start";
+    SleepFor(MonoDelta::FromMilliseconds(FLAGS_thread_inject_start_latency_ms));
+  }
 
   {
     SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix, "creating pthread");
@@ -522,28 +570,7 @@ Status Thread::StartThread(const std::string& category, const std::string& name,
   // (or someone communicating with the parent) can join, so joinable must
   // be set before the parent returns.
   t->joinable_ = true;
-
-  // Optional, and only set if the thread was successfully created.
-  if (holder) {
-    *holder = t;
-  }
-
-  // The tid_ member goes through the following states:
-  // 1  CHILD_WAITING_TID: the child has just been spawned and is waiting
-  //    for the parent to finish writing to caller state (i.e. 'holder').
-  // 2. PARENT_WAITING_TID: the parent has updated caller state and is now
-  //    waiting for the child to write the tid.
-  // 3. <value>: both the parent and the child are free to continue. If the
-  //    value is INVALID_TID, the child could not discover its tid.
-  Release_Store(&t->tid_, PARENT_WAITING_TID);
-  {
-    SCOPED_LOG_SLOW_EXECUTION_PREFIX(WARNING, 500 /* ms */, log_prefix,
-                                     "waiting for new thread to publish its TID");
-    int loop_count = 0;
-    while (Acquire_Load(&t->tid_) == PARENT_WAITING_TID) {
-      boost::detail::yield(loop_count++);
-    }
-  }
+  cleanup.cancel();
 
   VLOG(2) << "Started thread " << t->tid()<< " - " << category << ":" << name;
   return Status::OK();
@@ -552,14 +579,9 @@ Status Thread::StartThread(const std::string& category, const std::string& name,
 void* Thread::SuperviseThread(void* arg) {
   Thread* t = static_cast<Thread*>(arg);
   int64_t system_tid = Thread::CurrentThreadId();
-  if (system_tid == -1) {
-    string error_msg = ErrnoToString(errno);
-    KLOG_EVERY_N(INFO, 100) << "Could not determine thread ID: " << error_msg;
-  }
-  string name = strings::Substitute("$0-$1", t->name(), system_tid);
+  PCHECK(system_tid != -1);
 
   // Take an additional reference to the thread manager, which we'll need below.
-  GoogleOnceInit(&once, &InitThreading);
   ANNOTATE_IGNORE_SYNC_BEGIN();
   shared_ptr<ThreadMgr> thread_mgr_ref = thread_manager;
   ANNOTATE_IGNORE_SYNC_END();
@@ -567,21 +589,17 @@ void* Thread::SuperviseThread(void* arg) {
   // Set up the TLS.
   //
   // We could store a scoped_refptr in the TLS itself, but as its
-  // lifecycle is poorly defined, we'll use a bare pointer and take an
-  // additional reference on t out of band, in thread_ref.
-  scoped_refptr<Thread> thread_ref = t;
-  t->tls_ = t;
+  // lifecycle is poorly defined, we'll use a bare pointer. We
+  // already incremented the reference count in StartThread.
+  Thread::tls_ = t;
 
-  // Wait until the parent has updated all caller-visible state, then write
-  // the TID to 'tid_', thus completing the parent<-->child handshake.
-  int loop_count = 0;
-  while (Acquire_Load(&t->tid_) == CHILD_WAITING_TID) {
-    boost::detail::yield(loop_count++);
-  }
+  // Publish our tid to 'tid_', which unblocks any callers waiting in
+  // WaitForTid().
   Release_Store(&t->tid_, system_tid);
 
-  thread_manager->SetThreadName(name, t->tid());
-  thread_manager->AddThread(pthread_self(), name, t->category(), t->tid());
+  string name = strings::Substitute("$0-$1", t->name(), system_tid);
+  thread_manager->SetThreadName(name, t->tid_);
+  thread_manager->AddThread(pthread_self(), name, t->category(), t->tid_);
 
   // FinishThread() is guaranteed to run (even if functor_ throws an
   // exception) because pthread_cleanup_push() creates a scoped object
@@ -609,8 +627,11 @@ void Thread::FinishThread(void* arg) {
   // Signal any Joiner that we're done.
   t->done_.CountDown();
 
-  VLOG(2) << "Ended thread " << t->tid() << " - "
-          << t->category() << ":" << t->name();
+  VLOG(2) << "Ended thread " << t->tid_ << " - " << t->category() << ":" << t->name();
+  t->Release();
+  // NOTE: the above 'Release' call could be the last reference to 'this',
+  // so 'this' could be destructed at this point. Do not add any code
+  // following here!
 }
 
 } // namespace kudu

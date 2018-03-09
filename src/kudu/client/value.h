@@ -17,14 +17,16 @@
 #ifndef KUDU_CLIENT_VALUE_H
 #define KUDU_CLIENT_VALUE_H
 
+#include <stdint.h>
+
 #ifdef KUDU_HEADERS_NO_STUBS
 #include "kudu/gutil/macros.h"
-#include "kudu/gutil/port.h"
 #else
 #include "kudu/client/stubs.h"
 #endif
-#include "kudu/util/slice.h"
+#include "kudu/util/int128.h"
 #include "kudu/util/kudu_export.h"
+#include "kudu/util/slice.h"
 
 namespace kudu {
 namespace client {
@@ -50,6 +52,22 @@ class KUDU_EXPORT KuduValue {
   static KuduValue* FromBool(bool b);
   ///@}
 
+#if KUDU_INT128_SUPPORTED
+  /// Construct a decimal KuduValue from the raw value and scale.
+  ///
+  /// The validity of the decimal value is not checked until the
+  /// KuduValue is used by Kudu.
+  ///
+  /// @param [in] dv
+  ///   The raw decimal value to build the KuduValue from.
+  /// @param [in] scale
+  ///   The decimal value's scale. (Must match the column's scale exactly)
+  /// @return A new KuduValue object.
+  ///@{
+  static KuduValue* FromDecimal(int128_t dv, int8_t scale);
+///@}
+#endif
+
   /// Construct a KuduValue by copying the value of the given Slice.
   ///
   /// @param [in] s
@@ -69,6 +87,7 @@ class KUDU_EXPORT KuduValue {
   // Owned.
   Data* data_;
 
+ private:
   DISALLOW_COPY_AND_ASSIGN(KuduValue);
 };
 

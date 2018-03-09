@@ -17,6 +17,12 @@
 #ifndef KUDU_CLIENT_SCAN_BATCH_H
 #define KUDU_CLIENT_SCAN_BATCH_H
 
+// NOTE: using stdint.h instead of cstdint because this file is supposed
+//       to be processed by a compiler lacking C++11 support.
+#include <stdint.h>
+
+#include <cstddef>
+#include <iterator>
 #include <string>
 
 #ifdef KUDU_HEADERS_NO_STUBS
@@ -26,8 +32,10 @@
 #include "kudu/client/stubs.h"
 #endif
 
+#include "kudu/util/int128.h"
 #include "kudu/util/kudu_export.h"
 #include "kudu/util/slice.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 class Schema;
@@ -116,6 +124,28 @@ class KUDU_EXPORT KuduScanBatch {
   ///   to have this schema.
   const KuduSchema* projection_schema() const;
 
+  /// @name Advanced/Unstable API
+  ///
+  /// There are no guarantees on the stability of the format returned
+  /// by these methods, which might change at any given time.
+  ///
+  /// @note The Slices returned by both direct_data() and indirect_data()
+  ///   are only valid for the lifetime of the KuduScanBatch.
+  //
+  ///@{
+  /// Return a slice that points to the direct row data received from the
+  /// server. Users of this API must have knowledge of the data format in
+  /// order to decode the data.
+  ///
+  /// @return a Slice that points to the raw direct row data.
+  Slice direct_data() const;
+
+  /// Like the method above, but for indirect data.
+  ///
+  /// @return a Slice that points to the raw indirect row data.
+  Slice indirect_data() const;
+  ///@}
+
  private:
   class KUDU_NO_EXPORT Data;
   friend class KuduScanner;
@@ -165,6 +195,10 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
 
   Status GetFloat(const Slice& col_name, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(const Slice& col_name, double* val) const WARN_UNUSED_RESULT;
+
+#if KUDU_INT128_SUPPORTED
+  Status GetUnscaledDecimal(const Slice& col_name, int128_t* val) const WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Getters for integral type columns by column index.
@@ -195,6 +229,10 @@ class KUDU_EXPORT KuduScanBatch::RowPtr {
 
   Status GetFloat(int col_idx, float* val) const WARN_UNUSED_RESULT;
   Status GetDouble(int col_idx, double* val) const WARN_UNUSED_RESULT;
+
+#if KUDU_INT128_SUPPORTED
+  Status GetUnscaledDecimal(int col_idx, int128_t* val) const WARN_UNUSED_RESULT;
+#endif
   ///@}
 
   /// @name Getters for string/binary column by column name.

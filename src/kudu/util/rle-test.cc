@@ -14,20 +14,29 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#include <stdlib.h>
-#include <stdio.h>
+
+#include <algorithm>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <ostream>
+#include <string>
+#include <vector>
 
 // Must come before gtest.h.
 #include "kudu/gutil/mathlimits.h"
 
 #include <boost/utility/binary.hpp>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
-#include <string>
-#include <vector>
 
-#include "kudu/util/rle-encoding.h"
 #include "kudu/util/bit-stream-utils.h"
+#include "kudu/util/bit-stream-utils.inline.h"
+#include "kudu/util/bit-util.h"
+#include "kudu/util/faststring.h"
 #include "kudu/util/hexdump.h"
+#include "kudu/util/rle-encoding.h"
+#include "kudu/util/slice.h"
 #include "kudu/util/test_util.h"
 
 using std::string;
@@ -35,7 +44,7 @@ using std::vector;
 
 namespace kudu {
 
-const int MAX_WIDTH = 64;
+const int kMaxWidth = 64;
 
 class TestRle : public KuduTest {};
 
@@ -123,7 +132,7 @@ void TestBitArrayValues(int bit_width, int num_vals) {
 }
 
 TEST(BitArray, TestValues) {
-  for (int width = 1; width <= MAX_WIDTH; ++width) {
+  for (int width = 1; width <= kMaxWidth; ++width) {
     TestBitArrayValues(width, 1);
     TestBitArrayValues(width, 2);
     // Don't write too many values
@@ -225,7 +234,7 @@ TEST(Rle, SpecificSequences) {
     ValidateRle(values, width, expected_buffer, 4);
   }
 
-  for (int width = 9; width <= MAX_WIDTH; ++width) {
+  for (int width = 9; width <= kMaxWidth; ++width) {
     ValidateRle(values, width, nullptr, 2 * (1 + BitUtil::Ceil(width, 8)));
   }
 
@@ -243,7 +252,7 @@ TEST(Rle, SpecificSequences) {
 
   // num_groups and expected_buffer only valid for bit width = 1
   ValidateRle(values, 1, expected_buffer, 1 + num_groups);
-  for (int width = 2; width <= MAX_WIDTH; ++width) {
+  for (int width = 2; width <= kMaxWidth; ++width) {
     ValidateRle(values, width, nullptr, 1 + BitUtil::Ceil(width * 100, 8));
   }
 }
@@ -260,7 +269,7 @@ void TestRleValues(int bit_width, int num_vals, int value = -1) {
 }
 
 TEST(Rle, TestValues) {
-  for (int width = 1; width <= MAX_WIDTH; ++width) {
+  for (int width = 1; width <= kMaxWidth; ++width) {
     TestRleValues(width, 1);
     TestRleValues(width, 1024);
     TestRleValues(width, 1024, 0);
@@ -320,7 +329,7 @@ TEST_F(BitRle, RandomBools) {
       }
       parity = !parity;
     }
-    ValidateRle(values, (iters % MAX_WIDTH) + 1, nullptr, -1);
+    ValidateRle(values, (iters % kMaxWidth) + 1, nullptr, -1);
   }
 }
 

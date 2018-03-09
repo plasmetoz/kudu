@@ -17,14 +17,22 @@
 
 #include "kudu/cfile/cfile_util.h"
 
-#include <glog/logging.h>
 #include <algorithm>
+#include <cstdint>
 #include <string>
+
+#include <boost/optional/optional.hpp>
+#include <glog/logging.h>
 
 #include "kudu/cfile/cfile_reader.h"
 #include "kudu/common/column_materialization_context.h"
-#include "kudu/util/env.h"
+#include "kudu/common/columnblock.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/types.h"
+#include "kudu/gutil/port.h"
+#include "kudu/util/bitmap.h"
 #include "kudu/util/mem_tracker.h"
+#include "kudu/util/memory/arena.h"
 
 namespace kudu {
 namespace cfile {
@@ -33,13 +41,22 @@ using std::string;
 
 static const int kBufSize = 1024*1024;
 
+WriterOptions::WriterOptions()
+  : index_block_size(32*1024),
+    block_restart_interval(16),
+    write_posidx(false),
+    write_validx(false),
+    optimize_index_keys(true),
+    validx_key_encoder(boost::none) {
+}
+
 Status DumpIterator(const CFileReader& reader,
                     CFileIterator* it,
                     std::ostream* out,
                     int num_rows,
                     int indent) {
 
-  Arena arena(8192, 8*1024*1024);
+  Arena arena(8192);
   uint8_t buf[kBufSize];
   const TypeInfo *type = reader.type_info();
   size_t max_rows = kBufSize/type->size();

@@ -16,33 +16,6 @@
 # under the License.
 
 #########################################
-# server_common
-#########################################
-
-set(SERVER_COMMON_SRCS
-  hybrid_clock.cc
-  logical_clock.cc
-)
-
-add_library(server_common ${SERVER_COMMON_SRCS})
-target_link_libraries(server_common
-  kudu_common
-  codegen
-  gutil
-  kudu_fs
-  kudu_util
-  consensus_metadata_proto
-  security)
-
-#########################################
-# server_common tests
-#########################################
-
-set(KUDU_TEST_LINK_LIBS server_common ${KUDU_MIN_TEST_LIBS})
-ADD_KUDU_TEST(hybrid_clock-test)
-ADD_KUDU_TEST(logical_clock-test)
-
-#########################################
 # server_base_proto
 #########################################
 
@@ -66,16 +39,17 @@ target_link_libraries(server_base_proto
 #########################################
 
 set(SERVER_PROCESS_SRCS
-  default-path-handlers.cc
+  default_path_handlers.cc
+  diagnostics_log.cc
   generic_service.cc
   glog_metrics.cc
-  pprof-path-handlers.cc
+  pprof_path_handlers.cc
   rpcz-path-handler.cc
   rpc_server.cc
   server_base.cc
   server_base_options.cc
   tcmalloc_metrics.cc
-  tracing-path-handlers.cc
+  tracing_path_handlers.cc
   webserver.cc
   webserver_options.cc
   webui_util.cc
@@ -83,13 +57,15 @@ set(SERVER_PROCESS_SRCS
 
 add_library(server_process ${SERVER_PROCESS_SRCS})
 target_link_libraries(server_process
-  server_base_proto
-  server_common
-  kudu_common
-  kudu_fs
+  clock
+  codegen
   gutil
   krpc
+  kudu_common
+  kudu_fs
   kudu_util
+  mustache
+  server_base_proto
   squeasel)
 
 # This module depends on tcmalloc and profiler directly, so need to make
@@ -102,8 +78,9 @@ endif()
 # server_process tests
 #########################################
 
-set(KUDU_TEST_LINK_LIBS  ${KUDU_MIN_TEST_LIBS}
+set(KUDU_TEST_LINK_LIBS ${KUDU_MIN_TEST_LIBS}
   kudu_curl_util
   server_process
-  security-test)
+  security_test_util)
+ADD_KUDU_TEST(rpc_server-test)
 ADD_KUDU_TEST(webserver-test)

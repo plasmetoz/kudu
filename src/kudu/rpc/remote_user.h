@@ -17,8 +17,9 @@
 #pragma once
 
 #include <string>
+#include <utility>
 
-#include <boost/optional.hpp>
+#include <boost/optional/optional.hpp>
 
 namespace kudu {
 namespace rpc {

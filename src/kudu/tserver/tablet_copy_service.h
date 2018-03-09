@@ -20,36 +20,44 @@
 #include <string>
 #include <unordered_map>
 
-#include "kudu/gutil/gscoped_ptr.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/ref_counted.h"
+#include "kudu/tserver/tablet_copy.pb.h"
 #include "kudu/tserver/tablet_copy.service.h"
+#include "kudu/tserver/tablet_copy_source_session.h"
 #include "kudu/util/countdown_latch.h"
-#include "kudu/util/locks.h"
-#include "kudu/util/metrics.h"
 #include "kudu/util/monotime.h"
+#include "kudu/util/mutex.h"
+#include "kudu/util/random.h"
 #include "kudu/util/status.h"
 #include "kudu/util/thread.h"
 
+namespace google {
+namespace protobuf {
+class Message;
+}
+}
+
 namespace kudu {
+
 class FsManager;
 
 namespace server {
 class ServerBase;
 } // namespace server
 
-namespace log {
-class ReadableLogSegment;
-} // namespace log
+namespace rpc {
+class RpcContext;
+} // namespace rpc
 
 namespace tserver {
 
-class TabletCopySourceSession;
-class TabletPeerLookupIf;
+class TabletReplicaLookupIf;
 
 class TabletCopyServiceImpl : public TabletCopyServiceIf {
  public:
   TabletCopyServiceImpl(server::ServerBase* server,
-                        TabletPeerLookupIf* tablet_peer_lookup);
+                        TabletReplicaLookupIf* tablet_replica_lookup);
 
   bool AuthorizeServiceUser(const google::protobuf::Message* req,
                             google::protobuf::Message* resp,
@@ -74,8 +82,12 @@ class TabletCopyServiceImpl : public TabletCopyServiceIf {
   virtual void Shutdown() OVERRIDE;
 
  private:
-  typedef std::unordered_map<std::string, scoped_refptr<TabletCopySourceSession> > SessionMap;
-  typedef std::unordered_map<std::string, MonoTime> MonoTimeMap;
+  struct SessionEntry {
+    scoped_refptr<TabletCopySourceSession> session;
+    MonoTime expires;
+  };
+
+  typedef std::unordered_map<std::string, SessionEntry> SessionMap;
 
   // Look up session in session map.
   Status FindSessionUnlocked(const std::string& session_id,
@@ -102,22 +114,24 @@ class TabletCopyServiceImpl : public TabletCopyServiceIf {
 
   void SetupErrorAndRespond(rpc::RpcContext* context,
                             TabletCopyErrorPB::Code code,
-                            const string& message,
+                            const std::string& message,
                             const Status& s);
 
   server::ServerBase* server_;
   FsManager* fs_manager_;
-  TabletPeerLookupIf* tablet_peer_lookup_;
+  TabletReplicaLookupIf* tablet_replica_lookup_;
 
-  // Protects sessions_ and session_expirations_ maps.
+  // Protects sessions_ map.
   mutable Mutex sessions_lock_;
   SessionMap sessions_;
-  MonoTimeMap session_expirations_;
+  ThreadSafeRandom rand_;
 
   // Session expiration thread.
-  // TODO: this is a hack, replace with some kind of timer impl. See KUDU-286.
+  // TODO(mpercy): This is a hack, replace some kind of timer. See KUDU-286.
   CountDownLatch shutdown_latch_;
   scoped_refptr<Thread> session_expiration_thread_;
+
+  TabletCopySourceMetrics tablet_copy_metrics_;
 };
 
 } // namespace tserver

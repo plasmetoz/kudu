@@ -17,8 +17,13 @@
 
 #pragma once
 
+#include <cstddef>
 #include <string>
 
+#include <openssl/bio.h>
+#include <openssl/rsa.h>
+
+#include "kudu/gutil/port.h"
 #include "kudu/security/openssl_util.h"
 
 // Forward declarations for the OpenSSL typedefs.
@@ -71,7 +76,11 @@ class PrivateKey : public RawDataWrapper<EVP_PKEY> {
 
   Status FromString(const std::string& data, DataFormat format) WARN_UNUSED_RESULT;
   Status ToString(std::string* data, DataFormat format) const WARN_UNUSED_RESULT;
-  Status FromFile(const std::string& fpath, DataFormat format) WARN_UNUSED_RESULT;
+
+  // If 'cb' is set, it will be called to obtain the password necessary to decrypt
+  // the private key file in 'fpath'.
+  Status FromFile(const std::string& fpath, DataFormat format,
+                  const PasswordCallback& password_cb = PasswordCallback()) WARN_UNUSED_RESULT;
 
   // Output the public part of the keypair into the specified placeholder.
   Status GetPublicKey(PublicKey* public_key) const WARN_UNUSED_RESULT;

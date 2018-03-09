@@ -32,7 +32,7 @@ namespace kudu {
 namespace tablet {
 
 // Helper class to write directly into a local tablet, without going
-// through TabletPeer, consensus, etc.
+// through TabletReplica, consensus, etc.
 //
 // This is useful for unit-testing the Tablet code paths with no consensus
 // implementation or thread pools.
@@ -79,8 +79,8 @@ class LocalTabletWriter {
   // Returns a bad Status if the applied operation had a per-row error.
   Status Write(RowOperationsPB::Type type,
                const KuduPartialRow& row) {
-    vector<Op> ops;
-    ops.push_back(Op(type, &row));
+    std::vector<Op> ops;
+    ops.emplace_back(type, &row);
     return WriteBatch(ops);
   }
 
@@ -100,7 +100,7 @@ class LocalTabletWriter {
 
     // Create a "fake" OpId and set it in the TransactionState for anchoring.
     tx_state_->mutable_op_id()->CopyFrom(consensus::MaximumOpId());
-    tablet_->ApplyRowOperations(tx_state_.get());
+    RETURN_NOT_OK(tablet_->ApplyRowOperations(tx_state_.get()));
 
     tx_state_->ReleaseTxResultPB(&result_);
     tablet_->mvcc_manager()->AdjustSafeTime(tx_state_->timestamp());

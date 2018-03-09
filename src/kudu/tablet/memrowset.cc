@@ -19,6 +19,8 @@
 
 #include <memory>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 #include <gflags/gflags.h>
@@ -26,23 +28,33 @@
 
 #include "kudu/codegen/compilation_manager.h"
 #include "kudu/codegen/row_projector.h"
+#include "kudu/common/columnblock.h"
 #include "kudu/common/common.pb.h"
-#include "kudu/common/generic_iterators.h"
+#include "kudu/common/encoded_key.h"
 #include "kudu/common/row.h"
-#include "kudu/consensus/consensus.pb.h"
+#include "kudu/common/row_changelist.h"
+#include "kudu/common/rowblock.h"
+#include "kudu/common/scan_spec.h"
 #include "kudu/consensus/log_anchor_registry.h"
+#include "kudu/consensus/opid.pb.h"
 #include "kudu/gutil/dynamic_annotations.h"
+#include "kudu/gutil/move.h"
+#include "kudu/gutil/port.h"
+#include "kudu/gutil/strings/substitute.h"
 #include "kudu/tablet/compaction.h"
+#include "kudu/tablet/mutation.h"
+#include "kudu/tablet/tablet.pb.h"
 #include "kudu/util/flag_tags.h"
 #include "kudu/util/mem_tracker.h"
-#include "kudu/util/memory/overwrite.h"
+#include "kudu/util/memory/memory.h"
 
 DEFINE_bool(mrs_use_codegen, true, "whether the memrowset should use code "
             "generation for iteration");
 TAG_FLAG(mrs_use_codegen, hidden);
 
-using std::pair;
 using std::shared_ptr;
+using std::string;
+using std::vector;
 
 namespace kudu { namespace tablet {
 
@@ -51,7 +63,6 @@ using log::LogAnchorRegistry;
 using strings::Substitute;
 
 static const int kInitialArenaSize = 16;
-static const int kMaxArenaBufferSize = 8*1024*1024;
 
 bool MRSRow::IsGhost() const {
   bool is_ghost = false;
@@ -105,12 +116,12 @@ MemRowSet::MemRowSet(int64_t id,
     schema_(schema),
     allocator_(new MemoryTrackingBufferAllocator(HeapBufferAllocator::Get(),
                                                  CreateMemTrackerForMemRowSet(id, parent_tracker))),
-    arena_(new ThreadSafeMemoryTrackingArena(kInitialArenaSize, kMaxArenaBufferSize,
-                                             allocator_)),
+    arena_(new ThreadSafeMemoryTrackingArena(kInitialArenaSize, allocator_)),
     tree_(arena_),
     debug_insert_count_(0),
     debug_update_count_(0),
-    anchorer_(log_anchor_registry, Substitute("MemRowSet-$0", id_)) {
+    anchorer_(log_anchor_registry, Substitute("MemRowSet-$0", id_)),
+    has_been_compacted_(false) {
   CHECK(schema.has_column_ids());
   ANNOTATE_BENIGN_RACE(&debug_insert_count_, "insert count isnt accurate");
   ANNOTATE_BENIGN_RACE(&debug_update_count_, "update count isnt accurate");

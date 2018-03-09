@@ -19,11 +19,14 @@
 
 #include <memory>
 #include <string>
+#include <utility>
 
 #include "kudu/gutil/callback.h"
+#include "kudu/gutil/macros.h"
+#include "kudu/gutil/ref_counted.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/util/monotime.h"
-#include "kudu/util/status_callback.h"
+#include "kudu/util/status.h"
 
 namespace kudu {
 
@@ -47,8 +50,12 @@ struct RetriableRpcStatus {
     // reaching the replica or a DNS resolution problem.
     SERVER_NOT_ACCESSIBLE,
 
-    // The server is too busy to serve the request.
-    SERVER_BUSY,
+    // The server received the request but it was not ready to serve it right
+    // away. It might happen that the server was too busy and did not have
+    // necessary resources or information to serve the request but it
+    // anticipates it should be ready to serve the request really soon, so it's
+    // worth retrying the request at a later time.
+    SERVICE_UNAVAILABLE,
 
     // For rpc's that are meant only for the leader of a shared resource, when the server
     // we're interacting with is not the leader.
@@ -56,7 +63,12 @@ struct RetriableRpcStatus {
 
     // The server doesn't know the resource we're interacting with. For instance a TabletServer
     // is not part of the config for the tablet we're trying to write to.
-    RESOURCE_NOT_FOUND
+    RESOURCE_NOT_FOUND,
+
+    // The authentication token supplied with the operation was found invalid
+    // by the server. Most likely, the token has expired. If so, get a new token
+    // using client credentials and retry the operation with it.
+    INVALID_AUTHENTICATION_TOKEN,
   };
 
   Result result;

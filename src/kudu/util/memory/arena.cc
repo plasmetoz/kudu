@@ -20,47 +20,47 @@
 #include "kudu/util/memory/arena.h"
 
 #include <algorithm>
+#include <memory>
 #include <mutex>
 
-#include "kudu/util/debug-util.h"
-#include "kudu/util/flag_tags.h"
-
-using std::copy;
-using std::max;
 using std::min;
-using std::reverse;
-using std::sort;
-using std::swap;
 using std::unique_ptr;
-
-DEFINE_int64(arena_warn_threshold_bytes, 256*1024*1024,
-             "Number of bytes beyond which to emit a warning for a large arena");
-TAG_FLAG(arena_warn_threshold_bytes, hidden);
 
 namespace kudu {
 
 template <bool THREADSAFE>
 const size_t ArenaBase<THREADSAFE>::kMinimumChunkSize = 16;
 
+// The max size of our allocations is set to this magic number
+// corresponding to 127 tcmalloc pages (each being 8KB). tcmalloc
+// internally keeps a free-list of spans up to this size. Larger
+// allocations have to go through a linear search through free
+// space, which can get quite slow in a fragmented heap.
+//
+// See the definition of kMaxPages in tcmalloc/src/common.h
+// as well as https://github.com/gperftools/gperftools/issues/535
+// for a description of the performance issue.
+constexpr int kMaxTcmallocFastAllocation = 8192 * 127;
+
 template <bool THREADSAFE>
-ArenaBase<THREADSAFE>::ArenaBase(
-  BufferAllocator* const buffer_allocator,
-  size_t initial_buffer_size,
-  size_t max_buffer_size)
+ArenaBase<THREADSAFE>::ArenaBase(BufferAllocator* buffer_allocator,
+                                 size_t initial_buffer_size)
     : buffer_allocator_(buffer_allocator),
-      max_buffer_size_(max_buffer_size),
-      arena_footprint_(0),
-      warned_(false) {
+      max_buffer_size_(kMaxTcmallocFastAllocation),
+      arena_footprint_(0) {
   AddComponent(CHECK_NOTNULL(NewComponent(initial_buffer_size, 0)));
 }
 
 template <bool THREADSAFE>
-ArenaBase<THREADSAFE>::ArenaBase(size_t initial_buffer_size, size_t max_buffer_size)
-    : buffer_allocator_(HeapBufferAllocator::Get()),
-      max_buffer_size_(max_buffer_size),
-      arena_footprint_(0),
-      warned_(false) {
-  AddComponent(CHECK_NOTNULL(NewComponent(initial_buffer_size, 0)));
+ArenaBase<THREADSAFE>::ArenaBase(size_t initial_buffer_size)
+    : ArenaBase<THREADSAFE>(HeapBufferAllocator::Get(),
+                            initial_buffer_size) {
+}
+
+template <bool THREADSAFE>
+void ArenaBase<THREADSAFE>::SetMaxBufferSize(size_t size) {
+  DCHECK_LE(size, kMaxTcmallocFastAllocation);
+  max_buffer_size_ = size;
 }
 
 template <bool THREADSAFE>
@@ -128,13 +128,6 @@ void ArenaBase<THREADSAFE>::AddComponent(ArenaBase::Component *component) {
   ReleaseStoreCurrent(component);
   arena_.push_back(unique_ptr<Component>(component));
   arena_footprint_ += component->size();
-  if (PREDICT_FALSE(arena_footprint_ > FLAGS_arena_warn_threshold_bytes) && !warned_) {
-    LOG(WARNING) << "Arena " << reinterpret_cast<const void *>(this)
-                 << " footprint (" << arena_footprint_ << " bytes) exceeded warning threshold ("
-                 << FLAGS_arena_warn_threshold_bytes << " bytes)\n"
-                 << GetStackTrace();
-    warned_ = true;
-  }
 }
 
 template <bool THREADSAFE>
@@ -149,7 +142,6 @@ void ArenaBase<THREADSAFE>::Reset() {
   }
   arena_.back()->Reset();
   arena_footprint_ = arena_.back()->size();
-  warned_ = false;
 
 #ifndef NDEBUG
   // In debug mode release the last component too for (hopefully) better

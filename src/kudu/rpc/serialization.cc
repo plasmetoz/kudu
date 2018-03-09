@@ -17,11 +17,16 @@
 
 #include "kudu/rpc/serialization.h"
 
+#include <ostream>
+#include <string>
+
+#include <gflags/gflags_declare.h>
 #include <glog/logging.h>
 #include <google/protobuf/message_lite.h>
 #include <google/protobuf/io/coded_stream.h>
 
 #include "kudu/gutil/endian.h"
+#include "kudu/gutil/port.h"
 #include "kudu/gutil/stringprintf.h"
 #include "kudu/gutil/strings/substitute.h"
 #include "kudu/rpc/constants.h"
@@ -51,9 +56,12 @@ void SerializeMessage(const MessageLite& message, faststring* param_buf,
                         int additional_size, bool use_cached_size) {
   int pb_size = use_cached_size ? message.GetCachedSize() : message.ByteSize();
   DCHECK_EQ(message.ByteSize(), pb_size);
-  int recorded_size = pb_size + additional_size;
-  int size_with_delim = pb_size + CodedOutputStream::VarintSize32(recorded_size);
-  int total_size = size_with_delim + additional_size;
+  // Use 8-byte integers to avoid overflowing when additional_size approaches INT_MAX.
+  int64_t recorded_size = static_cast<int64_t>(pb_size) +
+      static_cast<int64_t>(additional_size);
+  int64_t size_with_delim = static_cast<int64_t>(pb_size) +
+      static_cast<int64_t>(CodedOutputStream::VarintSize32(recorded_size));
+  int64_t total_size = size_with_delim + static_cast<int64_t>(additional_size);
 
   if (total_size > FLAGS_rpc_max_message_size) {
     LOG(WARNING) << Substitute("Serialized $0 ($1 bytes) is larger than the maximum configured "
@@ -109,11 +117,15 @@ Status ParseMessage(const Slice& buf,
                               KUDU_REDACT(buf.ToDebugString()));
   }
 
-  int total_len = NetworkByteOrder::Load32(buf.data());
-  DCHECK_EQ(total_len + kMsgLengthPrefixLength, buf.size())
+  uint32_t total_len = NetworkByteOrder::Load32(buf.data());
+  DCHECK_EQ(total_len, buf.size() - kMsgLengthPrefixLength)
     << "Got mis-sized buffer: " << KUDU_REDACT(buf.ToDebugString());
 
   CodedInputStream in(buf.data(), buf.size());
+  // Protobuf enforces a 64MB total bytes limit on CodedInputStream by default.
+  // Override this default with the actual size of the buffer to allow messages
+  // larger than 64MB.
+  in.SetTotalBytesLimit(buf.size(), -1);
   in.Skip(kMsgLengthPrefixLength);
 
   uint32_t header_len;

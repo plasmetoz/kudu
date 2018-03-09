@@ -14,27 +14,26 @@
 // KIND, either express or implied.  See the License for the
 // specific language governing permissions and limitations
 // under the License.
-#ifndef KUDU_TABLET_TABLET_PEER_HARNESS_H
-#define KUDU_TABLET_TABLET_PEER_HARNESS_H
+#ifndef KUDU_TABLET_TABLET_REPLICA_HARNESS_H
+#define KUDU_TABLET_TABLET_REPLICA_HARNESS_H
 
 #include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
+#include "kudu/clock/hybrid_clock.h"
+#include "kudu/clock/logical_clock.h"
+#include "kudu/common/partial_row.h"
 #include "kudu/common/schema.h"
 #include "kudu/consensus/log_anchor_registry.h"
 #include "kudu/consensus/metadata.pb.h"
-#include "kudu/server/hybrid_clock.h"
-#include "kudu/server/logical_clock.h"
+#include "kudu/fs/fs_manager.h"
 #include "kudu/tablet/tablet.h"
 #include "kudu/util/env.h"
 #include "kudu/util/mem_tracker.h"
 #include "kudu/util/metrics.h"
 #include "kudu/util/status.h"
-
-using std::string;
-using std::vector;
 
 namespace kudu {
 namespace tablet {
@@ -52,8 +51,8 @@ static std::pair<PartitionSchema, Partition> CreateDefaultPartition(const Schema
   CHECK_OK(PartitionSchema::FromPB(PartitionSchemaPB(), schema, &partition_schema));
 
   // Create the tablet partitions.
-  vector<Partition> partitions;
-  CHECK_OK(partition_schema.CreatePartitions(vector<KuduPartialRow>(), {}, schema, &partitions));
+  std::vector<Partition> partitions;
+  CHECK_OK(partition_schema.CreatePartitions({}, {}, schema, &partitions));
   CHECK_EQ(1, partitions.size());
   return std::make_pair(partition_schema, partitions[0]);
 }
@@ -65,7 +64,7 @@ class TabletHarness {
       HYBRID_CLOCK,
       LOGICAL_CLOCK
     };
-    explicit Options(string root_dir)
+    explicit Options(std::string root_dir)
         : env(Env::Default()),
           tablet_id("test_tablet_id"),
           root_dir(std::move(root_dir)),
@@ -73,8 +72,8 @@ class TabletHarness {
           clock_type(LOGICAL_CLOCK) {}
 
     Env* env;
-    string tablet_id;
-    string root_dir;
+    std::string tablet_id;
+    std::string root_dir;
     bool enable_metrics;
     ClockType clock_type;
   };
@@ -101,15 +100,16 @@ class TabletHarness {
                                                partition.first,
                                                partition.second,
                                                TABLET_DATA_READY,
+                                               /*tombstone_last_logged_opid=*/ boost::none,
                                                &metadata));
     if (options_.enable_metrics) {
       metrics_registry_.reset(new MetricRegistry());
     }
 
     if (options_.clock_type == Options::LOGICAL_CLOCK) {
-      clock_.reset(server::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp));
+      clock_.reset(clock::LogicalClock::CreateStartingAt(Timestamp::kInitialTimestamp));
     } else {
-      clock_.reset(new server::HybridClock());
+      clock_.reset(new clock::HybridClock());
       RETURN_NOT_OK(clock_->Init());
     }
     tablet_.reset(new Tablet(metadata,
@@ -122,11 +122,10 @@ class TabletHarness {
 
   Status Open() {
     RETURN_NOT_OK(tablet_->Open());
-    tablet_->MarkFinishedBootstrapping();
-    return Status::OK();
+    return tablet_->MarkFinishedBootstrapping();
   }
 
-  server::Clock* clock() const {
+  clock::Clock* clock() const {
     return clock_.get();
   }
 
@@ -147,7 +146,7 @@ class TabletHarness {
 
   gscoped_ptr<MetricRegistry> metrics_registry_;
 
-  scoped_refptr<server::Clock> clock_;
+  scoped_refptr<clock::Clock> clock_;
   Schema schema_;
   gscoped_ptr<FsManager> fs_manager_;
   std::shared_ptr<Tablet> tablet_;
@@ -155,4 +154,4 @@ class TabletHarness {
 
 } // namespace tablet
 } // namespace kudu
-#endif /* KUDU_TABLET_TABLET_PEER_HARNESS_H */
+#endif /* KUDU_TABLET_TABLET_REPLICA_HARNESS_H */

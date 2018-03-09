@@ -102,7 +102,7 @@ fetch_and_expand() {
 mkdir -p $TP_SOURCE_DIR
 cd $TP_SOURCE_DIR
 
-GLOG_PATCHLEVEL=3
+GLOG_PATCHLEVEL=2
 delete_if_wrong_patchlevel $GLOG_SOURCE $GLOG_PATCHLEVEL
 if [ ! -d $GLOG_SOURCE ]; then
   fetch_and_expand glog-${GLOG_VERSION}.tar.gz
@@ -110,7 +110,6 @@ if [ ! -d $GLOG_SOURCE ]; then
   pushd $GLOG_SOURCE
   patch -p0 < $TP_DIR/patches/glog-issue-198-fix-unused-warnings.patch
   patch -p0 < $TP_DIR/patches/glog-issue-54-dont-build-tests.patch
-  patch -p1 < $TP_DIR/patches/glog-cda16b3443e2d6ef88cdbbe10b9a11adea6f33fe.patch
   touch patchlevel-$GLOG_PATCHLEVEL
   autoreconf -fvi
   popd
@@ -118,31 +117,34 @@ if [ ! -d $GLOG_SOURCE ]; then
 fi
 
 if [ ! -d $GMOCK_SOURCE ]; then
-  fetch_and_expand gmock-${GMOCK_VERSION}.zip
+  fetch_and_expand googletest-release-${GMOCK_VERSION}.tar.gz
 fi
 
 if [ ! -d $GFLAGS_SOURCE ]; then
   fetch_and_expand gflags-${GFLAGS_VERSION}.tar.gz
 fi
 
-GPERFTOOLS_PATCHLEVEL=3
+GPERFTOOLS_PATCHLEVEL=4
 delete_if_wrong_patchlevel $GPERFTOOLS_SOURCE $GPERFTOOLS_PATCHLEVEL
 if [ ! -d $GPERFTOOLS_SOURCE ]; then
   fetch_and_expand gperftools-${GPERFTOOLS_VERSION}.tar.gz
 
   pushd $GPERFTOOLS_SOURCE
-  patch -p1 < $TP_DIR/patches/gperftools-Change-default-TCMALLOC_TRANSFER_NUM_OBJ-to-40.patch
-  patch -p1 < $TP_DIR/patches/gperftools-hook-mi_force_unlock-on-OSX-instead-of-pthread_atfork.patch
-  patch -p1 < $TP_DIR/patches/gperftools-issue-827-add_get_default_zone_to_osx_libc_override.patch
+  patch -p1 < $TP_DIR/patches/gperftools-Implemented-O-log-n-searching-among-large-spans.patch
+  patch -p1 < $TP_DIR/patches/gperftools-Replace-namespace-base-with-namespace-tcmalloc.patch
+  patch -p1 < $TP_DIR/patches/gperftools-sized-alloc-build-fix.patch
   touch patchlevel-$GPERFTOOLS_PATCHLEVEL
   autoreconf -fvi
   popd
   echo
 fi
 
+PROTOBUF_PATCHLEVEL=0
+delete_if_wrong_patchlevel $PROTOBUF_SOURCE $PROTOBUF_PATCHLEVEL
 if [ ! -d $PROTOBUF_SOURCE ]; then
   fetch_and_expand protobuf-${PROTOBUF_VERSION}.tar.gz
   pushd $PROTOBUF_SOURCE
+  touch patchlevel-$PROTOBUF_PATCHLEVEL
   autoreconf -fvi
   popd
 fi
@@ -207,8 +209,20 @@ if [ ! -d $SQUEASEL_SOURCE ]; then
   fetch_and_expand squeasel-${SQUEASEL_VERSION}.tar.gz
 fi
 
+if [ ! -d $MUSTACHE_SOURCE ]; then
+  fetch_and_expand mustache-${MUSTACHE_VERSION}.tar.gz
+fi
+
+GSG_PATCHLEVEL=1
+delete_if_wrong_patchlevel $GSG_SOURCE $GSG_PATCHLEVEL
 if [ ! -d $GSG_SOURCE ]; then
   fetch_and_expand google-styleguide-${GSG_VERSION}.tar.gz
+
+  pushd $GSG_SOURCE
+  patch -p1 < $TP_DIR/patches/google-styleguide-cpplint.patch
+  touch patchlevel-$GSG_PATCHLEVEL
+  popd
+  echo
 fi
 
 if [ ! -d $GCOVR_SOURCE ]; then
@@ -231,24 +245,33 @@ if [ ! -d $CRCUTIL_SOURCE ]; then
   echo
 fi
 
+LIBUNWIND_PATCHLEVEL=1
+delete_if_wrong_patchlevel $LIBUNWIND_SOURCE $LIBUNWIND_PATCHLEVEL
 if [ ! -d $LIBUNWIND_SOURCE ]; then
   fetch_and_expand libunwind-${LIBUNWIND_VERSION}.tar.gz
+  pushd $LIBUNWIND_SOURCE
+  patch -p1 < $TP_DIR/patches/libunwind-Use-syscall-directly-in-write_validate-to-avoid-ASAN.patch
+  touch patchlevel-$LIBUNWIND_PATCHLEVEL
+  popd
+  echo
 fi
 
 if [ ! -d $PYTHON_SOURCE ]; then
   fetch_and_expand python-${PYTHON_VERSION}.tar.gz
 fi
 
-LLVM_PATCHLEVEL=2
+LLVM_PATCHLEVEL=6
 delete_if_wrong_patchlevel $LLVM_SOURCE $LLVM_PATCHLEVEL
 if [ ! -d $LLVM_SOURCE ]; then
-  fetch_and_expand llvm-${LLVM_VERSION}.src.tar.gz
+  fetch_and_expand llvm-${LLVM_VERSION}-iwyu-${IWYU_VERSION}.src.tar.gz
 
   pushd $LLVM_SOURCE
   patch -p1 < $TP_DIR/patches/llvm-fix-amazon-linux.patch
-  pushd projects/libcxx
-  patch -p1 < $TP_DIR/patches/libc++-fix-std-once-barriers.patch
-  popd
+  patch -p1 -d $LLVM_SOURCE/tools/clang/tools/extra \
+    < $TP_DIR/patches/llvm-fix-readability-redundant-declaration-false-positive.patch
+  patch -p1 < $TP_DIR/patches/llvm-add-iwyu.patch
+  patch -p1 < $TP_DIR/patches/llvm-iwyu-nocurses.patch
+  patch -p1 < $TP_DIR/patches/llvm-iwyu-include-picker.patch
   touch patchlevel-$LLVM_PATCHLEVEL
   popd
   echo
@@ -301,8 +324,70 @@ if needs_openssl_workaround && [ ! -d "$OPENSSL_WORKAROUND_DIR" ] ; then
   $TP_DIR/install-openssl-el6-workaround.sh
 fi
 
+BREAKPAD_PATCHLEVEL=1
+delete_if_wrong_patchlevel $BREAKPAD_SOURCE $BREAKPAD_PATCHLEVEL
 if [ ! -d "$BREAKPAD_SOURCE" ]; then
   fetch_and_expand breakpad-${BREAKPAD_VERSION}.tar.gz
+  pushd $BREAKPAD_SOURCE
+  patch -p1 < $TP_DIR/patches/breakpad-add-basic-support-for-dwz-dwarf-extension.patch
+  touch patchlevel-$BREAKPAD_PATCHLEVEL
+  popd
+fi
+
+SPARSEHASH_PATCHLEVEL=2
+delete_if_wrong_patchlevel $SPARSEHASH_SOURCE $SPARSEHASH_PATCHLEVEL
+if [ ! -d "$SPARSEHASH_SOURCE" ]; then
+  fetch_and_expand sparsehash-c11-${SPARSEHASH_VERSION}.tar.gz
+  pushd $SPARSEHASH_SOURCE
+  patch -p1 < $TP_DIR/patches/sparsehash-0001-Add-compatibily-for-gcc-4.x-in-traits.patch
+  touch patchlevel-$SPARSEHASH_PATCHLEVEL
+  popd
+fi
+
+SPARSEPP_PATCHLEVEL=0
+delete_if_wrong_patchlevel $SPARSEPP_SOURCE $SPARSEPP_PATCHLEVEL
+if [ ! -d "$SPARSEPP_SOURCE" ]; then
+  fetch_and_expand sparsepp-${SPARSEPP_VERSION}.tar.gz
+  pushd $SPARSEPP_SOURCE
+  touch patchlevel-$SPARSEPP_PATCHLEVEL
+  popd
+fi
+
+THRIFT_PATCHLEVEL=0
+if [ ! -d "$THRIFT_SOURCE" ]; then
+  fetch_and_expand $THRIFT_NAME.tar.gz
+  pushd $THRIFT_SOURCE
+  touch patchlevel-$THRIFT_PATCHLEVEL
+  popd
+fi
+
+BISON_PATCHLEVEL=1
+if [ ! -d "$BISON_SOURCE" ]; then
+  fetch_and_expand $BISON_NAME.tar.gz
+  # This would normally call autoreconf, but it does not succeed with
+  # autoreconf 2.69 (RHEL 7): "autoreconf: 'configure.ac' or 'configure.in' is required".
+  pushd $BISON_SOURCE
+  # Fix compilation issue in macOS High Sierra
+  # See: https://github.com/spack/spack/issues/5521
+  patch -p0 < $TP_DIR/patches/bison-fix-high-sierra-compilation-issue.patch
+  touch patchlevel-$BISON_PATCHLEVEL
+  popd
+fi
+
+HIVE_PATCHLEVEL=0
+if [ ! -d "$HIVE_SOURCE" ]; then
+  fetch_and_expand $HIVE_NAME-stripped.tar.gz
+  pushd $HIVE_SOURCE
+  touch patchlevel-$HIVE_PATCHLEVEL
+  popd
+fi
+
+HADOOP_PATCHLEVEL=0
+if [ ! -d "$HADOOP_SOURCE" ]; then
+  fetch_and_expand $HADOOP_NAME-stripped.tar.gz
+  pushd $HADOOP_SOURCE
+  touch patchlevel-$HADOOP_PATCHLEVEL
+  popd
 fi
 
 echo "---------------"

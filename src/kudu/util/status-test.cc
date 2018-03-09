@@ -2,13 +2,15 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
-#include <glog/logging.h>
+#include <cerrno>
+#include <string>
+#include <utility>
+
 #include <gtest/gtest.h>
 
-#include <errno.h>
-#include <vector>
+#include "kudu/util/slice.h"
 #include "kudu/util/status.h"
-#include "kudu/util/test_util.h"
+#include "kudu/util/test_macros.h"
 
 using std::string;
 
@@ -50,7 +52,7 @@ TEST(StatusTest, TestMoveConstructor) {
   {
     Status src = Status::OK();
     Status dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(misc-use-after-move)
     ASSERT_OK(dst);
   }
 
@@ -59,7 +61,7 @@ TEST(StatusTest, TestMoveConstructor) {
   {
     Status src = Status::NotFound("foo");
     Status dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(misc-use-after-move)
     ASSERT_EQ("Not found: foo", dst.ToString());
   }
 }
@@ -71,7 +73,7 @@ TEST(StatusTest, TestMoveAssignment) {
     Status src = Status::OK();
     Status dst = Status::NotFound("orig dst");
     dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(misc-use-after-move)
     ASSERT_OK(dst);
   }
 
@@ -80,7 +82,7 @@ TEST(StatusTest, TestMoveAssignment) {
     Status src = Status::NotFound("orig src");
     Status dst = Status::NotFound("orig dst");
     dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(misc-use-after-move)
     ASSERT_EQ("Not found: orig src", dst.ToString());
   }
 
@@ -89,10 +91,29 @@ TEST(StatusTest, TestMoveAssignment) {
     Status src = Status::NotFound("orig src");
     Status dst = Status::OK();
     dst = std::move(src);
-    ASSERT_OK(src);
+    ASSERT_OK(src); // NOLINT(misc-use-after-move)
     ASSERT_EQ("Not found: orig src", dst.ToString());
   }
 }
 
+TEST(StatusTest, TestAndThen) {
+  ASSERT_OK(Status::OK().AndThen(Status::OK)
+                        .AndThen(Status::OK)
+                        .AndThen(Status::OK));
+
+  ASSERT_TRUE(Status::InvalidArgument("").AndThen([] { return Status::IllegalState(""); })
+                                         .IsInvalidArgument());
+  ASSERT_TRUE(Status::InvalidArgument("").AndThen(Status::OK)
+                                         .IsInvalidArgument());
+  ASSERT_TRUE(Status::OK().AndThen([] { return Status::InvalidArgument(""); })
+                          .AndThen(Status::OK)
+                          .IsInvalidArgument());
+
+  ASSERT_EQ("foo: bar",
+            Status::OK().CloneAndPrepend("baz")
+                        .AndThen([] {
+                          return Status::InvalidArgument("bar").CloneAndPrepend("foo");
+                        }).message());
+}
 
 }  // namespace kudu

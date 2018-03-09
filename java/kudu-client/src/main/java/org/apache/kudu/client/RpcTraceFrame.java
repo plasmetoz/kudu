@@ -20,8 +20,7 @@ package org.apache.kudu.client;
 import java.util.List;
 
 import com.google.common.base.MoreObjects;
-
-import org.apache.kudu.annotations.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceAudience;
 
 /**
  * Container class for traces. Most of its properties can be null, when they aren't set via the
@@ -51,6 +50,12 @@ class RpcTraceFrame {
       void appendToStringBuilder(RpcTraceFrame trace, StringBuilder sb) {
         sb.append("delaying RPC due to ");
         sb.append(trace.getStatus());
+      }
+    },
+    // Waiting for a new authn token to re-send the request.
+    GET_NEW_AUTHENTICATION_TOKEN_THEN_RETRY {
+      void appendToStringBuilder(RpcTraceFrame trace, StringBuilder sb) {
+        sb.append("waiting for new authn token");
       }
     },
     // After having figured out that we don't know where the RPC is going,

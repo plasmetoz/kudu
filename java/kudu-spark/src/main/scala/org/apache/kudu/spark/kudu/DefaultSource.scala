@@ -17,18 +17,22 @@
 
 package org.apache.kudu.spark.kudu
 
+import java.math.BigDecimal
+import java.net.InetAddress
 import java.sql.Timestamp
 
 import scala.collection.JavaConverters._
+import scala.util.Try
+
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.sources._
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.{DataFrame, Row, SQLContext, SaveMode}
-import org.apache.kudu.{Type, ColumnSchema}
+import org.apache.yetus.audience.InterfaceStability
 
-import org.apache.kudu.annotations.InterfaceStability
 import org.apache.kudu.client.KuduPredicate.ComparisonOp
 import org.apache.kudu.client._
+import org.apache.kudu.{ColumnSchema, ColumnTypeAttributes, Type}
 
 /**
   * Data source for integration with Spark's [[DataFrame]] API.
@@ -45,6 +49,10 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
   val TABLE_KEY = "kudu.table"
   val KUDU_MASTER = "kudu.master"
   val OPERATION = "kudu.operation"
+  val FAULT_TOLERANT_SCANNER = "kudu.faultTolerantScan"
+  val SCAN_LOCALITY = "kudu.scanLocality"
+
+  def defaultMasterAddrs: String = InetAddress.getLocalHost.getCanonicalHostName
 
   /**
     * Construct a BaseRelation using the provided context and parameters.
@@ -59,10 +67,14 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     val tableName = parameters.getOrElse(TABLE_KEY,
       throw new IllegalArgumentException(
         s"Kudu table name must be specified in create options using key '$TABLE_KEY'"))
-    val kuduMaster = parameters.getOrElse(KUDU_MASTER, "localhost")
+    val kuduMaster = parameters.getOrElse(KUDU_MASTER, defaultMasterAddrs)
     val operationType = getOperationType(parameters.getOrElse(OPERATION, "upsert"))
+    val faultTolerantScanner = Try(parameters.getOrElse(FAULT_TOLERANT_SCANNER, "false").toBoolean)
+      .getOrElse(false)
+    val scanLocality = getScanLocalityType(parameters.getOrElse(SCAN_LOCALITY, "closest_replica"))
 
-    new KuduRelation(tableName, kuduMaster, operationType, None)(sqlContext)
+    new KuduRelation(tableName, kuduMaster, faultTolerantScanner,
+      scanLocality, operationType, None)(sqlContext)
   }
 
   /**
@@ -70,7 +82,7 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     *
     * @param sqlContext
     * @param mode Only Append mode is supported. It will upsert or insert data
-    *             to an existing table, depending on the upsert parameter.
+    *             to an existing table, depending on the upsert parameter
     * @param parameters Necessary parameters for kudu.table and kudu.master
     * @param data Dataframe to save into kudu
     * @return returns populated base relation
@@ -80,8 +92,7 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     val kuduRelation = createRelation(sqlContext, parameters)
     mode match {
       case SaveMode.Append => kuduRelation.asInstanceOf[KuduRelation].insert(data, false)
-      case _ => throw new UnsupportedOperationException(
-        "Currently, only Append is supported")
+      case _ => throw new UnsupportedOperationException("Currently, only Append is supported")
     }
 
     kuduRelation
@@ -92,10 +103,14 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
     val tableName = parameters.getOrElse(TABLE_KEY,
       throw new IllegalArgumentException(s"Kudu table name must be specified in create options " +
         s"using key '$TABLE_KEY'"))
-    val kuduMaster = parameters.getOrElse(KUDU_MASTER, "localhost")
+    val kuduMaster = parameters.getOrElse(KUDU_MASTER, defaultMasterAddrs)
     val operationType = getOperationType(parameters.getOrElse(OPERATION, "upsert"))
+    val faultTolerantScanner = Try(parameters.getOrElse(FAULT_TOLERANT_SCANNER, "false").toBoolean)
+      .getOrElse(false)
+    val scanLocality = getScanLocalityType(parameters.getOrElse(SCAN_LOCALITY, "closest_replica"))
 
-    new KuduRelation(tableName, kuduMaster, operationType, Some(schema))(sqlContext)
+    new KuduRelation(tableName, kuduMaster, faultTolerantScanner,
+      scanLocality, operationType, Some(schema))(sqlContext)
   }
 
   private def getOperationType(opParam: String): OperationType = {
@@ -108,6 +123,14 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
       case _ => throw new IllegalArgumentException(s"Unsupported operation type '$opParam'")
     }
   }
+
+  private def getScanLocalityType(opParam: String): ReplicaSelection = {
+    opParam.toLowerCase match {
+      case "leader_only" => ReplicaSelection.LEADER_ONLY
+      case "closest_replica" => ReplicaSelection.CLOSEST_REPLICA
+      case _ => throw new IllegalArgumentException(s"Unsupported replica selection type '$opParam'")
+    }
+  }
 }
 
 /**
@@ -115,6 +138,10 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
   *
   * @param tableName Kudu table that we plan to read from
   * @param masterAddrs Kudu master addresses
+  * @param faultTolerantScanner scanner type to be used. Fault tolerant if true,
+  *                             otherwise, use non fault tolerant one
+  * @param scanLocality If true scan locality is enabled, so that the scan will
+  *                     take place at the closest replica.
   * @param operationType The default operation type to perform when writing to the relation
   * @param userSchema A schema used to select columns for the relation
   * @param sqlContext SparkSQL context
@@ -122,16 +149,18 @@ class DefaultSource extends RelationProvider with CreatableRelationProvider
 @InterfaceStability.Unstable
 class KuduRelation(private val tableName: String,
                    private val masterAddrs: String,
+                   private val faultTolerantScanner: Boolean,
+                   private val scanLocality: ReplicaSelection,
                    private val operationType: OperationType,
                    private val userSchema: Option[StructType])(
-                    val sqlContext: SQLContext)
+                   val sqlContext: SQLContext)
   extends BaseRelation
     with PrunedFilteredScan
     with InsertableRelation {
 
   import KuduRelation._
 
-  private val context: KuduContext = new KuduContext(masterAddrs)
+  private val context: KuduContext = new KuduContext(masterAddrs, sqlContext.sparkContext)
   private val table: KuduTable = context.syncClient.openTable(tableName)
 
   override def unhandledFilters(filters: Array[Filter]): Array[Filter] =
@@ -155,7 +184,7 @@ class KuduRelation(private val tableName: String,
 
   def kuduColumnToSparkField: (ColumnSchema) => StructField = {
     columnSchema =>
-      val sparkType = kuduTypeToSparkType(columnSchema.getType)
+      val sparkType = kuduTypeToSparkType(columnSchema.getType, columnSchema.getTypeAttributes)
       new StructField(columnSchema.getName, sparkType, columnSchema.isNullable)
   }
 
@@ -169,7 +198,7 @@ class KuduRelation(private val tableName: String,
   override def buildScan(requiredColumns: Array[String], filters: Array[Filter]): RDD[Row] = {
     val predicates = filters.flatMap(filterToPredicate)
     new KuduRDD(context, 1024 * 1024 * 20, requiredColumns, predicates,
-                table, sqlContext.sparkContext)
+                table, faultTolerantScanner, scanLocality, sqlContext.sparkContext)
   }
 
   /**
@@ -243,6 +272,7 @@ class KuduRelation(private val tableName: String,
       case value: Double => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: String => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
       case value: Array[Byte] => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
+      case value: BigDecimal => KuduPredicate.newComparisonPredicate(columnSchema, operator, value)
     }
   }
 
@@ -299,9 +329,10 @@ private[spark] object KuduRelation {
     * Converts a Kudu [[Type]] to a Spark SQL [[DataType]].
     *
     * @param t the Kudu type
+    * @param a the Kudu type attributes
     * @return the corresponding Spark SQL type
     */
-  private def kuduTypeToSparkType(t: Type): DataType = t match {
+  private def kuduTypeToSparkType(t: Type, a: ColumnTypeAttributes): DataType = t match {
     case Type.BOOL => BooleanType
     case Type.INT8 => ByteType
     case Type.INT16 => ShortType
@@ -312,6 +343,7 @@ private[spark] object KuduRelation {
     case Type.DOUBLE => DoubleType
     case Type.STRING => StringType
     case Type.BINARY => BinaryType
+    case Type.DECIMAL => DecimalType(a.getPrecision, a.getScale)
   }
 
   /**

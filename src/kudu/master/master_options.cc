@@ -17,11 +17,17 @@
 
 #include "kudu/master/master_options.h"
 
-#include <glog/logging.h>
-#include <gflags/gflags.h>
+#include <ostream>
+#include <string>
 
+#include <gflags/gflags.h>
+#include <glog/logging.h>
+
+#include "kudu/gutil/macros.h"
 #include "kudu/master/master.h"
+#include "kudu/server/rpc_server.h"
 #include "kudu/util/flag_tags.h"
+#include "kudu/util/status.h"
 
 DEFINE_string(master_addresses, "",
               "Comma-separated list of the RPC addresses belonging to all "
@@ -47,6 +53,7 @@ MasterOptions::MasterOptions() {
           "master_addresses flag ('" << FLAGS_master_addresses << "') only specifies "
                  << master_addresses.size() << " masters.";
     }
+    // TODO(wdberkeley): Un-actionable warning. Link to docs, once they exist.
     if (master_addresses.size() == 2) {
       LOG(WARNING) << "Only 2 masters are specified by master_addresses_flag ('" <<
           FLAGS_master_addresses << "'), but minimum of 3 are required to tolerate failures"

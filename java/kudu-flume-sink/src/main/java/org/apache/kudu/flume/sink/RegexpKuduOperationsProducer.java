@@ -19,6 +19,7 @@
 
 package org.apache.kudu.flume.sink;
 
+import java.math.BigDecimal;
 import java.nio.charset.Charset;
 import java.util.List;
 import java.util.regex.Matcher;
@@ -30,14 +31,14 @@ import com.google.common.collect.Lists;
 import org.apache.flume.Context;
 import org.apache.flume.Event;
 import org.apache.flume.FlumeException;
+import org.apache.yetus.audience.InterfaceAudience;
+import org.apache.yetus.audience.InterfaceStability;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import org.apache.kudu.ColumnSchema;
 import org.apache.kudu.Schema;
 import org.apache.kudu.Type;
-import org.apache.kudu.annotations.InterfaceAudience;
-import org.apache.kudu.annotations.InterfaceStability;
 import org.apache.kudu.client.Insert;
 import org.apache.kudu.client.KuduTable;
 import org.apache.kudu.client.Operation;
@@ -253,6 +254,9 @@ public class RegexpKuduOperationsProducer implements KuduOperationsProducer {
   private void coerceAndSet(String rawVal, String colName, Type type, PartialRow row)
       throws NumberFormatException {
     switch (type) {
+      case BOOL:
+        row.addBoolean(colName, Boolean.parseBoolean(rawVal));
+        break;
       case INT8:
         row.addByte(colName, Byte.parseByte(rawVal));
         break;
@@ -262,17 +266,9 @@ public class RegexpKuduOperationsProducer implements KuduOperationsProducer {
       case INT32:
         row.addInt(colName, Integer.parseInt(rawVal));
         break;
-      case INT64:
+      case INT64: // Fall through
+      case UNIXTIME_MICROS:
         row.addLong(colName, Long.parseLong(rawVal));
-        break;
-      case BINARY:
-        row.addBinary(colName, rawVal.getBytes(charset));
-        break;
-      case STRING:
-        row.addString(colName, rawVal);
-        break;
-      case BOOL:
-        row.addBoolean(colName, Boolean.parseBoolean(rawVal));
         break;
       case FLOAT:
         row.addFloat(colName, Float.parseFloat(rawVal));
@@ -280,8 +276,14 @@ public class RegexpKuduOperationsProducer implements KuduOperationsProducer {
       case DOUBLE:
         row.addDouble(colName, Double.parseDouble(rawVal));
         break;
-      case UNIXTIME_MICROS:
-        row.addLong(colName, Long.parseLong(rawVal));
+      case DECIMAL:
+        row.addDecimal(colName, new BigDecimal(rawVal));
+        break;
+      case BINARY:
+        row.addBinary(colName, rawVal.getBytes(charset));
+        break;
+      case STRING:
+        row.addString(colName, rawVal);
         break;
       default:
         logger.warn("got unknown type {} for column '{}'-- ignoring this column",

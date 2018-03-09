@@ -15,38 +15,71 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <algorithm>
+#include <cstdint>
+#include <iterator>
 #include <memory>
+#include <ostream>
 #include <string>
+#include <thread>
+#include <vector>
 
+#include <boost/optional/optional.hpp>
+#include <gflags/gflags_declare.h>
+#include <glog/logging.h>
 #include <gtest/gtest.h>
 
+#include "kudu/client/client-internal.h"
+#include "kudu/client/client.h"
+#include "kudu/client/shared_ptr.h"
+#include "kudu/common/common.pb.h"
+#include "kudu/common/wire_protocol.pb.h"
+#include "kudu/consensus/replica_management.pb.h"
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/mini_cluster.h"
-#include "kudu/master/catalog_manager.h"
 #include "kudu/master/master.h"
+#include "kudu/master/master.pb.h"
 #include "kudu/master/master.proxy.h"
 #include "kudu/master/master_cert_authority.h"
 #include "kudu/master/mini_master.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
+#include "kudu/mini-cluster/internal_mini_cluster.h"
 #include "kudu/rpc/messenger.h"
 #include "kudu/rpc/rpc_controller.h"
 #include "kudu/security/ca/cert_management.h"
 #include "kudu/security/cert.h"
 #include "kudu/security/crypto.h"
+#include "kudu/security/openssl_util.h"
+#include "kudu/security/tls_context.h"
+#include "kudu/util/countdown_latch.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/net/sockaddr.h"
 #include "kudu/util/pb_util.h"
+#include "kudu/util/scoped_cleanup.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 #include "kudu/util/test_util.h"
 #include "kudu/util/user.h"
 
+DECLARE_bool(raft_prepare_replacement_before_eviction);
+
+using kudu::cluster::ExternalMiniCluster;
+using kudu::cluster::ExternalMiniClusterOptions;
+using kudu::cluster::InternalMiniCluster;
+using kudu::cluster::InternalMiniClusterOptions;
+using kudu::consensus::ReplicaManagementInfoPB;
+using kudu::security::Cert;
+using kudu::security::CertSignRequest;
+using kudu::security::DataFormat;
+using kudu::security::PrivateKey;
+using kudu::security::ca::CertRequestGenerator;
+using std::back_inserter;
+using std::copy;
 using std::string;
-using std::shared_ptr;
+using std::vector;
+using strings::Substitute;
+
 
 namespace kudu {
-
-using security::ca::CertRequestGenerator;
-using security::Cert;
-using security::CertSignRequest;
-using security::DataFormat;
-using security::PrivateKey;
-
 namespace master {
 
 class MasterCertAuthorityTest : public KuduTest {
@@ -56,13 +89,12 @@ class MasterCertAuthorityTest : public KuduTest {
     // runs under a resource lock (see CMakeLists.txt in this directory).
     // TODO(aserbin): we should have a generic method to obtain n free ports.
     opts_.master_rpc_ports = { 11010, 11011, 11012 };
-
-    opts_.num_masters = num_masters_ = opts_.master_rpc_ports.size();
+    opts_.num_masters = opts_.master_rpc_ports.size();
   }
 
-  virtual void SetUp() OVERRIDE {
+  void SetUp() override {
     KuduTest::SetUp();
-    cluster_.reset(new MiniCluster(env_, opts_));
+    cluster_.reset(new InternalMiniCluster(env_, opts_));
     ASSERT_OK(cluster_->Start());
 
     rpc::MessengerBuilder bld("Client");
@@ -106,6 +138,12 @@ class MasterCertAuthorityTest : public KuduTest {
     pb->set_host("localhost");
     pb->set_port(2000);
 
+    // Information on the replica management scheme.
+    ReplicaManagementInfoPB rmi;
+    rmi.set_replacement_scheme(FLAGS_raft_prepare_replacement_before_eviction
+        ? ReplicaManagementInfoPB::PREPARE_REPLACEMENT_BEFORE_EVICTION
+        : ReplicaManagementInfoPB::EVICT_FIRST);
+
     for (int i = 0; i < cluster_->num_masters(); ++i) {
       TSHeartbeatRequestPB req;
       TSHeartbeatResponsePB resp;
@@ -113,16 +151,17 @@ class MasterCertAuthorityTest : public KuduTest {
 
       req.mutable_common()->CopyFrom(common);
       req.mutable_registration()->CopyFrom(fake_reg);
+      req.mutable_replica_management_info()->CopyFrom(rmi);
 
       MiniMaster* m = cluster_->mini_master(i);
-      if (!m->is_running()) {
+      if (!m->is_started()) {
         continue;
       }
-      MasterServiceProxy proxy(messenger_, m->bound_rpc_addr());
+      MasterServiceProxy proxy(messenger_, m->bound_rpc_addr(), m->bound_rpc_addr().host());
 
       // All masters (including followers) should accept the heartbeat.
       ASSERT_OK(proxy.TSHeartbeat(req, &resp, &rpc));
-      SCOPED_TRACE(SecureDebugString(resp));
+      SCOPED_TRACE(pb_util::SecureDebugString(resp));
       ASSERT_FALSE(resp.has_error());
     }
   }
@@ -145,14 +184,14 @@ class MasterCertAuthorityTest : public KuduTest {
       req.set_csr_der(csr_str);
 
       MiniMaster* m = cluster_->mini_master(i);
-      if (!m->is_running()) {
+      if (!m->is_started()) {
         continue;
       }
-      MasterServiceProxy proxy(messenger_, m->bound_rpc_addr());
+      MasterServiceProxy proxy(messenger_, m->bound_rpc_addr(), m->bound_rpc_addr().host());
 
       // All masters (including followers) should accept the heartbeat.
       RETURN_NOT_OK(proxy.TSHeartbeat(req, &resp, &rpc));
-      SCOPED_TRACE(SecureDebugString(resp));
+      SCOPED_TRACE(pb_util::SecureDebugString(resp));
       if (resp.has_error()) {
         return Status::RuntimeError("RPC error", resp.error().ShortDebugString());
       }
@@ -177,11 +216,9 @@ class MasterCertAuthorityTest : public KuduTest {
  protected:
   static const char kFakeTsUUID[];
 
-  int num_masters_;
-  MiniClusterOptions opts_;
-  gscoped_ptr<MiniCluster> cluster_;
-
-  shared_ptr<rpc::Messenger> messenger_;
+  InternalMiniClusterOptions opts_;
+  std::unique_ptr<InternalMiniCluster> cluster_;
+  std::shared_ptr<rpc::Messenger> messenger_;
 };
 const char MasterCertAuthorityTest::kFakeTsUUID[] = "fake-ts-uuid";
 
@@ -241,7 +278,7 @@ TEST_F(MasterCertAuthorityTest, RefuseToSignInvalidCSR) {
   string csr_str;
   {
     CertRequestGenerator::Config gen_config;
-    gen_config.cn = "ts.foo.com";
+    gen_config.hostname = "ts.foo.com";
     gen_config.user_id = "joe-impostor";
     NO_FATALS(GenerateCSR(gen_config, &csr_str));
   }
@@ -265,7 +302,18 @@ TEST_F(MasterCertAuthorityTest, MasterLeaderSignsCSR) {
   string csr_str;
   {
     CertRequestGenerator::Config gen_config;
-    gen_config.cn = "ts.foo.com";
+    // The hostname is longer than permitted 255 characters and breaks other
+    // restrictions on valid DNS hostnames, but it should not be an issue for
+    // both the requestor and the signer.
+    gen_config.hostname =
+        "toooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo."
+        "looooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+        "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+        "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+        "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+        "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+        "oooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooooo"
+        "ng.hostname.io";
     string test_user;
     ASSERT_OK(GetLoggedInUser(&test_user));
     gen_config.user_id = test_user;
@@ -308,4 +356,124 @@ TEST_F(MasterCertAuthorityTest, MasterLeaderSignsCSR) {
 }
 
 } // namespace master
+
+namespace client {
+
+class ConnectToClusterBaseTest : public KuduTest {
+ public:
+  ConnectToClusterBaseTest(int run_time_seconds,
+                           int latency_ms,
+                           vector<uint16_t> master_ports)
+      : run_time_seconds_(run_time_seconds),
+        latency_ms_(latency_ms) {
+    cluster_opts_.master_rpc_ports = std::move(master_ports);
+    cluster_opts_.num_masters = cluster_opts_.master_rpc_ports.size();
+  }
+
+  void SetUp() override {
+    KuduTest::SetUp();
+    cluster_.reset(new ExternalMiniCluster(cluster_opts_));
+  }
+
+  void ConnectToCluster() {
+    const MonoDelta timeout(MonoDelta::FromSeconds(run_time_seconds_));
+    KuduClientBuilder builder;
+    builder.default_admin_operation_timeout(timeout);
+    builder.default_rpc_timeout(timeout);
+    client::sp::shared_ptr<KuduClient> client;
+    ASSERT_OK(cluster_->CreateClient(&builder, &client));
+    ASSERT_EQ(1, client->data_->messenger_-> tls_context().trusted_cert_count_for_tests());
+    ASSERT_NE(boost::none, client->data_->messenger_->authn_token());
+  }
+
+  void Run() {
+    const MonoTime t_stop = MonoTime::Now() + MonoDelta::FromSeconds(run_time_seconds_);
+    CountDownLatch stop_latch(1);
+    std::thread clear_latency_thread([&]{
+      // Allow the test client to connect to the cluster (avoid timing out).
+      const MonoTime clear_latency = t_stop -
+          MonoDelta::FromMilliseconds(1000L * run_time_seconds_ / 4);
+      stop_latch.WaitUntil(clear_latency);
+      for (auto i = 0; i < cluster_->num_masters(); ++i) {
+        CHECK_OK(cluster_->SetFlag(cluster_->master(i),
+            "catalog_manager_inject_latency_load_ca_info_ms", "0"));
+      }
+    });
+    SCOPED_CLEANUP({
+      clear_latency_thread.join();
+    });
+    while (MonoTime::Now() < t_stop) {
+      NO_FATALS(ConnectToCluster());
+    }
+    stop_latch.CountDown();
+    NO_FATALS(cluster_->AssertNoCrashes());
+  }
+
+ protected:
+  const int run_time_seconds_;
+  const int latency_ms_;
+  ExternalMiniClusterOptions cluster_opts_;
+  std::shared_ptr<ExternalMiniCluster> cluster_;
+};
+
+// Test for KUDU-1927 in single-master configuration: verify that Kudu client
+// successfully connects to Kudu cluster and always have CA certificate and
+// authn token once connected. The test injects random latency into the process
+// of loading the CA record from the system table. There is a high chance that
+// during start-up the master server responds with ServiceUnavailable to
+// ConnectToCluster RPC sent by the client. The client should retry in that
+// case, connecting to the cluster eventually. Once successfully connected,
+// the client must have Kudu IPKI CA certificate and authn token.
+class SingleMasterConnectToClusterTest : public ConnectToClusterBaseTest {
+ public:
+  SingleMasterConnectToClusterTest()
+      : ConnectToClusterBaseTest(5, 2500, { 11020 }) {
+    // Add master-only flags.
+    cluster_opts_.extra_master_flags.push_back(Substitute(
+        "--catalog_manager_inject_latency_load_ca_info_ms=$0", latency_ms_));
+  }
+};
+
+// Test for KUDU-1927 in multi-master configuration: verify that Kudu client
+// successfully connects to Kudu cluster and always has CA certificate and
+// authn token once connected. The test injects random latency into the process
+// of loading the CA record from the system table. In addition, it uses short
+// timeouts for leader failure detection. Due to many re-election events,
+// sometimes elected master servers respond with ServiceUnavailable to
+// ConnectToCluster RPC sent by the client. The client should retry in that
+// case, connecting to the cluster eventually. Once successfully connected,
+// the client must have Kudu IPKI CA certificate and authn token.
+class MultiMasterConnectToClusterTest : public ConnectToClusterBaseTest {
+ public:
+  MultiMasterConnectToClusterTest()
+      : ConnectToClusterBaseTest(120, 2000, { 11030, 11031, 11032 }) {
+    constexpr int kHbIntervalMs = 100;
+    // Add master-only flags.
+    const vector<string> master_flags = {
+      Substitute("--catalog_manager_inject_latency_load_ca_info_ms=$0", latency_ms_),
+      "--raft_enable_pre_election=false",
+      Substitute("--leader_failure_exp_backoff_max_delta_ms=$0", kHbIntervalMs * 3),
+      "--leader_failure_max_missed_heartbeat_periods=1.0",
+      Substitute("--raft_heartbeat_interval_ms=$0", kHbIntervalMs),
+    };
+    copy(master_flags.begin(), master_flags.end(),
+         back_inserter(cluster_opts_.extra_master_flags));
+  }
+};
+
+TEST_F(SingleMasterConnectToClusterTest, ConnectToCluster) {
+  ASSERT_OK(cluster_->Start());
+  Run();
+}
+
+TEST_F(MultiMasterConnectToClusterTest, ConnectToCluster) {
+  if (!AllowSlowTests()) {
+    LOG(WARNING) << "test is skipped; set KUDU_ALLOW_SLOW_TESTS=1 to run";
+    return;
+  }
+  ASSERT_OK(cluster_->Start());
+  Run();
+}
+
+} // namespace client
 } // namespace kudu

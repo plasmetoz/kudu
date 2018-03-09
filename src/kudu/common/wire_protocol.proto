@@ -20,6 +20,7 @@
 // which are exclusively used on the wire. If a protobuf is persisted on
 // disk and not used as part of the wire protocol, it belongs in another
 // place such as common/common.proto or within cfile/, server/, etc.
+syntax = "proto2";
 package kudu;
 
 option java_package = "org.apache.kudu";
@@ -56,6 +57,7 @@ message AppStatusPB {
     CONFIGURATION_ERROR = 16;
     INCOMPLETE = 17;
     END_OF_FILE = 18;
+    CANCELLED = 19;
   }
 
   required ErrorCode code = 1;

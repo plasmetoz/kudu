@@ -15,15 +15,28 @@
 // specific language governing permissions and limitations
 // under the License.
 
+#include <cstdint>
+#include <memory>
+#include <ostream>
+#include <string>
+#include <utility>
 #include <vector>
 
+#include <glog/logging.h>
+#include <gtest/gtest.h>
+
 #include "kudu/gutil/strings/substitute.h"
-#include "kudu/integration-tests/cluster_verifier.h"
+#include "kudu/integration-tests/cluster_itest_util.h"
 #include "kudu/integration-tests/external_mini_cluster-itest-base.h"
 #include "kudu/integration-tests/test_workload.h"
+#include "kudu/mini-cluster/external_mini_cluster.h"
 #include "kudu/util/metrics.h"
+#include "kudu/util/monotime.h"
+#include "kudu/util/status.h"
+#include "kudu/util/test_macros.h"
 
 using std::string;
+using std::vector;
 using strings::Substitute;
 
 METRIC_DECLARE_entity(server);
@@ -31,14 +44,17 @@ METRIC_DECLARE_gauge_uint64(data_dirs_full);
 
 namespace kudu {
 
+using cluster::ExternalMiniClusterOptions;
+using cluster::ExternalTabletServer;
+
 namespace {
 Status GetTsCounterValue(ExternalTabletServer* ets, MetricPrototype* metric, int64_t* value) {
-  return ets->GetInt64Metric(
-             &METRIC_ENTITY_server,
-             "kudu.tabletserver",
-             metric,
-             "value",
-             value);
+  return itest::GetInt64Metric(ets->bound_http_hostport(),
+                               &METRIC_ENTITY_server,
+                               "kudu.tabletserver",
+                               metric,
+                               "value",
+                               value);
 }
 } // namespace
 
@@ -51,21 +67,26 @@ class DiskReservationITest : public ExternalMiniClusterITestBase {
 TEST_F(DiskReservationITest, TestFillMultipleDisks) {
   vector<string> ts_flags;
   // Don't preallocate very many bytes so we run the "full disk" check often.
-  ts_flags.push_back("--log_container_preallocate_bytes=100000");
+  ts_flags.emplace_back("--log_container_preallocate_bytes=100000");
   // Set up the tablet so that flushes are constantly occurring.
-  ts_flags.push_back("--flush_threshold_mb=0");
-  ts_flags.push_back("--maintenance_manager_polling_interval_ms=50");
-  ts_flags.push_back("--disable_core_dumps");
+  ts_flags.emplace_back("--flush_threshold_mb=0");
+  ts_flags.emplace_back("--maintenance_manager_polling_interval_ms=50");
+  ts_flags.emplace_back("--disable_core_dumps");
   // Reserve one byte so that when we simulate 0 bytes free below, we'll start
   // failing requests.
-  ts_flags.push_back("--fs_data_dirs_reserved_bytes=1");
-  ts_flags.push_back(Substitute("--fs_data_dirs=$0/a,$0/b", test_dir_));
-  ts_flags.push_back(Substitute("--disk_reserved_override_prefix_1_path_for_testing=$0/a",
-                                test_dir_));
-  ts_flags.push_back(Substitute("--disk_reserved_override_prefix_2_path_for_testing=$0/b",
-                                test_dir_));
+  ts_flags.emplace_back("--fs_data_dirs_reserved_bytes=1");
 
-  NO_FATALS(StartCluster(ts_flags, {}, 1));
+  ExternalMiniClusterOptions opts;
+  opts.extra_tserver_flags = std::move(ts_flags);
+  opts.num_data_dirs = 2;
+  NO_FATALS(StartClusterWithOpts(opts));
+
+  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),
+      "disk_reserved_override_prefix_1_path_for_testing",
+                                cluster_->GetDataPath("ts-0", 0)));
+  ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),
+      "disk_reserved_override_prefix_2_path_for_testing",
+                                cluster_->GetDataPath("ts-0", 1)));
 
   TestWorkload workload(cluster_.get());
   workload.set_num_replicas(1);
@@ -77,10 +98,10 @@ TEST_F(DiskReservationITest, TestFillMultipleDisks) {
   workload.Setup();
   workload.Start();
 
-  // Simulate that /a has 0 bytes free.
+  // Simulate that /data-0 has 0 bytes free.
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),
                               "disk_reserved_override_prefix_1_bytes_free_for_testing", "0"));
-  // Simulate that /b has 1GB free.
+  // Simulate that /data-1 has 1GB free.
   ASSERT_OK(cluster_->SetFlag(cluster_->tablet_server(0),
                               "disk_reserved_override_prefix_2_bytes_free_for_testing",
                               Substitute("$0", 1L * 1024 * 1024 * 1024)));
